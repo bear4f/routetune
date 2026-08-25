@@ -22,16 +22,23 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 assert_eq "$((250 * 125 * 500))" "$(bdp_bytes 500 250)" 'BDP is rate x rtt with no lost precision'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 # 500 Mbps x 250 ms = 15.6 MB. tcp_adv_win_scale=1 hands the application half
-# the receive buffer, so the ceiling is twice the product.
-assert_eq "$((2 * 250 * 125 * 500))" "$(buffer_ceiling 500 250)" \
-  'the ceiling is twice the bandwidth-delay product'
+# the receive buffer, so the ceiling is twice the product — plus a fixed 2 MiB.
+# tcpfit A/B'd that margin on a real 300Mbps/168ms link: 11.25MB averaged
+# 257.3 Mbps, the same buffer plus 2MiB averaged 272.7, both at zero
+# retransmission. A fixed margin recovers it without scaling faster machines up
+# proportionally.
+assert_eq "$((2 * 250 * 125 * 500 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+  'the ceiling is twice the bandwidth-delay product plus a fixed margin'
 # The asymmetry that motivates a coverage RTT also motivates a floor: a ceiling
 # below what a distant client needs is a cap nobody can diagnose.
 assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope still gets the 8 MiB floor'
-# A ceiling is per socket, so it stays bounded relative to RAM.
+# One socket may take at most an eighth of the global TCP budget, so at least
+# eight large flows fit before anyone hits pressure. The budget's own cap is a
+# quarter of RAM, which puts the per-socket clamp at RAM/32. Clamping against
+# RAM directly let one connection monopolise the budget on a small box.
 total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
-assert_eq "$((512 * 1024 * 1024 / 16))" "$(buffer_ceiling 2000 1000)" \
-  'the ceiling is clamped against total RAM'
+assert_eq "$((512 * 1024 * 1024 / 32))" "$(buffer_ceiling 2000 1000)" \
+  'one socket is capped at an eighth of the global TCP budget'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 assert_eq '475000' "$(shaped_kbit 500)" 'shaping leaves the configured headroom under the line rate'
 
@@ -54,14 +61,29 @@ assert_eq '0' "$(key net.ipv4.tcp_slow_start_after_idle)" 'cwnd is not reset bet
 # ramp, so this must always be part of the set.
 assert_eq '1' "$(key net.ipv4.tcp_no_metrics_save)" 'a bad moment is not cached into the next connection'
 assert_eq bbr "$(key net.ipv4.tcp_congestion_control)" 'the chosen congestion control lands in the set'
-assert_eq "$((2 * 250 * 125 * 500))" "$(key net.core.rmem_max)" 'the ceiling follows the coverage envelope'
-# ECN only means anything when something on the path marks instead of dropping.
-[[ -n "$(key net.ipv4.tcp_ecn)" ]] || fail 'ECN should be set when we run the AQM'
-pass 'ECN is requested when we own the queue'
-SHAPE=0; tgt="$(target_sysctl 500 250)"
-[[ -z "$(key net.ipv4.tcp_ecn)" ]] || fail 'ECN must not be set without a local AQM'
-pass 'ECN is left alone when nothing local marks packets'
-SHAPE=1; tgt="$(target_sysctl 500 250)"
+assert_eq "$(buffer_ceiling 500 250)" "$(key net.core.rmem_max)" 'the ceiling follows the coverage envelope'
+# Every ceiling above is computed as twice the BDP, which is only right when the
+# application gets half of the receive buffer. At 2 it gets a quarter and all of
+# them are wrong by a factor of two, so the assumption is stated, not assumed.
+assert_eq '1' "$(key net.ipv4.tcp_adv_win_scale)" 'the half-of-buffer assumption is asserted, not assumed'
+# Without autotuning the ceiling is decorative: connections never leave the
+# default and never grow toward it.
+assert_eq '1' "$(key net.ipv4.tcp_moderate_rcvbuf)" 'receive autotuning is required for a ceiling to mean anything'
+# rmem_max is only a ceiling. tcp_mem is the budget the kernel actually
+# enforces, and past its pressure threshold it shrinks every socket regardless.
+[[ -n "$(key net.ipv4.tcp_mem)" ]] || fail 'the global TCP budget must be part of the set'
+pass 'the global TCP page budget is set alongside the per-socket ceiling'
+# netshape disables ECN on purpose and its reason is specific and field-earned:
+# cross-border middleboxes blackhole ECN negotiation, and these are exactly
+# cross-border paths. That beats the theory that passive mode is inherently safe.
+assert_eq '0' "$(key net.ipv4.tcp_ecn)" 'ECN stays off on cross-border paths'
+# Sized for a userspace proxy: at 400 Mbps a 16KB allowance is 0.33ms of data,
+# and the process must finish a whole wake/read/decrypt/write cycle inside it.
+assert_eq '131072' "$(key net.ipv4.tcp_notsent_lowat)" \
+  'the unsent allowance is sized so the proxy is not the bottleneck'
+assert_eq 'exact' \
+  "$(printf '%s\n' "$tgt" | awk -F'\t' '$1 == "net.ipv4.tcp_notsent_lowat" {print $3}')" \
+  'the unsent allowance is no longer lower-only, which preserved a throttling 16KB'
 while IFS=$'\t' read -r k v dir why; do
   [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "key $k is missing a value or a rationale"
   [[ "$dir" =~ ^(exact|raise|lower)$ ]] || fail "key $k has no safe direction"
@@ -296,5 +318,44 @@ if printf 'q\n' | prompt_uint 'x' 500 1 100000 >/dev/null 2>&1; then
   fail 'q must cancel'
 fi
 pass 'q cancels the prompt'
+
+
+# ── 0.3.0 全局 TCP 预算 ────────────────────────────────────────────────────
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+# The script runs under IFS=$'\n\t', so a default read would keep the three
+# space-separated thresholds as one field.
+IFS=' ' read -r tm_low tm_pres tm_max <<< "$(target_tcp_mem)"
+# 1/16, 1/8, 1/4 of RAM in pages, following tcpfit.
+assert_eq "$((958 * 1024 * 1024 / 4096 / 4))" "$tm_max" \
+  'the global budget cap is a quarter of RAM in pages'
+[[ "$tm_low" -lt "$tm_pres" && "$tm_pres" -lt "$tm_max" ]] \
+  || fail 'the three tcp_mem thresholds must be ordered'
+pass 'the tcp_mem thresholds are ordered low < pressure < max'
+# A per-socket ceiling above an eighth of the budget means fewer than eight
+# large flows fit, which is the case the clamp exists to prevent.
+buf="$(buffer_ceiling 500 250)"
+(( buf * 8 <= tm_max * 4096 )) \
+  || fail 'the ceiling must leave room for eight flows inside the global budget'
+pass 'eight flows at the ceiling fit inside the global budget'
+
+# ── 0.3.0 整形的 CPU 代价 ──────────────────────────────────────────────────
+# CAKE funnels the whole egress through one qdisc and does per-packet work. On a
+# small VPS that can cost more than the policer it replaces, and the operator
+# needs to know before choosing, not after a slow speedtest.
+SHAPE=1
+cpu_count() { printf '1\n'; }
+[[ -n "$(shaping_cpu_warning 500)" ]] || fail 'one core shaping 500 Mbps must warn'
+pass 'shaping well past one core of headroom warns'
+if shaping_cpu_warning 200 >/dev/null 2>&1; then fail '200 Mbps on one core needs no warning'; fi
+pass 'a modest rate on one core does not warn'
+cpu_count() { printf '4\n'; }
+if shaping_cpu_warning 500 >/dev/null 2>&1; then fail 'four cores at 500 Mbps needs no warning'; fi
+pass 'enough cores means no shaping warning'
+SHAPE=0
+cpu_count() { printf '1\n'; }
+if shaping_cpu_warning 5000 >/dev/null 2>&1; then fail 'no-shape mode has no shaping cost'; fi
+pass 'no-shape mode never warns about shaping CPU'
+SHAPE=1
+unset -f cpu_count
 
 printf '%s\n' 'All tcpwide self-tests passed.'

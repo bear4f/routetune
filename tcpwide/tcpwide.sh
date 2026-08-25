@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -73,7 +73,12 @@ SHAPE_PCT=95
 # over an RTT instead of being dumped, so it buys ramp without buying loss.
 INITCWND=20
 BUF_FLOOR=$((8 * 1024 * 1024))
-BUF_CAP=$((512 * 1024 * 1024))
+BUF_CAP=$((256 * 1024 * 1024))
+# 2xBDP with no slack measurably underperforms. tcpfit A/B'd this on a real
+# 300Mbps/168ms link: 11.25MB averaged 257.3 Mbps, the same buffer plus 2MiB
+# averaged 272.7 Mbps, both at zero retransmission. A fixed margin recovers
+# that without scaling up the buffers of faster machines proportionally.
+BUF_SLACK=$((2 * 1024 * 1024))
 
 EGRESS_MBPS=""
 IFACE=""
@@ -123,16 +128,40 @@ bdp_bytes() { printf '%s\n' $(( ${1:-0} * 125 * ${2:-0} )); }
 # ceiling equal to the BDP delivers half a BDP. The clamps exist because a
 # ceiling is per socket: unbounded tuning is how a small box dies of its own
 # configuration.
-buffer_ceiling() {
-  local rate="${1:-0}" rtt="${2:-0}" ram buf
-  buf=$(( $(bdp_bytes "$rate" "$rtt") * 2 ))
-  (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
-  (( buf > BUF_CAP ))   && buf="$BUF_CAP"
+# The global page budget for all of TCP. rmem_max is only a ceiling; this is the
+# hard cap the kernel enforces, and past the pressure threshold it shrinks every
+# socket regardless of what the ceiling says. Raising it is safe in a way that
+# raising a per-socket ceiling is not, because it is the thing doing the
+# catching. Formula follows tcpfit: 1/16, 1/8, 1/4 of RAM in pages.
+target_tcp_mem() {
+  local ram page pages
   ram="$(total_ram_bytes)"
-  if (( ram > 0 )) && (( buf > ram / 16 )); then
-    buf=$(( ram / 16 ))
-    (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
+  (( ram > 0 )) || return 1
+  page="$(getconf PAGESIZE 2>/dev/null || printf 4096)"
+  pages=$(( ram / page ))
+  awk -v p="$pages" 'BEGIN {
+    low = int(p / 16); pres = int(p / 8); max = int(p / 4)
+    if (low  < 4096)  low  = 4096
+    if (pres < 8192)  pres = 8192
+    if (max  < 16384) max  = 16384
+    printf "%d %d %d", low, pres, max }'
+}
+
+buffer_ceiling() {
+  local rate="${1:-0}" rtt="${2:-0}" ram buf cap
+  buf=$(( $(bdp_bytes "$rate" "$rtt") * 2 + BUF_SLACK ))
+  (( buf > BUF_CAP )) && buf="$BUF_CAP"
+  ram="$(total_ram_bytes)"
+  # One socket may take at most an eighth of the global TCP budget, so at least
+  # eight large flows can run at the ceiling before anyone hits pressure. Since
+  # the budget's own cap is a quarter of RAM, that works out to RAM/32. Clamping
+  # against RAM directly, as this used to, let a single connection monopolise
+  # the budget on a small box.
+  if (( ram > 0 )); then
+    cap=$(( ram / 32 ))
+    (( buf > cap )) && buf="$cap"
   fi
+  (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
   printf '%s\n' "$buf"
 }
 
@@ -165,15 +194,35 @@ target_sysctl() {
     '默认会把每个目标的 ssthresh 缓存下来。5G 波动时缓存到一个很低的值，下一条连接会带着这个悲观值起步、提前退出慢启动——这是波动链路「爬不起来」的直接原因'
   printf 'net.ipv4.tcp_mtu_probing\t1\texact\t%s\n' \
     '路径上有人钳制 MSS 时让内核探到能用的大小，而不是反复重传大包'
-  printf 'net.ipv4.tcp_notsent_lowat\t131072\tlower\t%s\n' \
-    '限制本机 socket 里堆积的未发送数据；已经调得更紧就保持不动'
-  # ECN only means anything when something on the path marks instead of drops.
-  # Passive (2) never asks for it, only agrees when the client does, which is
-  # what keeps it safe past middleboxes that blackhole ECN negotiation.
-  if (( SHAPE == 1 )); then
-    printf 'net.ipv4.tcp_ecn\t2\texact\t%s\n' \
-      '被动 ECN：不主动要求，客户端要求时才答应。配合本机 AQM，拥塞用标记代替丢包——这是直接冲着低重传去的'
+  # Everything above assumes the application gets half of a receive buffer.
+  # If the kernel is set to 2 it gets a quarter, and every ceiling here is
+  # wrong by a factor of two — so state it rather than assume it.
+  printf 'net.ipv4.tcp_adv_win_scale\t1\texact\t%s\n' \
+    '决定接收缓冲里有多少真正给应用当窗口用。上面所有上限都是按「一半」算的，这里必须是 1，否则那些数全部差一倍'
+  printf 'net.ipv4.tcp_moderate_rcvbuf\t1\texact\t%s\n' \
+    '接收缓冲自动伸缩。关掉的话上限就是摆设——连接永远停在默认值，涨不上去'
+  local tcpmem
+  if tcpmem="$(target_tcp_mem)"; then
+    printf 'net.ipv4.tcp_mem\t%s\traise\t%s\n' "$tcpmem" \
+      '全局 TCP 页预算（所有 socket 共享）。rmem_max 只是天花板，这个才是内核硬拦的总量——它太小的话，上限调多大都没用，几条大流一上来就触发压力被缩回去'
   fi
+  # Sized for a userspace proxy, not for a seek-latency-sensitive origin. At
+  # 400 Mbps a 16KB allowance is 0.33ms of data: the process has to finish a
+  # whole wake/read/decrypt/write cycle inside that or the pipe runs dry. This
+  # used to be lower-only, which preserved exactly that 16KB on a box where the
+  # symptom was a single flow oscillating well under line rate.
+  printf 'net.ipv4.tcp_notsent_lowat\t131072\texact\t%s\n' \
+    '本机 socket 里允许堆多少未发送数据。给得太紧会让代理进程变成瓶颈——400Mbps 下 16KB 只够 0.33ms，进程稍慢一下管道就空了。要极致低延迟可以手动调小，代价是吞吐'
+  printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' \
+    "$( (( $(total_ram_bytes) < 1024 * 1024 * 1024 )) && printf 4096 || printf 16384 )" \
+    '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
+  # netshape turns ECN off on purpose, and its reason is specific and
+  # field-earned: cross-border middleboxes blackhole ECN negotiation. That is
+  # better evidence than the theory that passive mode is inherently safe, and
+  # these are exactly cross-border paths. CAKE drops instead of marking, which
+  # is still far gentler than the provider policer it replaces.
+  printf 'net.ipv4.tcp_ecn\t0\texact\t%s\n' \
+    '跨境中间盒会 blackhole ECN 协商（netshape 的实战结论）。关掉后 CAKE 改用丢包发信号，仍然比运营商那个 policer 温和得多'
 }
 
 # CAKE's AQM targets a round-trip time, and its default assumes 100ms. Pointing
@@ -443,6 +492,21 @@ tcp_mem_high_bytes() {
 
 mb() { awk -v b="${1:-0}" 'BEGIN {printf "%.1f", b / 1048576}'; }
 
+cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1; }
+
+# Software shaping is not free. CAKE runs the whole egress through one qdisc and
+# does per-packet work on it; on a single-core VPS at several hundred Mbps that
+# can cost more throughput than the policer it is replacing. Roughly 400 Mbps
+# per core is where it starts to matter on a small box.
+shaping_cpu_warning() {
+  local rate="${1:-0}" cores
+  (( SHAPE == 1 )) || return 1
+  cores="$(cpu_count)"
+  is_uint "$cores" && (( cores > 0 )) || cores=1
+  (( rate > cores * 400 )) || return 1
+  printf '%s\t%s\n' "$cores" "$rate"
+}
+
 # ── 命令 ───────────────────────────────────────────────────────────────────
 
 cmd_check() {
@@ -464,6 +528,17 @@ cmd_check() {
   [[ "$cake" == yes ]] || printf '  %b（没有 CAKE 就做不了按设备公平，会退回 fq）%b' "$YELLOW" "$RESET"
   printf '\n'
   printf '  内存:              %s MB\n' "$(( $(total_ram_bytes) / 1048576 ))"
+  printf '  CPU:               %s 核\n' "$(cpu_count)"
+  local warn_row cores rate
+  if warn_row="$(shaping_cpu_warning "${EGRESS_MBPS:-500}")"; then
+    IFS=$'\t' read -r cores rate <<< "$warn_row"
+    printf '\n'
+    warn "${cores} 核整形 ${rate} Mbps 可能撑不住"
+    printf '  %bCAKE 把整个出口收敛到一个 qdisc 并逐包处理，小机器上这笔 CPU 开销可能比它%b\n' \
+      "$DIM" "$RESET"
+    printf '  %b替掉的 policer 还贵。单线程测速掉速的话，先用「4) 不整形」档对照一次。%b\n' \
+      "$DIM" "$RESET"
+  fi
   local other
   if other="$(conflicting_tool)"; then
     printf '\n'
@@ -839,6 +914,18 @@ render_panel() {
   if drift="$(qdisc_drift)"; then
     printf '  %b[!] 实际生效的队列是 %s，与配置不一致%b\n' "$YELLOW" "$drift" "$RESET"
     printf '      %b可能是重启后没应用，或被别的服务覆盖。按 a 重新应用%b\n' "$DIM" "$RESET"
+  fi
+  local cpu_row cores rate
+  if cpu_row="$(shaping_cpu_warning "${EGRESS_MBPS:-0}")"; then
+    IFS=$'\t' read -r cores rate <<< "$cpu_row"
+    printf '  %b[!] %s 核整形 %s Mbps 可能是 CPU 瓶颈——单线程掉速时先用 4) 不整形 对照%b\n' \
+      "$YELLOW" "$cores" "$rate" "$RESET"
+  fi
+  if (( SHAPE == 1 )); then
+    printf '  %b注：整形按定义会让出 %s%% 峰值，而按设备公平对单线程测速没有帮助。%b\n' \
+      "$DIM" "$(( 100 - SHAPE_PCT ))" "$RESET"
+    printf '  %b    单线程跑分是这套设计主动交换掉的那一面；多设备并发才是它换来的东西。%b\n' \
+      "$DIM" "$RESET"
   fi
   local other
   if other="$(conflicting_tool)"; then

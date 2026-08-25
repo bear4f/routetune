@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -254,6 +254,10 @@ LOCAL_RTT_FLOOR_MS=5
 # denominator: one retransmit out of 1000 is already 0.1%.
 MIN_SEGS_FOR_PATH=100
 MIN_SEGS_FOR_RETRANS=1000
+# A round whose RTT95 reached this multiple of the path floor counts as a
+# spike. What matters for policy is how OFTEN that happens, not how bad the
+# single worst round was, so this is a counting threshold rather than a verdict.
+SPIKE_TAIL=2
 
 # rtt / minrtt is how many times the path has grown above the connection's
 # observed floor. It is evidence of queueing, not proof of where that queue is.
@@ -396,9 +400,9 @@ bbr_variant_note() {
 # never be filed under a class that would earn it a routing change.
 classify_peer() {
   local p50="${1:-0}" jit="${2:-0}" bloat="${3:-1}" tail="${4:-1}" \
-        retrans="${5:-0}" spread="${6:-1}" segs="${7:-0}"
+        retrans="${5:-0}" spread="${6:-1}" segs="${7:-0}" spikefrac="${8:-0}"
   awk -v t="$p50" -v j="$jit" -v b="$bloat" -v tb="$tail" -v r="$retrans" \
-      -v sp="$spread" -v sg="$segs" -v floor="$LOCAL_RTT_FLOOR_MS" \
+      -v sp="$spread" -v sg="$segs" -v spf="$spikefrac" -v floor="$LOCAL_RTT_FLOOR_MS" \
       -v minpath="$MIN_SEGS_FOR_PATH" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor)   { print "local";  exit }
     if (sg < minpath) { print "idle";  exit }
@@ -410,7 +414,9 @@ classify_peer() {
     if (trust_r && r >= 1 && (j >= 0.15 || sp >= 1.4)) { print "mobile"; exit }
     if (trust_r && r >= 1)      { print "flatloss"; exit }
     if (trust_r && r >= 0.1)    { print "lossy"; exit }
-    if (tb >= 3)     { print "spiky";  exit }
+    # How often, not how bad: a link that spikes in a tenth of its rounds is a
+    # different animal from one that spiked once in a thousand.
+    if (tb >= 3 || spf >= 0.1) { print "spiky"; exit }
     if (j >= 0.3 || sp >= 1.4) { print "variable"; exit }
     if (t >= 120)    { print "far";    exit }
     print "near";
@@ -487,6 +493,12 @@ FNR == NR && FILENAME == db {
   mins[$1] = $6; jits[$1] = $7; bls[$1] = $8; tlm[$1] = $9
   retrs[$1] = $10; sgs[$1] = $11; mbm[$1] = $12; cmx[$1] = $13
   first[$1] = $14; last[$1] = $15
+  # A pre-0.1.4 database has no sums, only the maxima. Seeding the sums from
+  # the max assumes every past round was the worst one — the pessimistic
+  # reading, so an upgrade never quietly turns a bad profile into a good one.
+  # It decays toward the truth as new rounds land.
+  if (NF >= 18 && $16 != "") { p95s[$1] = $16; tls[$1] = $17; spk[$1] = $18 }
+  else { p95s[$1] = $5 * $3; tls[$1] = $9 * $3; spk[$1] = ($9 >= spiketail ? $3 : 0) }
   next
 }
 {
@@ -497,11 +509,14 @@ FNR == NR && FILENAME == db {
   if (($12 + 0) >= minpath) {
     trusted[k]++
     p50s[k] += $4
+    p95s[k] += $5
     if ($5 > p95m[k]) p95m[k] = $5
     if (!(k in mins) || $6 < mins[k]) mins[k] = $6
     jits[k] += $7
     bls[k]  += ($8 > 0 ? $8 : 0)
+    tls[k]  += $14
     if ($14 > tlm[k]) tlm[k] = $14
+    if ($14 >= spiketail) spk[k]++
     retrs[k] += $15
     sgs[k] += $12
     if ($10 > mbm[k]) mbm[k] = $10
@@ -511,10 +526,12 @@ FNR == NR && FILENAME == db {
 }
 END {
   print "prefix", "obs", "trusted", "p50sum", "p95max", "minrtt", "jitsum", \
-        "bloatsum", "tailmax", "retrtotal", "segtotal", "mbpsmax", "connmax", "first", "last"
+        "bloatsum", "tailmax", "retrtotal", "segtotal", "mbpsmax", "connmax", "first", "last", \
+        "p95sum", "tailsum", "spikes"
   for (k in n)
     print k, n[k], trusted[k], p50s[k], p95m[k], mins[k], jits[k], bls[k], tlm[k], \
-          retrs[k], sgs[k], mbm[k], cmx[k], first[k], (k in seen ? seen[k] : last[k])
+          retrs[k], sgs[k], mbm[k], cmx[k], first[k], (k in seen ? seen[k] : last[k]), \
+          p95s[k] + 0, tls[k] + 0, spk[k] + 0
 }
 '
 
@@ -525,7 +542,7 @@ merge_profiles() {
   [[ -e "$PROFILE_DB" ]] || printf 'prefix\n' > "$PROFILE_DB"
   merged="$(mktemp)"
   awk -v db="$PROFILE_DB" -v stamp="$stamp" -v minpath="$MIN_SEGS_FOR_PATH" \
-    "$PROFILE_MERGE_AWK" "$PROFILE_DB" "$agg" > "$merged"
+    -v spiketail="$SPIKE_TAIL" "$PROFILE_MERGE_AWK" "$PROFILE_DB" "$agg" > "$merged"
   mv -f "$merged" "$PROFILE_DB"
   chmod 0600 "$PROFILE_DB"
 }
@@ -651,13 +668,22 @@ BEGIN { FS = OFS = "\t" }
 NR == 1 || $1 == "prefix" || $1 == "" { next }
 {
   obs = $3 + 0; if (obs < 1) next
-  p50 = $4 / obs; p95 = $5 + 0; mn = $6 + 0
-  jit = $7 / obs; bl = $8 / obs; tl = $9 + 0
+  p50 = $4 / obs; p95mx = $5 + 0; mn = $6 + 0
+  jit = $7 / obs; bl = $8 / obs; tlmx = $9 + 0
   sg = $11 + 0; rt = (sg > 0) ? ($10 * 100 / sg) : 0
   mb = $12 + 0; cn = $13 + 0
-  sp  = (p50 > 0) ? p95 / p50 : 1
-  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\n", \
-    $1, obs, p50, p95, mn, jit, bl, tl, rt, sg, mb, cn, sp
+  # Classification runs on the typical round, not the worst one ever seen. A
+  # max never decays, so classifying on it meant one freak round pinned a
+  # prefix out of its class permanently and more observation could only ever
+  # make a profile look worse. The maxima stay, but as displayed evidence.
+  p95t = (NF >= 16 && $16 != "") ? $16 / obs : p95mx
+  tlt  = (NF >= 17 && $17 != "") ? $17 / obs : tlmx
+  # A pre-0.1.4 row has no spike count. That is "unknown", not "zero"; -1 makes
+  # the display say so instead of claiming a clean record we never observed.
+  spk  = (NF >= 18 && $18 != "") ? $18 + 0 : -1
+  sp   = (p50 > 0) ? p95t / p50 : 1
+  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\t%.3f\t%d\n", \
+    $1, obs, p50, p95mx, mn, jit, bl, tlt, rt, sg, mb, cn, sp, (spk >= 0 ? spk / obs : 0), spk
 }
 '
 
@@ -671,20 +697,23 @@ cmd_profiles() {
   rows="$(profile_rows)" || die "还没有画像，先跑：$PROGRAM watch --minutes 30"
   [[ -n "$rows" ]] || die "画像库是空的，先跑：$PROGRAM watch --minutes 30"
   panel_title 'routetune 画像'
-  printf '  %b前缀                      轮次 RTT50 峰95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
+  printf '  %b前缀                      轮次 RTT50 峰95  最低  抖动  膨胀  尾涨   尖峰 重传%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
-  local prefix obs p50 p95 mn jit bl tl rt sg sp class
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
-    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg")"
+  local prefix obs p50 p95 mn jit bl tl rt sg sp spf spk class
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk; do
+    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf")"
     local color="$GREEN"
     case "$class" in mobile|flatloss|lossy|bloated|spiky|variable) color="$YELLOW" ;; esac
-    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %7s  %s\n' \
-      "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" "$rt" "$sg" \
-      "$(class_label "$class")"
+    local spike="$spk/$obs"; (( spk < 0 )) && spike='—'
+    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %5s %7s  %s\n' \
+      "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" \
+      "$spike" "$rt" "$sg" "$(class_label "$class")"
   done <<< "$rows"
   rule_light
   printf '  %b轮次 = 这个前缀被观测到多少轮；轮次越多画像越可信%b\n' "$DIM" "$RESET"
   printf '  %b峰95 = 所有可信轮次中最高的一轮 RTT95，用来保留卡顿尾峰；不是整段观测的全量 P95%b\n' "$DIM" "$RESET"
+  printf '  %b尾涨/抖动/膨胀 = 各轮的平均值；尖峰 = 有多少轮 RTT95 涨到底噪的 %s 倍以上%b\n' "$DIM" "$SPIKE_TAIL" "$RESET"
+  printf '  %b分类看的是尖峰出现的频率，不是最差那一轮——偶发一次不该把一条链路永久打上标签%b\n' "$DIM" "$RESET"
   printf '  %b出策略：%s recommend%b\n' "$DIM" "$PROGRAM" "$RESET"
 }
 
@@ -746,18 +775,19 @@ cmd_recommend() {
   printf '  %b若已存在精确路由或检测到多路径，routetune 会拒绝生成命令，避免覆盖现网语义。%b\n' "$DIM" "$RESET"
   printf '  %b重启后失效（阶段一不做持久化），先手动跑一条看效果再说。%b\n\n' "$DIM" "$RESET"
 
-  local prefix obs p50 p95 mn jit bl tl rt sg sp class opts reason commands rc
+  local prefix obs p50 p95 mn jit bl tl rt sg sp spf spk class opts reason commands rc
   local emitted=0 few_obs=0 not_actionable=0 route_skipped=0
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk; do
     if (( obs < min_obs )); then few_obs=$((few_obs + 1)); continue; fi
-    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg")"
+    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf")"
     case "$class" in local|idle) not_actionable=$((not_actionable + 1)); continue ;; esac
     opts="$(class_policy "$class" | sed -n '1p')"
     reason="$(class_policy "$class" | sed -n '2p')"
     printf '  %b%s%b  %b%s%b  %s轮观测\n' "$BOLD" "$prefix" "$RESET" \
       "$CYAN" "$(class_label "$class")" "$RESET" "$obs"
-    printf '    %bRTT %s/%s ms（底噪 %s）｜抖动 %s｜膨胀 %s｜重传 %s%%（%s 段）%b\n' \
-      "$DIM" "$p50" "$p95" "$mn" "$jit" "$bl" "$rt" "$sg" "$RESET"
+    printf '    %bRTT %s ms 中位／最差一轮 %s（底噪 %s）｜抖动 %s｜膨胀 %s｜尖峰 %s/%s 轮｜重传 %s%%（%s 段）%b\n' \
+      "$DIM" "$p50" "$p95" "$mn" "$jit" "$bl" "$( (( spk < 0 )) && printf '未知' || printf '%s' "$spk" )" \
+      "$obs" "$rt" "$sg" "$RESET"
     if [[ -n "$opts" ]]; then
       if commands="$(route_commands "$prefix" "$opts")"; then
         printf '    %b%s%b\n' "$GREEN" "$(sed -n '1p' <<< "$commands")" "$RESET"
@@ -897,7 +927,7 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
   稳定延迟丢包 重传 ≥1%、延迟较稳    → 不推断限速器；主动复测前不改参数
   轻度丢包   重传 0.1%-1%           → 继续观测，不当作健康固网优化
   接入网排队 中位膨胀 ≥3            → 服务端限速无效，根治靠 BBRv3
-  间歇排队   中位不深但尾部有尖峰    → 先观察
+  间歇排队   尾峰反复出现（≥10% 轮次） → 先观察；偶发一次不算
   时变链路   抖动或尾部散布高、无明确丢包 → 延长观测，不凭快照改参数
 
 阶段一只出建议不落地。画像准不准要先用真实流量验证过，再谈自动下发。

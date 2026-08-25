@@ -108,7 +108,8 @@ assert_eq '2' "$(printf '%s' "$row" | cut -f2)" 'observation count accumulates'
 assert_eq '150.0' "$(printf '%s' "$row" | cut -f3)" 'p50 is averaged across rounds'
 assert_eq '260.0' "$(printf '%s' "$row" | cut -f4)" 'p95 keeps the worst round'
 assert_eq '70.0' "$(printf '%s' "$row" | cut -f5)" 'minrtt keeps the lowest floor ever seen'
-assert_eq '3.71' "$(printf '%s' "$row" | cut -f8)" 'tail keeps the worst round'
+assert_eq '2.79' "$(printf '%s' "$row" | cut -f8)" 'tail reports the typical round, not the worst'
+assert_eq '1' "$(printf '%s' "$row" | cut -f15)" 'the spiky round is counted'
 assert_eq '1.0833' "$(printf '%s' "$row" | cut -f9)" 'retransmission rate is segment-weighted'
 assert_eq '12000' "$(printf '%s' "$row" | cut -f10)" 'segment counts sum'
 assert_eq '4' "$(printf '%s' "$row" | cut -f12)" 'connection count keeps the peak'
@@ -126,6 +127,48 @@ printf '192.0.2.0/24\t1\tbbr\t147.0\t152.1\t145.8\t0.035\t1.01\t0.0\t2.0\t10\t99
 merge_profiles "$r1"
 assert_eq 1 "$(profile_rows | awk -F'\t' '$1 == "192.0.2.0/24" {n++} END {print n + 0}')" \
   'a 991-segment round contributes trustworthy latency evidence'
+rm -rf "$tmp"
+
+# ── 尖峰频率而非最差一轮 ───────────────────────────────────────────────────
+# A max never decays, so classifying on one meant a single freak round pinned a
+# prefix out of its class forever and more observation could only make a profile
+# look worse — the opposite of what "轮次越多画像越可信" promises.
+tmp="$(mktemp -d)"; STATE_DIR="$tmp"; PROFILE_DB="$tmp/profiles.tsv"
+# 18 columns: prefix obs trusted p50sum p95max minrtt jitsum bloatsum tailmax
+#             retrtotal segtotal mbpsmax connmax first last p95sum tailsum spikes
+hdr=$'prefix\tobs\ttrusted\tp50sum\tp95max\tminrtt\tjitsum\tbloatsum\ttailmax\tretrtotal\tsegtotal\tmbpsmax\tconnmax\tfirst\tlast\tp95sum\ttailsum\tspikes'
+classify_db() {
+  local out p50 jit bl tl rt sg sp spf
+  out="$(profile_rows)"
+  IFS=$'\t' read -r _ _ p50 _ _ jit bl tl rt sg _ _ sp spf _ <<< "$out"
+  classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf"
+}
+
+# 100 healthy rounds at 147/152ms over a 145.5ms floor, and one 620ms round.
+printf '%s\n119.237.129.0/24\t100\t100\t14700\t620.0\t145.5\t3.0\t101.0\t4.26\t0\t120000\t95.0\t1\t0\t0\t15668\t108.21\t1\n' \
+  "$hdr" > "$PROFILE_DB"
+assert_eq far "$(classify_db)" 'one freak round in a hundred no longer pins the class'
+
+# The same worst round, but now it is a third of the observation.
+printf '%s\n119.237.129.0/24\t43\t43\t6321\t620.0\t145.5\t1.29\t43.43\t4.26\t0\t51600\t95.0\t1\t0\t0\t12152\t83.67\t12\n' \
+  "$hdr" > "$PROFILE_DB"
+assert_eq spiky "$(classify_db)" 'a link that spikes in a third of its rounds is still spiky'
+
+# A pre-0.1.4 database has no sums. It must still read, and must degrade
+# pessimistically — an upgrade may not quietly promote a bad profile.
+printf 'prefix\n119.237.129.0/24\t101\t101\t14847\t620.0\t145.5\t3.03\t102.01\t4.26\t0\t121200\t95.0\t1\t0\t0\n' \
+  > "$PROFILE_DB"
+assert_eq spiky "$(classify_db)" 'a legacy database still classifies, on the pessimistic reading'
+# "unknown", not "zero" — a legacy row never observed a clean spike record.
+assert_eq '-1' "$(profile_rows | cut -f15)" 'a legacy row reports its spike count as unknown'
+# And once merged, the seeded sums decay toward the truth instead of sticking.
+r1="$tmp/r1"
+printf '119.237.129.0/24\t1\tbbr\t147.0\t152.0\t145.5\t0.030\t1.01\t0.0\t95.0\t10\t1200\tin\t1.05\t0\n' > "$r1"
+merge_profiles "$r1"
+[[ "$(profile_rows | cut -f8)" != '4.26' ]] \
+  || fail 'a merged legacy profile must stop reporting the worst round as typical'
+pass 'seeded legacy sums decay as new rounds arrive'
+unset -f classify_db
 rm -rf "$tmp"
 
 # ── 虚假重传 ───────────────────────────────────────────────────────────────

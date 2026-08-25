@@ -557,4 +557,42 @@ apply_profile noshape
 assert_eq '98|0' "$SHAPE_PCT|$SHAPE" 'and does so regardless of what preceded it'
 apply_profile balanced
 
+
+# ── 0.7.0 目标不等于现值 ───────────────────────────────────────────────────
+# raise refuses to lower, so a SMALLER target is silently never written. The
+# live node ran at 31.4 MB the whole time while every panel printed the 16 MB
+# ladder target as though it were the running value — and an entire round of
+# analysis was built on that number.
+assert_eq '31391744' "$(safe_value 31391744 16777216 raise)" \
+  'a smaller target under raise leaves the live value alone'
+if needs_write 31391744 16777216 raise; then
+  fail 'lowering under raise must not be reported as a pending change'
+fi
+pass 'a smaller target under raise is correctly a no-op'
+
+# The apply loop reports its count through a variable. It used to echo the count
+# on stdout and the caller captured it, which threw away every progress line
+# with it, so an apply that wrote nine keys looked like it wrote none.
+tmp="$(mktemp -d)"; SYSCTL_SNAP="$tmp/snap"
+writes="$tmp/w"; : > "$writes"
+sysctl() {
+  case "${1:-}" in
+    -qw|-w) printf '%s\n' "$2" >> "$writes"; return 0 ;;
+    -n) case "${2:-}" in *available*) printf 'reno cubic bbr\n' ;; *) printf '\n' ;; esac ;;
+  esac
+}
+has() { [[ "$1" == sysctl ]]; }
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+# A redirect, not a command substitution: the latter is a subshell and would
+# lose SYSCTL_WROTE — which is the very thing that made the old design lose the
+# progress lines.
+apply_sysctl 500 250 > "$tmp/out" 2>&1
+[[ "$(cat "$tmp/out")" == *"[写]"* ]] || fail 'apply must show what it wrote'
+pass 'the apply loop prints each key it writes'
+(( SYSCTL_WROTE > 0 )) || fail 'the count must come back to the caller'
+assert_eq "$(grep -c '' < "$writes")" "$SYSCTL_WROTE" \
+  'the reported count matches the keys actually written'
+rm -rf "$tmp"
+unset -f sysctl has total_ram_bytes
+
 printf '%s\n' 'All tcpwide self-tests passed.'

@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -712,6 +712,10 @@ cmd_plan() {
   printf '\n  %b这是预演，什么都没有改。确认后跑：%s apply%b\n' "$BOLD" "$PROGRAM" "$RESET"
 }
 
+# Writes SYSCTL_WROTE rather than echoing a count, because the caller used to
+# capture stdout to read that count — which swallowed every progress line with
+# it, so an apply looked like it had touched nothing.
+SYSCTL_WROTE=0
 apply_sysctl() {
   local rate="$1" rtt="$2" k v dir now n=0
   : > "$SYSCTL_SNAP.tmp"
@@ -731,7 +735,8 @@ apply_sysctl() {
   # was before tcpwide ever ran, not to what the previous apply left behind.
   if [[ -e "$SYSCTL_SNAP" ]]; then rm -f "$SYSCTL_SNAP.tmp"
   else mv -f "$SYSCTL_SNAP.tmp" "$SYSCTL_SNAP"; chmod 0600 "$SYSCTL_SNAP"; fi
-  printf '%s\n' "$n"
+  SYSCTL_WROTE="$n"
+  (( n > 0 )) || info "所有 sysctl 都已经是目标值或更好，没有写入任何一项"
 }
 
 apply_link() {
@@ -828,7 +833,7 @@ cmd_apply() {
     fi
   fi
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"
-  n="$(apply_sysctl "$rate" "$rtt" | tail -1)"
+  apply_sysctl "$rate" "$rtt"; n="$SYSCTL_WROTE"
   apply_link "$rate" "$rtt"
   (( PERSIST == 1 )) && write_persistence "$rate" "$rtt"
   printf '\n'
@@ -1124,6 +1129,11 @@ render_panel() {
     stable) p1='▸' ;; balanced) p2='▸' ;; speed) p3='▸' ;; noshape) p4='▸' ;;
   esac
   buf="$(buffer_ceiling "${EGRESS_MBPS:-200}" "$COVER_RTT_MS")"
+  # The live value, not the computed one. These diverge whenever the safe
+  # direction refuses a write — a smaller target under `raise` is silently kept
+  # out — and a panel that prints the target as though it were running is
+  # exactly how an analysis ends up resting on a number that never applied.
+  local live_buf; live_buf="$(live_value net.core.rmem_max)"
   title 'tcpwide 调优面板'
   if (( SHAPE == 1 )); then
     printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
@@ -1142,7 +1152,8 @@ render_panel() {
   printf '\n'
   live_q="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //' | cut -c1-58)"
   printf '  %b根队列%b     %s\n' "$DIM" "$RESET" "${live_q:-未知}"
-  printf '  %b缓冲上限%b   %s MB/socket' "$DIM" "$RESET" "$(mb "$buf")"
+  local show_buf="$buf"; [[ -z "$live_buf" ]] || show_buf="$live_buf"
+  printf '  %b缓冲上限%b   %s MB/socket' "$DIM" "$RESET" "$(mb "$show_buf")"
   if tcpmem="$(tcp_mem_high_bytes)"; then
     printf '%b ｜ 全局 tcp_mem 高水位 %s MB（约 %s 条满上限就触发压力）%b' \
       "$DIM" "$(mb "$tcpmem")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" "$RESET"
@@ -1150,6 +1161,10 @@ render_panel() {
   printf '\n'
   # A route without the metric makes grep exit 1, which under pipefail takes
   # the whole panel down mid-render rather than reporting the kernel default.
+  if [[ -n "$live_buf" && "$live_buf" != "$buf" ]]; then
+    printf '  %b            目标是 %s MB —— 目标更小时不会下调（上限只升不降）%b\n' \
+      "$DIM" "$(mb "$buf")" "$RESET"
+  fi
   cwnd_now="$(current_default_route | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}')"
   printf '  %b首窗%b       initcwnd %s%b（内核默认 10）%b\n' "$DIM" "$RESET" \
     "${cwnd_now:-10}" "$DIM" "$RESET"

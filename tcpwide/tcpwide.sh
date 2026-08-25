@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -225,22 +225,29 @@ bdp_bytes() { printf '%s\n' $(( ${1:-0} * 125 * ${2:-0} )); }
 # raising a per-socket ceiling is not, because it is the thing doing the
 # catching. Formula follows tcpfit: 1/16, 1/8, 1/4 of RAM in pages.
 target_tcp_mem() {
-  local ram page pages
+  local need="${1:-0}" ram page budget
   ram="$(total_ram_bytes)"
   (( ram > 0 )) || return 1
   page="$(getconf PAGESIZE 2>/dev/null || printf 4096)"
-  pages=$(( ram / page ))
-  awk -v p="$pages" 'BEGIN {
-    low = int(p / 16); pres = int(p / 8); max = int(p / 4)
+  budget="$(tcp_mem_budget_bytes "$ram" "$need")"
+  awk -v b="$budget" -v pg="$page" 'BEGIN {
+    max = int(b / pg); low = int(max / 4); pres = int(max / 2)
     if (low  < 4096)  low  = 4096
     if (pres < 8192)  pres = 8192
     if (max  < 16384) max  = 16384
     printf "%d %d %d", low, pres, max }'
 }
 
-# How much one socket may take of the global TCP budget. The budget itself is a
-# quarter of RAM (see target_tcp_mem), so this works out to RAM/16 and leaves
-# room for four large flows before the kernel starts shrinking everyone.
+# How much one socket may take of the global TCP budget: a quarter of it, so
+# four large flows still fit before the kernel starts shrinking anyone.
+#
+# The budget is sized from what the link actually needs rather than from RAM
+# alone — see target_tcp_mem. Sizing it from RAM was wrong in the same way the
+# ladder was: a 520 MB box behind a gigabit port needs far more per socket than
+# its memory would suggest, and rmem_max is a CEILING, not an allocation.
+# Autotuning only grows a socket to what its connection needs, and tcp_mem is
+# the guard that catches the aggregate — when it binds the kernel shrinks
+# buffers, it does not OOM. So the budget can follow the need.
 #
 # This replaces netshape's RAM ladder, which was adopted in 0.5.0 and has to be
 # withdrawn on the evidence.
@@ -257,9 +264,23 @@ target_tcp_mem() {
 # fq maxrate. Meanwhile the thing the ladder guards against, BBR holding a huge
 # cwnd, is now bounded by per-flow pacing rather than by the window.
 socket_budget_cap() {
-  local ram="${1:-0}"
+  local ram="${1:-0}" need="${2:-0}" budget
   (( ram > 0 )) || { printf '0\n'; return 0; }
-  printf '%s\n' $(( ram / 16 ))
+  budget="$(tcp_mem_budget_bytes "$ram" "$need")"
+  printf '%s\n' $(( budget / 4 ))
+}
+
+# The global TCP page budget in bytes. At least a quarter of RAM, grown toward a
+# third when four sockets at the required ceiling would not otherwise fit.
+# A third is the ceiling on the ceiling: past that a proxy box is handing too
+# much of itself to socket buffers.
+tcp_mem_budget_bytes() {
+  local ram="${1:-0}" need="${2:-0}" budget
+  (( ram > 0 )) || { printf '0\n'; return 0; }
+  budget=$(( ram / 4 ))
+  if (( need > 0 )) && (( need * 4 > budget )); then budget=$(( need * 4 )); fi
+  (( budget > ram / 3 )) && budget=$(( ram / 3 ))
+  printf '%s\n' "$budget"
 }
 
 buffer_ceiling() {
@@ -278,7 +299,7 @@ buffer_ceiling() {
   # against RAM directly, as this used to, let a single connection monopolise
   # the budget on a small box.
   if (( ram > 0 )); then
-    cap="$(socket_budget_cap "$ram")"
+    cap="$(socket_budget_cap "$ram" "$buf")"
     (( buf > cap )) && buf="$cap"
   fi
   (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
@@ -322,7 +343,7 @@ target_sysctl() {
   printf 'net.ipv4.tcp_moderate_rcvbuf\t1\texact\t%s\n' \
     '接收缓冲自动伸缩。关掉的话上限就是摆设——连接永远停在默认值，涨不上去'
   local tcpmem
-  if tcpmem="$(target_tcp_mem)"; then
+  if tcpmem="$(target_tcp_mem "$(( $(bdp_bytes "$rate" "$rtt") * 2 + BUF_SLACK ))")"; then
     printf 'net.ipv4.tcp_mem\t%s\traise\t%s\n' "$tcpmem" \
       '全局 TCP 页预算（所有 socket 共享）。rmem_max 只是天花板，这个才是内核硬拦的总量——它太小的话，上限调多大都没用，几条大流一上来就触发压力被缩回去'
   fi
@@ -664,14 +685,18 @@ cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1; }
 
 # Software shaping is not free. CAKE runs the whole egress through one qdisc and
 # does per-packet work on it; on a single-core VPS at several hundred Mbps that
-# can cost more throughput than the policer it is replacing. Roughly 400 Mbps
-# per core is where it starts to matter on a small box.
+# can cost more throughput than the policer it is replacing.
+#
+# The threshold is deliberately not tight: a modern core handles several hundred
+# Mbps of CAKE comfortably, and warning too early tells an operator their
+# hardware cannot do something it plainly can.
+SHAPE_MBPS_PER_CORE=600
 shaping_cpu_warning() {
   local rate="${1:-0}" cores
   (( SHAPE == 1 )) || return 1
   cores="$(cpu_count)"
   is_uint "$cores" && (( cores > 0 )) || cores=1
-  (( rate > cores * 400 )) || return 1
+  (( rate > cores * SHAPE_MBPS_PER_CORE )) || return 1
   printf '%s\t%s\n' "$cores" "$rate"
 }
 

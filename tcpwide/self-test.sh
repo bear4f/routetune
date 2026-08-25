@@ -32,13 +32,19 @@ assert_eq "$((2 * 250 * 125 * 500 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250
 # The asymmetry that motivates a coverage RTT also motivates a floor: a ceiling
 # below what a distant client needs is a cap nobody can diagnose.
 assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope still gets the 8 MiB floor'
-# One socket may take at most an eighth of the global TCP budget, so at least
-# eight large flows fit before anyone hits pressure. The budget's own cap is a
-# quarter of RAM, which puts the per-socket clamp at RAM/32. Clamping against
-# RAM directly let one connection monopolise the budget on a small box.
+# One socket may take at most a quarter of the global TCP budget, so four large
+# flows still fit before the kernel starts shrinking anyone. The budget starts at
+# a quarter of RAM and grows toward a third when four sockets at the required
+# ceiling would not otherwise fit, so a small box with a fast port is not held to
+# a memory ladder that knows nothing about the path. Clamping against RAM
+# directly let one connection monopolise the budget on a small box.
 total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
-assert_eq "$((512 * 1024 * 1024 / 16))" "$(buffer_ceiling 2000 1000)" \
+assert_eq "$((512 * 1024 * 1024 / 3 / 4))" "$(buffer_ceiling 2000 1000)" \
   'one socket is held to a quarter of the global TCP budget'
+# The budget only grows when the need calls for it: a modest ceiling leaves the
+# budget at RAM/4 and is not clamped at all.
+assert_eq "$((2 * 400 * 125 * 200 + 2 * 1024 * 1024))" "$(buffer_ceiling 400 200)" \
+  'a ceiling that fits inside the starting budget is passed through unclamped'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 
 # netshape's RAM ladder was adopted in 0.5.0 and is withdrawn here. It derives a
@@ -52,10 +58,20 @@ total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 # against, BBR holding a huge cwnd, is now bounded by per-flow pacing.
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
 buf="$(buffer_ceiling 1000 250)"
-assert_eq "$((520 * 1024 * 1024 / 16))" "$buf" \
+assert_eq "$((520 * 1024 * 1024 / 3 / 4))" "$buf" \
   'a small box with a fast port is sized by budget, not by a RAM ladder'
 (( buf > 16 * 1024 * 1024 )) || fail 'the budget cap must beat the ladder it replaced here'
 pass 'the gigabit box gets more than the ladder would have allowed'
+# The reason the budget follows the need rather than RAM alone: a 2-core 520 MB
+# box does clear a gigabit, and a budget derived from memory alone decided it
+# could not. What matters is the rate the resulting window supports on the paths
+# that box actually serves — 140-176 ms, not the 250 ms worst case.
+for rtt in 150 176; do
+  win=$(( $(buffer_ceiling 1000 "$rtt") / 2 ))
+  mbps=$(( win / 125 / rtt ))
+  (( mbps >= 1000 )) || fail "a 520 MB box must clear a gigabit at ${rtt}ms, got ${mbps} Mbps"
+done
+pass 'a 520 MB box with a gigabit port clears the port on its real paths'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 assert_eq '475000' "$(shaped_kbit 500)" 'shaping leaves the configured headroom under the line rate'
 
@@ -384,10 +400,16 @@ pass 'four flows at the ceiling fit inside the global budget'
 # needs to know before choosing, not after a slow speedtest.
 SHAPE=1
 cpu_count() { printf '1\n'; }
-[[ -n "$(shaping_cpu_warning 500)" ]] || fail 'one core shaping 500 Mbps must warn'
+[[ -n "$(shaping_cpu_warning 1000)" ]] || fail 'one core shaping a gigabit must warn'
 pass 'shaping well past one core of headroom warns'
-if shaping_cpu_warning 200 >/dev/null 2>&1; then fail '200 Mbps on one core needs no warning'; fi
+if shaping_cpu_warning 500 >/dev/null 2>&1; then fail '500 Mbps on one core needs no warning'; fi
 pass 'a modest rate on one core does not warn'
+# The per-core figure was 400 Mbps, which warned on a 2-core gigabit box that
+# demonstrably shapes a gigabit. A warning that fires on a working configuration
+# teaches the operator to ignore warnings.
+cpu_count() { printf '2\n'; }
+if shaping_cpu_warning 1000 >/dev/null 2>&1; then fail 'two cores at a gigabit needs no warning'; fi
+pass 'two cores shaping a gigabit does not warn'
 cpu_count() { printf '4\n'; }
 if shaping_cpu_warning 500 >/dev/null 2>&1; then fail 'four cores at 500 Mbps needs no warning'; fi
 pass 'enough cores means no shaping warning'

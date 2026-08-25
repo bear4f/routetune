@@ -67,14 +67,14 @@ pass 'an idle peer never reaches an actionable class'
 # ── 策略映射 ───────────────────────────────────────────────────────────────
 assert_eq 'initcwnd 32' "$(class_policy far | sed -n 1p)" \
   'far peers get a bigger initial window'
-assert_eq 'initcwnd 10' "$(class_policy mobile | sed -n 1p)" \
-  'mobile peers get a conservative initial window'
+assert_eq '' "$(class_policy mobile | sed -n 1p)" \
+  'mobile peers do not get a no-op initial-window route'
 assert_eq '' "$(class_policy near | sed -n 1p)" 'near peers get no route change'
 assert_eq '' "$(class_policy flatloss | sed -n 1p)" 'flat loss gets no unproven route change'
 assert_eq '' "$(class_policy lossy | sed -n 1p)" 'light loss gets no route change'
 # BBR ignoring loss is an advantage on random radio loss; cubic would halve
 # the window on every one. Recommending cubic here would be actively wrong.
-[[ "$(class_policy mobile | sed -n 2p)" == *"不要给移动网段换 cubic"* ]] \
+[[ "$(class_policy mobile | sed -n 2p)" == *"不要凭随机无线丢包换 cubic"* ]] \
   || fail 'the mobile note must warn against cubic'
 pass 'the mobile policy warns against switching to cubic'
 [[ "$(class_policy far | sed -n 2p)" == *"初始窗"* ]] || fail 'far note should explain itself'
@@ -187,6 +187,15 @@ else
   assert_eq '3' "$?" 'existing exact routes are never overwritten'
 fi
 unset -f ip
+
+# `ip route help` prints its help to stderr and commonly exits non-zero. The
+# capability detector must still inspect that output under global pipefail.
+has() { [[ "$1" == ip ]]; }
+ip() { printf 'OPTIONS := [ congctl NAME ]\n' >&2; return 255; }
+supports_congctl || fail 'congctl help survives the non-zero ip help exit'
+pass 'congctl capability detection survives ip route help exit status'
+unset -f ip
+has() { command -v "$1" >/dev/null 2>&1; }
 
 # ── BBR 版本判定 ───────────────────────────────────────────────────────────
 assert_eq v1 "$(bbr_variant 'reno cubic bbr' '6.1.0-50-amd64')" 'stock Debian 6.1 is BBRv1'

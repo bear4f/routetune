@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -437,8 +437,8 @@ class_policy() {
       printf '%s\n' '' '默认即可。BDP 小，加大起步窗口只会制造首窗突发，没有收益'
       ;;
     mobile)
-      printf '%s\n' 'initcwnd 10' \
-        '保守起步，别把首窗突发灌进调度受限的无线链路。注意：不要给移动网段换 cubic —— BBR 忽略丢包这一点在随机无线丢包上恰恰是优势，cubic 会每丢一次就砍窗'
+      printf '%s\n' '' \
+        '不改路由参数。initcwnd 只影响新连接的首窗，10 又通常已是 Linux 默认值，治不了长连接中的无线丢包和延迟尾峰。也不要凭随机无线丢包换 cubic；BBR 不会像丢包型算法那样把每次随机丢包都当成持续拥塞'
       ;;
     flatloss)
       printf '%s\n' '' \
@@ -606,6 +606,7 @@ cmd_watch() {
   [[ "$group" =~ ^(ip|net)$ ]] || die "--group 只能是 ip 或 net"
   has ss || die "缺少 ss；请安装 iproute2"
   local round_s=$((samples * interval)) rounds agg n=0 kept=0
+  local total_prefixes trusted_inbound
   rounds=$(( minutes * 60 / round_s )); (( rounds < 1 )) && rounds=1
   panel_title 'routetune 观测'
   info "每轮 ${round_s}s，共 ${rounds} 轮（约 ${minutes} 分钟），结果累积到 $PROFILE_DB"
@@ -616,18 +617,22 @@ cmd_watch() {
   while (( n < rounds )); do
     n=$((n + 1))
     if collect_round "$samples" "$interval" "$group" "$agg"; then
+      total_prefixes="$(awk 'END { print NR + 0 }' "$agg")"
+      trusted_inbound="$(awk -F '\t' -v minseg="$MIN_SEGS_FOR_RETRANS" \
+        '$13 == "in" && ($12 + 0) >= minseg { n++ } END { print n + 0 }' "$agg")"
       merge_profiles "$agg"
-      kept=$((kept + 1))
-      printf '  %b[%s/%s]%b 已合并 %s 个前缀\n' "$DIM" "$n" "$rounds" "$RESET" "$(($(grep -c "" "$agg")))"
+      if (( trusted_inbound > 0 )); then kept=$((kept + 1)); fi
+      printf '  %b[%s/%s]%b 可信入站 %s 个（本轮共聚合 %s 个前缀）\n' \
+        "$DIM" "$n" "$rounds" "$RESET" "$trusted_inbound" "$total_prefixes"
     else
       printf '  %b[%s/%s]%b 窗口内无活跃连接，跳过\n' "$DIM" "$n" "$rounds" "$RESET"
     fi
   done
   if (( kept == 0 )); then
-    warn "没有采到任何数据；确认这台机器上确实有客户端在用"
+    warn "没有采到达到样本门槛的入站数据；确认客户端在观测期间确实有持续流量"
     return 0
   fi
-  log "观测完成，${kept}/${rounds} 轮有数据。看结果：$PROGRAM profiles"
+  log "观测完成，${kept}/${rounds} 轮有可信入站数据。看结果：$PROGRAM profiles"
 }
 
 # ── 画像与建议 ─────────────────────────────────────────────────────────────
@@ -659,7 +664,7 @@ cmd_profiles() {
   rows="$(profile_rows)" || die "还没有画像，先跑：$PROGRAM watch --minutes 30"
   [[ -n "$rows" ]] || die "画像库是空的，先跑：$PROGRAM watch --minutes 30"
   panel_title 'routetune 画像'
-  printf '  %b前缀                      轮次 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
+  printf '  %b前缀                      轮次 RTT50 峰95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
   local prefix obs p50 p95 mn jit bl tl rt sg sp class
   while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
@@ -672,6 +677,7 @@ cmd_profiles() {
   done <<< "$rows"
   rule_light
   printf '  %b轮次 = 这个前缀被观测到多少轮；轮次越多画像越可信%b\n' "$DIM" "$RESET"
+  printf '  %b峰95 = 所有可信轮次中最高的一轮 RTT95，用来保留卡顿尾峰；不是整段观测的全量 P95%b\n' "$DIM" "$RESET"
   printf '  %b出策略：%s recommend%b\n' "$DIM" "$PROGRAM" "$RESET"
 }
 
@@ -776,8 +782,13 @@ cmd_recommend() {
 # Per-route congestion control landed in Linux 4.0 (RTAX_CC_ALGO), but only
 # iproute2 knows whether the local `ip` can express it.
 supports_congctl() {
+  local help
   has ip || return 1
-  ip route help 2>&1 | grep -q 'congctl'
+  # `ip route help` commonly prints valid help and exits non-zero. With the
+  # script-wide pipefail setting, piping it directly into grep reports a false
+  # negative even when the word is present.
+  help="$(ip route help 2>&1 || true)"
+  grep -q 'congctl' <<< "$help"
 }
 
 # DSACK reports duplicate data observed by the receiver. It is useful evidence
@@ -875,7 +886,7 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
 
   远端固网   RTT ≥120ms 且稳定      → A/B 测试 initcwnd 32
   近端固网   RTT <120ms 且稳定      → 默认即可，加大起步只会制造突发
-  移动网络   丢包 + 延迟尾部散开     → initcwnd 保守；不要换 cubic
+  移动网络   丢包 + 延迟尾部散开     → 不改首窗；长连接问题不靠 initcwnd 修
   稳定延迟丢包 重传 ≥1%、延迟较稳    → 不推断限速器；主动复测前不改参数
   轻度丢包   重传 0.1%-1%           → 继续观测，不当作健康固网优化
   接入网排队 中位膨胀 ≥3            → 服务端限速无效，根治靠 BBRv3

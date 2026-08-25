@@ -37,8 +37,24 @@ assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope stil
 # quarter of RAM, which puts the per-socket clamp at RAM/32. Clamping against
 # RAM directly let one connection monopolise the budget on a small box.
 total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
-assert_eq "$((512 * 1024 * 1024 / 32))" "$(buffer_ceiling 2000 1000)" \
-  'one socket is capped at an eighth of the global TCP budget'
+assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 2000 1000)" \
+  'the field-proven ladder caps a small box below the budget rule'
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+
+# tcpfit tunes clean links, where too small is a silent cap and too large costs
+# only overshoot. netshape tunes policed cross-border links, where oversized
+# buffers let BBR hold a huge cwnd and retransmissions explode. Both are right
+# in their own domain; a cross-border relay is netshape's, so the ladder wins
+# wherever it is stricter.
+assert_eq "$((16 * 1024 * 1024))" "$(netshape_memory_cap 958)" \
+  'a sub-1GB box is held to 16 MB'
+assert_eq "$((32 * 1024 * 1024))" "$(netshape_memory_cap 1900)" 'a 2GB-class box gets 32 MB'
+assert_eq "$((128 * 1024 * 1024))" "$(netshape_memory_cap 16000)" 'a large box gets the top rung'
+# The live 958 MB box: 30 MB let BBR put 2.9x a 500 Mbps line in flight at
+# 171ms; 16 MB holds it to 1.6x.
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+  'the live box is held to the ladder rather than to RAM/32'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 assert_eq '475000' "$(shaped_kbit 500)" 'shaping leaves the configured headroom under the line rate'
 
@@ -115,7 +131,13 @@ pass 'the shaper sits under the provider line rate'
 [[ "$q" == *"rtt 250ms"* ]] || fail 'the AQM target must follow the coverage RTT'
 pass 'the AQM target follows the coverage RTT rather than CAKE default'
 SHAPE=0
-assert_eq fq "$(target_qdisc 500 250)" 'without shaping we still pace, but claim nothing more'
+# Even unshaped, every flow is paced at the line rate. Without that a single BBR
+# flow with a large window probes far past the link and whatever is downstream
+# drops the overshoot — and BBRv1 does not read those drops as congestion, so it
+# keeps producing them. netshape puts this under its shaper; shaping the
+# aggregate is not a substitute for pacing the individual flow.
+assert_eq 'fq maxrate 475mbit' "$(target_qdisc 500 250)" \
+  'unshaped still paces each flow at the line rate'
 SHAPE=1
 
 # ── 方向安全 ───────────────────────────────────────────────────────────────
@@ -209,7 +231,8 @@ apply_profile speed
 assert_eq '98|32|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the speed profile shapes closer to the line rate'
 apply_profile noshape
 assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
-assert_eq fq "$(target_qdisc 500 250)" 'the no-shape profile yields fq, not cake'
+assert_eq 'fq maxrate 490mbit' "$(target_qdisc 500 250)" \
+  'the no-shape profile yields paced fq, not cake'
 if apply_profile nonsense 2>/dev/null; then fail 'an unknown profile must be rejected'; fi
 pass 'an unknown profile is rejected'
 apply_profile balanced
@@ -412,8 +435,11 @@ suggest_cover_rtt() { printf '250\t169\t14\n'; }
 out="$(explain_cover_rtt 500 2>&1)"
 [[ "$out" == *"已被内存夹住"* ]] || fail 'a clamped row must be marked as clamped'
 pass 'a clamped row in the cost table is marked'
-[[ "$out" == *"超过 234 ms 不会再增加缓冲"* ]] \
+[[ "$out" == *"超过 117 ms 不会再增加缓冲"* ]] \
   || fail 'the point where the clamp starts binding must be named'
+[[ "$out" == *"重传就爆了"* ]] \
+  || fail 'when the field ladder binds it must say why, not cite the budget rule'
+pass 'the binding rule explains itself rather than citing the wrong one'
 pass 'the coverage RTT past which nothing changes is stated outright'
 # A box with room to spare must not claim a clamp it is nowhere near.
 total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }

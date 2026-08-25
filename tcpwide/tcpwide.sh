@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -221,8 +221,31 @@ target_tcp_mem() {
     printf "%d %d %d", low, pres, max }'
 }
 
+# netshape's field-proven ladder. Its reason is the mirror image of tcpfit's
+# asymmetry argument rather than a contradiction of it.
+#
+# tcpfit tunes CLEAN links, where a ceiling that is too small is a silent cap
+# and one that is too large costs only a little overshoot. netshape tunes
+# POLICED cross-border links, and its comment is blunt: oversized buffers let
+# BBR hold a huge cwnd and retransmissions explode. Both are right in their own
+# domain, and a cross-border relay is squarely netshape's.
+#
+# The arithmetic on the live 958 MB box makes it concrete. A 30 MB send buffer
+# lets BBR put 1472 Mbps in flight on a 171ms path — 2.9x a 500 Mbps line. BBRv1
+# does not back off on loss, so it keeps pushing that overshoot into whatever
+# drops it. This ladder holds the same box to 16 MB, or 1.6x.
+netshape_memory_cap() {
+  local mb="${1:-1024}"
+  if   (( mb < 512 ));  then printf '%s\n' $((8   * 1024 * 1024))
+  elif (( mb < 1024 )); then printf '%s\n' $((16  * 1024 * 1024))
+  elif (( mb < 2048 )); then printf '%s\n' $((32  * 1024 * 1024))
+  elif (( mb < 4096 )); then printf '%s\n' $((64  * 1024 * 1024))
+  else                       printf '%s\n' $((128 * 1024 * 1024))
+  fi
+}
+
 buffer_ceiling() {
-  local rate="${1:-0}" rtt="${2:-0}" ram buf cap
+  local rate="${1:-0}" rtt="${2:-0}" ram buf cap ladder
   buf=$(( $(bdp_bytes "$rate" "$rtt") * 2 + BUF_SLACK ))
   (( buf > BUF_CAP )) && buf="$BUF_CAP"
   ram="$(total_ram_bytes)"
@@ -233,6 +256,8 @@ buffer_ceiling() {
   # the budget on a small box.
   if (( ram > 0 )); then
     cap=$(( ram / 32 ))
+    ladder="$(netshape_memory_cap $(( ram / 1048576 )))"
+    (( ladder < cap )) && cap="$ladder"
     (( buf > cap )) && buf="$cap"
   fi
   (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
@@ -304,7 +329,15 @@ target_sysctl() {
 # standing, and reads that as congestion it does not have.
 target_qdisc() {
   local rate="${1:-0}" rtt="${2:-0}"
-  (( SHAPE == 1 )) || { printf 'fq\n'; return 0; }
+  # fq maxrate paces every FLOW at the line rate. Without it a single BBR flow
+  # with a large window probes far past the link, and whatever sits downstream —
+  # the provider's policer, or our own shaper — drops the overshoot. BBRv1 does
+  # not read those drops as congestion, so it keeps producing them. netshape
+  # puts exactly this under its shaper; tcpwide had no equivalent, and shaping
+  # the aggregate is not a substitute for pacing the individual flow.
+  local perflow; perflow=$(( rate * SHAPE_PCT / 100 ))
+  (( perflow > 0 )) || perflow="$rate"
+  (( SHAPE == 1 )) || { printf 'fq maxrate %smbit\n' "$perflow"; return 0; }
   # No `ecn` keyword: mainline sch_cake already marks ECN-capable packets
   # instead of dropping them, so there is nothing to switch on, and the option
   # does not exist in current iproute2 — the live node rejected the whole spec
@@ -887,7 +920,11 @@ explain_cover_rtt() {
 ' "$DIM" "$RESET"
     local r ram clamp knee
     ram="$(total_ram_bytes)"
+    # Whichever of the two caps actually binds, so the marker and the knee
+    # below describe the rule the operator is really up against.
     clamp=$(( ram / 32 ))
+    local ladder; ladder="$(netshape_memory_cap $(( ram / 1048576 )))"
+    (( ladder < clamp )) && clamp="$ladder"
     for r in 100 250 400; do
       buf="$(buffer_ceiling "$rate" "$r")"
       printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%s%b
@@ -900,10 +937,16 @@ explain_cover_rtt() {
     if (( ram > 0 && rate > 0 )); then
       knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
       if (( knee >= 10 && knee <= 2000 )); then
-        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB（全局预算的 1/8，保证至少%b\n' \
+        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB。%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
-        printf '  %b8 条大流能同时到顶）。所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' \
-          "$DIM" "$knee" "$RESET"
+        if (( clamp == $(netshape_memory_cap $(( ram / 1048576 ))) )); then
+          printf '  %b这是 netshape 实战得出的档位：跨境线路上被限速时，缓冲给太大会让 BBR%b\n' \
+            "$DIM" "$RESET"
+          printf '  %b攒起巨大的 cwnd，超发的部分被丢掉，重传就爆了。%b\n' "$DIM" "$RESET"
+        else
+          printf '  %b（全局 TCP 预算的 1/8，保证至少 8 条大流能同时到顶）%b\n' "$DIM" "$RESET"
+        fi
+        printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' "$DIM" "$knee" "$RESET"
       fi
     fi
   fi
@@ -1179,9 +1222,13 @@ panel_diagnose() {
     printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \
       "$wrtt" "$(mb "$wbytes")" "$wobs"
     printf '    %b对端窗口决定的单流上限：%s Mbps%b\n' "$BOLD" "$wceil" "$RESET"
-    printf '    %b单流永远不会超过「对端愿意收多少 ÷ 往返时间」。这台机器改不了那个数——%b\n' \
+    printf '    %b单流不会超过「对端愿意收多少 ÷ 往返时间」。但对端窗口是自动伸缩的：%b\n' \
       "$DIM" "$RESET"
-    printf '    %b单线程跑分到不了线速时，先排除这一条，否则会一直在服务端找不存在的原因。%b\n' \
+    printf '    %b我们推得多快它就长到多大，所以这两个数吻合既可能是对端封顶，也可能只是%b\n' \
+      "$DIM" "$RESET"
+    printf '    %b它跟着我们的发送量长到那儿。这是一条要排除的可能，不是结论——%b\n' \
+      "$DIM" "$RESET"
+    printf '    %b真正判定看多线程：多线程到线速而单线程到不了，才是对端窗口的锅。%b\n' \
       "$DIM" "$RESET"
   fi
   printf '\n  根队列:            %s\n' \

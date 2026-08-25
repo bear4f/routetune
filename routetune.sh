@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -249,8 +249,10 @@ END {
 # coalescing and scheduling — not by anything happening on the network. A
 # same-datacenter peer at 0.7ms will happily report a jitter ratio of 0.4.
 LOCAL_RTT_FLOOR_MS=5
-# A percentage over a handful of segments is noise: one retransmit out of
-# three is 33%, and it means nothing. Real streaming clients clear this easily.
+# Stale RTT fields on an idle socket are not a path sample. A modest amount of
+# fresh data is enough to trust the latency shape, while loss needs a larger
+# denominator: one retransmit out of 1000 is already 0.1%.
+MIN_SEGS_FOR_PATH=100
 MIN_SEGS_FOR_RETRANS=1000
 
 # rtt / minrtt is how many times the path has grown above the connection's
@@ -293,41 +295,45 @@ diagnose_peer() {
   local tail="${6:-$1}" spread="${7:-1}"
   awk -v b="$bloat" -v j="$jitter" -v r="$retrans" -v t="$rtt" -v sg="$segs" \
       -v tb="$tail" -v sp="$spread" \
-      -v floor="$LOCAL_RTT_FLOOR_MS" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
+      -v floor="$LOCAL_RTT_FLOOR_MS" -v minpath="$MIN_SEGS_FOR_PATH" \
+      -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor) {
       print "同机房量级连接（RTT < " floor "ms）——这个量级上抖动和膨胀都是计时噪声，不用管";
       exit
     }
+    if (sg < minpath) {
+      print "基本空闲，采样窗口内只发了 " sg " 段，数据不足以判断";
+      exit
+    }
     trust_r = (sg >= minseg)
-    # An idle connection has too few RTT samples for rttvar to mean anything
-    # either, so this gates jitter and bloat as much as it gates loss.
-    if (!trust_r) { print "基本空闲，采样窗口内只发了 " sg " 段，数据不足以判断"; exit }
-    if (b >= 3 && r < 1) {
+    if (b >= 3 && (!trust_r || r < 1)) {
       print "接入网排队膨胀——瓶颈队列不在服务器上；先做更长观测，再在可控机器上 A/B 测试 pacing 或 BBRv3";
       exit
     }
-    if (r >= 1 && b >= 2) {
+    if (trust_r && r >= 1 && b >= 2) {
       print "既排队又丢包——被动快照不能判断队列或丢包发生在哪一段；先延长观测，不据此直接降速";
       exit
     }
     # A spread latency tail plus loss is useful evidence of radio scheduling.
     # Flat latency is not proof of a policer: the same mobile prefix can be
     # temporarily flat during one window and bursty during the next.
-    if (r >= 1 && (j >= 0.15 || sp >= 1.4)) {
+    if (trust_r && r >= 1 && (j >= 0.15 || sp >= 1.4)) {
       print "无线接入层丢包（4G/5G 典型）——没有持续排队，但丢包和延迟尾部都高。这类丢包不是拥塞信号，降速率收益有限，客户端播放器多缓冲更有效";
       exit
     }
-    if (r >= 1) {
+    if (trust_r && r >= 1) {
       print "稳定延迟丢包——可能是暂时平稳的移动网、随机路径丢包或 policer；被动快照无法区分，不要据此直接降速，需主动复测";
       exit
     }
-    if (r >= 0.1) {
+    if (trust_r && r >= 0.1) {
       print "轻度丢包——高于干净线但不足以归因；继续用 watch 累积画像，不据此改路由参数";
       exit
     }
     if (tb >= 3) { print "间歇性排队——中位队列不深，但尾部涨到底噪的 " sprintf("%.1f", tb) " 倍，卡顿多半发生在这些尖峰上"; exit }
     if (j >= 0.3) { print "链路抖动大（无线接入或路径拥塞）——速率波动来自这里，不是你的配置"; exit }
+    if (sp >= 1.4) { print "延迟尾部散开——RTT95 是中位的 " sprintf("%.1f", sp) " 倍，链路存在时变尖峰；继续累积画像"; exit }
     if (b >= 1.5) { print "轻微排队，可接受"; exit }
+    if (!trust_r) { print "路径延迟健康；窗口内 " sg " 段足以看 RTT，但未满 " minseg " 段，重传率暂不判断"; exit }
     print "健康";
   }'
 }
@@ -393,16 +399,17 @@ classify_peer() {
         retrans="${5:-0}" spread="${6:-1}" segs="${7:-0}"
   awk -v t="$p50" -v j="$jit" -v b="$bloat" -v tb="$tail" -v r="$retrans" \
       -v sp="$spread" -v sg="$segs" -v floor="$LOCAL_RTT_FLOOR_MS" \
-      -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
+      -v minpath="$MIN_SEGS_FOR_PATH" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor)   { print "local";  exit }
-    if (sg < minseg) { print "idle";   exit }
+    if (sg < minpath) { print "idle";  exit }
+    trust_r = (sg >= minseg)
     if (b >= 3)      { print "bloated"; exit }
     # Loss with a spread latency tail is evidence of radio scheduling. Flat
     # latency is deliberately not called a rate limiter: this DMIT mobile
     # prefix was flat in consecutive windows while loss moved 3.07% -> 0.51%.
-    if (r >= 1 && (j >= 0.15 || sp >= 1.4)) { print "mobile"; exit }
-    if (r >= 1)      { print "flatloss"; exit }
-    if (r >= 0.1)    { print "lossy"; exit }
+    if (trust_r && r >= 1 && (j >= 0.15 || sp >= 1.4)) { print "mobile"; exit }
+    if (trust_r && r >= 1)      { print "flatloss"; exit }
+    if (trust_r && r >= 0.1)    { print "lossy"; exit }
     if (tb >= 3)     { print "spiky";  exit }
     if (j >= 0.3 || sp >= 1.4) { print "variable"; exit }
     if (t >= 120)    { print "far";    exit }
@@ -487,7 +494,7 @@ FNR == NR && FILENAME == db {
   k = $1
   if (!(k in n)) { n[k] = 0; trusted[k] = 0; first[k] = stamp }
   n[k]++
-  if (($12 + 0) >= minseg) {
+  if (($12 + 0) >= minpath) {
     trusted[k]++
     p50s[k] += $4
     if ($5 > p95m[k]) p95m[k] = $5
@@ -517,7 +524,7 @@ merge_profiles() {
   mkdir -p "$STATE_DIR"
   [[ -e "$PROFILE_DB" ]] || printf 'prefix\n' > "$PROFILE_DB"
   merged="$(mktemp)"
-  awk -v db="$PROFILE_DB" -v stamp="$stamp" -v minseg="$MIN_SEGS_FOR_RETRANS" \
+  awk -v db="$PROFILE_DB" -v stamp="$stamp" -v minpath="$MIN_SEGS_FOR_PATH" \
     "$PROFILE_MERGE_AWK" "$PROFILE_DB" "$agg" > "$merged"
   mv -f "$merged" "$PROFILE_DB"
   chmod 0600 "$PROFILE_DB"
@@ -618,8 +625,8 @@ cmd_watch() {
     n=$((n + 1))
     if collect_round "$samples" "$interval" "$group" "$agg"; then
       total_prefixes="$(awk 'END { print NR + 0 }' "$agg")"
-      trusted_inbound="$(awk -F '\t' -v minseg="$MIN_SEGS_FOR_RETRANS" \
-        '$13 == "in" && ($12 + 0) >= minseg { n++ } END { print n + 0 }' "$agg")"
+      trusted_inbound="$(awk -F '\t' -v minpath="$MIN_SEGS_FOR_PATH" \
+        '$13 == "in" && ($12 + 0) >= minpath { n++ } END { print n + 0 }' "$agg")"
       merge_profiles "$agg"
       if (( trusted_inbound > 0 )); then kept=$((kept + 1)); fi
       printf '  %b[%s/%s]%b 可信入站 %s 个（本轮共聚合 %s 个前缀）\n' \

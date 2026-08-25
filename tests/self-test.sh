@@ -58,6 +58,13 @@ assert_eq local "$(classify_peer 0.7 3.875 -1 -1 0.0 5.14 500000)" \
   'a same-datacentre peer is gated out'
 assert_eq idle "$(classify_peer 170.5 0.443 1.11 1.15 33.3 1.05 3)" \
   'three segments cannot classify as anything actionable'
+assert_eq far "$(classify_peer 147.0 0.035 1.01 1.04 0.0 1.03 991)" \
+  '991 fresh segments can classify a stable RTT path without claiming clean loss'
+assert_eq far "$(classify_peer 147.0 0.035 1.01 1.04 50.0 1.03 991)" \
+  'sub-threshold retransmission percentages cannot drive a loss class'
+[[ "$(diagnose_peer 1.14 0.116 0.0 191.1 1965 1.61 1.41)" == *"延迟尾部散开"* ]] \
+  || fail 'a variable classification must not be diagnosed as healthy'
+pass 'spread latency tails receive a matching diagnosis'
 for c in mobile flatloss lossy far near bloated spiky variable; do
   [[ "$(classify_peer 170.5 0.443 4.0 5.0 33.3 2.0 3)" != "$c" ]] \
     || fail "an idle peer must never classify as $c"
@@ -115,6 +122,10 @@ assert_eq '2' "$(profile_rows | awk -F'\t' '$1 == "203.0.113.0/24" {print $2}')"
 printf '104.21.67.0/24\t1\tbbr\t2.0\t3.0\t1.0\t0.500\t2.0\t0.0\t50.0\t10\t9000\tout\t3.0\t0\n' > "$r1"
 merge_profiles "$r1"
 assert_eq 2 "$(profile_rows | grep -c '')" 'outbound CDN prefixes never enter the profile database'
+printf '192.0.2.0/24\t1\tbbr\t147.0\t152.1\t145.8\t0.035\t1.01\t0.0\t2.0\t10\t991\tin\t1.04\t0\n' > "$r1"
+merge_profiles "$r1"
+assert_eq 1 "$(profile_rows | awk -F'\t' '$1 == "192.0.2.0/24" {n++} END {print n + 0}')" \
+  'a 991-segment round contributes trustworthy latency evidence'
 rm -rf "$tmp"
 
 # ── 虚假重传 ───────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -336,7 +336,7 @@ diagnose_peer() {
     if (tb >= 3) { print "间歇性排队——中位队列不深，但尾部涨到底噪的 " sprintf("%.1f", tb) " 倍，卡顿多半发生在这些尖峰上"; exit }
     if (j >= 0.3) { print "链路抖动大（无线接入或路径拥塞）——速率波动来自这里，不是你的配置"; exit }
     if (sp >= 1.4) { print "延迟尾部散开——RTT95 是中位的 " sprintf("%.1f", sp) " 倍，链路存在时变尖峰；继续累积画像"; exit }
-    if (b >= 1.5) { print "轻微排队，可接受"; exit }
+    if (b >= 1.5) { print "轻微排队——路径稳定坐在底噪之上，不影响使用，但已有存量队列时不适合再加大首窗"; exit }
     if (!trust_r) { print "路径延迟健康；窗口内 " sg " 段足以看 RTT，但未满 " minseg " 段，重传率暂不判断"; exit }
     print "健康";
   }'
@@ -407,7 +407,12 @@ classify_peer() {
     if (t < floor)   { print "local";  exit }
     if (sg < minpath) { print "idle";  exit }
     trust_r = (sg >= minseg)
-    if (b >= 3)      { print "bloated"; exit }
+    # Deep queueing is only the whole story when loss is low. With both
+    # present, a passive snapshot cannot say which segment of the path owns
+    # the queue or the drops, so it gets its own class rather than being
+    # filed under one cause and handed the policy text for that cause.
+    if (b >= 3 && (!trust_r || r < 1)) { print "bloated"; exit }
+    if (trust_r && r >= 1 && b >= 2)   { print "mixed";   exit }
     # Loss with a spread latency tail is evidence of radio scheduling. Flat
     # latency is deliberately not called a rate limiter: this DMIT mobile
     # prefix was flat in consecutive windows while loss moved 3.07% -> 0.51%.
@@ -418,6 +423,15 @@ classify_peer() {
     # different animal from one that spiked once in a thousand.
     if (tb >= 3 || spf >= 0.1) { print "spiky"; exit }
     if (j >= 0.3 || sp >= 1.4) { print "variable"; exit }
+    # Standing queue short of the bloat threshold. It used to fall through to
+    # "far", which is the one class that hands out a bigger initial window --
+    # exactly the wrong prescription for a path already sitting above its
+    # floor. It is not alarming enough to act on either way, so it says so.
+    if (b >= 1.5)    { print "queued"; exit }
+    # The path shape is trustworthy at MIN_SEGS_FOR_PATH, but calling a prefix
+    # a clean fixed line means asserting its loss is low, and that assertion
+    # needs the larger denominator. Without it, no initcwnd change.
+    if (!trust_r)    { print "unverified"; exit }
     if (t >= 120)    { print "far";    exit }
     print "near";
   }'
@@ -428,11 +442,14 @@ class_label() {
     local)   printf '同机房\n' ;;
     idle)    printf '数据不足\n' ;;
     bloated) printf '接入网排队\n' ;;
+    mixed)   printf '排队且丢包\n' ;;
     mobile)  printf '移动网络\n' ;;
     flatloss) printf '稳定延迟丢包\n' ;;
     lossy)    printf '轻度丢包\n' ;;
     spiky)   printf '间歇排队\n' ;;
     variable) printf '时变链路\n' ;;
+    queued)  printf '轻微排队\n' ;;
+    unverified) printf '丢包未证实\n' ;;
     far)     printf '远端固网\n' ;;
     near)    printf '近端固网\n' ;;
     *)       printf '未知\n' ;;
@@ -464,6 +481,18 @@ class_policy() {
     bloated)
       printf '%s\n' '' \
         '对端接入网在囤队列。服务器无法直接管理对方队列；若要试降 pacing 或 BBRv3，请在可回滚测试机上做 A/B，阶段一不自动下发'
+      ;;
+    mixed)
+      printf '%s\n' '' \
+        '同时有明显排队（膨胀 ≥2）和 ≥1% 重传。被动观测无法判断队列和丢包出在路径的哪一段，也就无法判断该压首窗还是该压速率；不改任何路由参数，先延长观测'
+      ;;
+    queued)
+      printf '%s\n' '' \
+        '路径稳定坐在底噪之上（膨胀 1.5–3），还不到接入网囤队列的程度。不给 initcwnd 32——路径已经有存量队列时加大首窗只会把尖峰推高'
+      ;;
+    unverified)
+      printf '%s\n' '' \
+        '延迟形状健康，但窗口内段数不够，重传率还没被证实。要判成干净固网就得先证明它低重传；证明之前不改首窗'
       ;;
     spiky)
       printf '%s\n' '' \
@@ -513,8 +542,11 @@ FNR == NR && FILENAME == db {
     if ($5 > p95m[k]) p95m[k] = $5
     if (!(k in mins) || $6 < mins[k]) mins[k] = $6
     jits[k] += $7
+    # -1 is the "no measurable floor" sentinel from the aggregator, not a
+    # ratio. Summed as-is it dragged the tail total of a same-host prefix
+    # below zero.
     bls[k]  += ($8 > 0 ? $8 : 0)
-    tls[k]  += $14
+    tls[k]  += ($14 > 0 ? $14 : 0)
     if ($14 > tlm[k]) tlm[k] = $14
     if ($14 >= spiketail) spk[k]++
     retrs[k] += $15
@@ -597,7 +629,7 @@ cmd_scan() {
     spread="$(row_spread "$p95" "$p50")"
     class="$(classify_peer "$p50" "$jit" "$bloat" "$tail" "$rpct" "$spread" "$segs")"
     local color="$GREEN"
-    case "$class" in mobile|flatloss|lossy|bloated|spiky|variable) color="$YELLOW" ;; esac
+    case "$class" in mobile|flatloss|lossy|bloated|mixed|spiky|variable) color="$YELLOW" ;; esac
     local bt="$bloat" tt="$tail" rt="$rpct"
     awk -v b="$bloat" 'BEGIN {exit !(b < 0)}' && { bt="—"; tt="—"; }
     (( segs < MIN_SEGS_FOR_RETRANS )) && rt="—"
@@ -703,7 +735,7 @@ cmd_profiles() {
   while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk; do
     class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf")"
     local color="$GREEN"
-    case "$class" in mobile|flatloss|lossy|bloated|spiky|variable) color="$YELLOW" ;; esac
+    case "$class" in mobile|flatloss|lossy|bloated|mixed|spiky|variable) color="$YELLOW" ;; esac
     local spike="$spk/$obs"; (( spk < 0 )) && spike='—'
     printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %5s %7s  %s\n' \
       "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" \
@@ -713,6 +745,7 @@ cmd_profiles() {
   printf '  %b轮次 = 这个前缀被观测到多少轮；轮次越多画像越可信%b\n' "$DIM" "$RESET"
   printf '  %b峰95 = 所有可信轮次中最高的一轮 RTT95，用来保留卡顿尾峰；不是整段观测的全量 P95%b\n' "$DIM" "$RESET"
   printf '  %b尾涨/抖动/膨胀 = 各轮的平均值；尖峰 = 有多少轮 RTT95 涨到底噪的 %s 倍以上%b\n' "$DIM" "$SPIKE_TAIL" "$RESET"
+  printf '  %b膨胀用的是每轮自己的底噪，不是「最低」这一列（那是全程最低），所以它不等于 RTT50÷最低%b\n' "$DIM" "$RESET"
   printf '  %b分类看的是尖峰出现的频率，不是最差那一轮——偶发一次不该把一条链路永久打上标签%b\n' "$DIM" "$RESET"
   printf '  %b出策略：%s recommend%b\n' "$DIM" "$PROGRAM" "$RESET"
 }
@@ -921,14 +954,20 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
 
 画像分类与对应策略：
 
-  远端固网   RTT ≥120ms 且稳定      → A/B 测试 initcwnd 32
+  远端固网   RTT ≥120ms、无排队、已证实低重传 → A/B 测试 initcwnd 32
   近端固网   RTT <120ms 且稳定      → 默认即可，加大起步只会制造突发
+  轻微排队   膨胀 1.5-3、无明显丢包  → 已有存量队列，不加大首窗
+  丢包未证实 延迟形状够看、段数不够   → 没证实低重传就不算干净固网
   移动网络   丢包 + 延迟尾部散开     → 不改首窗；长连接问题不靠 initcwnd 修
+  排队且丢包 膨胀 ≥2 且重传 ≥1%      → 分不清队列和丢包在哪一段，什么都不改
   稳定延迟丢包 重传 ≥1%、延迟较稳    → 不推断限速器；主动复测前不改参数
   轻度丢包   重传 0.1%-1%           → 继续观测，不当作健康固网优化
-  接入网排队 中位膨胀 ≥3            → 服务端限速无效，根治靠 BBRv3
+  接入网排队 中位膨胀 ≥3 且丢包低     → 服务端限速无效，根治靠 BBRv3
   间歇排队   尾峰反复出现（≥10% 轮次） → 先观察；偶发一次不算
   时变链路   抖动或尾部散布高、无明确丢包 → 延长观测，不凭快照改参数
+
+只有「远端固网」会输出命令。任何一项证据不成立——有存量队列、有丢包、或段数不够
+证实低重传——都会落到别的类，拿不到 initcwnd 32。
 
 阶段一只出建议不落地。画像准不准要先用真实流量验证过，再谈自动下发。
 

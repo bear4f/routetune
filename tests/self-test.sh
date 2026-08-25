@@ -58,14 +58,17 @@ assert_eq local "$(classify_peer 0.7 3.875 -1 -1 0.0 5.14 500000)" \
   'a same-datacentre peer is gated out'
 assert_eq idle "$(classify_peer 170.5 0.443 1.11 1.15 33.3 1.05 3)" \
   'three segments cannot classify as anything actionable'
-assert_eq far "$(classify_peer 147.0 0.035 1.01 1.04 0.0 1.03 991)" \
-  '991 fresh segments can classify a stable RTT path without claiming clean loss'
-assert_eq far "$(classify_peer 147.0 0.035 1.01 1.04 50.0 1.03 991)" \
+# 991 segments is enough to trust the latency shape but not the loss rate.
+# "far" is the one class that asserts low retransmission and hands out a
+# bigger initial window, so an unverified path must not land there.
+assert_eq unverified "$(classify_peer 147.0 0.035 1.01 1.04 0.0 1.03 991)" \
+  '991 fresh segments read the RTT shape without claiming the loss rate is clean'
+assert_eq unverified "$(classify_peer 147.0 0.035 1.01 1.04 50.0 1.03 991)" \
   'sub-threshold retransmission percentages cannot drive a loss class'
 [[ "$(diagnose_peer 1.14 0.116 0.0 191.1 1965 1.61 1.41)" == *"延迟尾部散开"* ]] \
   || fail 'a variable classification must not be diagnosed as healthy'
 pass 'spread latency tails receive a matching diagnosis'
-for c in mobile flatloss lossy far near bloated spiky variable; do
+for c in mobile flatloss lossy far near bloated mixed queued unverified spiky variable; do
   [[ "$(classify_peer 170.5 0.443 4.0 5.0 33.3 2.0 3)" != "$c" ]] \
     || fail "an idle peer must never classify as $c"
 done
@@ -255,5 +258,65 @@ has() { command -v "$1" >/dev/null 2>&1; }
 assert_eq v1 "$(bbr_variant 'reno cubic bbr' '6.1.0-50-amd64')" 'stock Debian 6.1 is BBRv1'
 assert_eq v3 "$(bbr_variant 'reno cubic bbr bbr3' '6.1.0-50-amd64')" 'an explicit bbr3 wins'
 assert_eq nonstock "$(bbr_variant 'reno cubic bbr' '6.6.7-x64v3-xanmod1')" 'XanMod is not assumed v1'
+
+
+# ── 表格标签与箭头说明必须一致 ─────────────────────────────────────────────
+# scan prints class_label(classify_peer(...)) on the row and diagnose_peer(...)
+# on the arrow beneath it. They were two independent ladders, so a prefix with
+# both queueing and loss showed 接入网排队 on the row and 既排队又丢包 below it.
+expect_arrow() {
+  case "$1" in
+    bloated)    printf '接入网排' ;;  mixed)      printf '既排队又' ;;
+    mobile)     printf '无线接入' ;;  flatloss)   printf '稳定延迟' ;;
+    lossy)      printf '轻度丢包' ;;  spiky)      printf '间歇性排' ;;
+    variable)   printf '链路抖动|延迟尾部' ;;
+    queued)     printf '轻微排队' ;;  unverified) printf '路径延迟' ;;
+    far|near)   printf '健康' ;;      idle)       printf '基本空闲' ;;
+    local)      printf '同机房' ;;
+  esac
+}
+mismatches=0
+for b in 1.0 1.6 2.4 3.5; do for j in 0.05 0.2 0.35; do
+for r in 0.0 0.5 1.5; do for sp in 1.1 1.5; do for sg in 500 50000; do
+  tl="$(awk -v b="$b" -v s="$sp" 'BEGIN {printf "%.2f", b * s}')"
+  cls="$(classify_peer 200 "$j" "$b" "$tl" "$r" "$sp" "$sg" 0.0)"
+  arrow="$(diagnose_peer "$b" "$j" "$r" 200 "$sg" "$tl" "$sp")"
+  printf '%s' "$arrow" | grep -qE "^($(expect_arrow "$cls"))" || {
+    printf 'FAIL: %s b=%s j=%s r=%s sp=%s sg=%s -> %s\n' \
+      "$cls" "$b" "$j" "$r" "$sp" "$sg" "$arrow" >&2
+    mismatches=$((mismatches + 1))
+  }
+done; done; done; done; done
+(( mismatches == 0 )) || fail "table label and arrow disagree in $mismatches combinations"
+pass 'every class label agrees with its arrow diagnosis'
+
+# ── 只有真正干净的远端路径才拿得到 initcwnd 32 ─────────────────────────────
+assert_eq far "$(classify_peer 200 0.01 1.00 1.05 0.0 1.05 80000 0.0)" \
+  'a clean, verified far path still earns the wider first window'
+assert_eq 'initcwnd 32' "$(class_policy far | sed -n 1p)" 'the far policy is unchanged'
+assert_eq '' "$(class_policy unverified | sed -n 1p)" \
+  'an unverified path is never handed initcwnd 32'
+# Bloat 2.4 used to fall through to far, handing a bigger initial burst to a
+# path already sitting 2.4x above its own floor.
+assert_eq queued "$(classify_peer 200 0.05 2.40 2.60 0.0 1.10 50000 0.0)" \
+  'a standing queue short of the bloat threshold no longer reads as a clean fixed line'
+assert_eq '' "$(class_policy queued | sed -n 1p)" \
+  'a queueing path is never handed a wider initial window'
+# Queueing and loss together: passive observation confirms neither cause, so
+# the profile must not inherit the policy text of either one.
+assert_eq mixed "$(classify_peer 200 0.20 2.40 3.00 1.5 1.25 50000 0.0)" \
+  'queueing plus loss gets its own class instead of being filed as mobile'
+assert_eq mixed "$(classify_peer 200 0.20 3.50 4.20 1.5 1.20 50000 0.0)" \
+  'deep queueing plus loss is not filed as pure access-network bloat'
+assert_eq bloated "$(classify_peer 200 0.05 3.50 3.85 0.0 1.10 50000 0.0)" \
+  'deep queueing with clean loss is still access-network bloat'
+assert_eq '' "$(class_policy mixed | sed -n 1p)" \
+  'a mixed profile changes no route parameters'
+
+# ── 真机画像在改动后必须分类不变 ───────────────────────────────────────────
+assert_eq far "$(classify_peer 146.0 0.010 1.00 1.07 0.0000 1.06 81573 0.05)" \
+  'the DMIT fixed-line profile still classifies as a healthy far path'
+assert_eq mobile "$(classify_peer 212.8 0.248 1.27 3.64 6.6001 1.30 433794 0.30)" \
+  'the DMIT 4G profile still classifies as mobile'
 
 printf '%s\n' 'All routetune self-tests passed.'

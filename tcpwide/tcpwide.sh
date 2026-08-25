@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -203,7 +203,81 @@ route_is_simple() {
 route_with_initcwnd() {
   local line="${1:-}" cwnd="${2:-$INITCWND}"
   line="$(sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g' <<< "$line")"
+  # `ip route show` emits a trailing space on some route types (onlink is one),
+  # so appending naively produced "... onlink  initcwnd 20". iproute2 accepts it
+  # but the panel has to display it, and a snapshot has to compare against it.
+  line="$(awk '{$1 = $1; print}' <<< "$line")"
   printf '%s initcwnd %s\n' "$line" "$cwnd"
+}
+
+# ── 配置持久化 ─────────────────────────────────────────────────────────────
+
+CONFIG_FILE="/etc/tcpwide.conf"
+CLI_PATH="/usr/local/bin/tcpwide"
+INSTALL_PATH="/usr/local/lib/tcpwide/tcpwide.sh"
+PROFILE=balanced
+
+# Profiles move three numbers and nothing else. A preset that quietly swapped in
+# a different mechanism would make the panel a liar about what is running.
+apply_profile() {
+  case "${1:-balanced}" in
+    stable)   SHAPE_PCT=90; INITCWND=16; SHAPE=1; PROFILE=stable ;;
+    balanced) SHAPE_PCT=95; INITCWND=20; SHAPE=1; PROFILE=balanced ;;
+    speed)    SHAPE_PCT=98; INITCWND=32; SHAPE=1; PROFILE=speed ;;
+    noshape)  SHAPE=0; PROFILE=noshape ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+profile_label() {
+  case "${1:-}" in
+    stable)   printf '稳定优先\n' ;;
+    balanced) printf '均衡\n' ;;
+    speed)    printf '速度优先\n' ;;
+    noshape)  printf '不整形\n' ;;
+    *)        printf '自定义\n' ;;
+  esac
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      EGRESS_MBPS)  is_uint "$value" && (( value > 0 )) && EGRESS_MBPS="$value" ;;
+      COVER_RTT_MS) is_uint "$value" && (( value >= 10 && value <= 2000 )) && COVER_RTT_MS="$value" ;;
+      INITCWND)     is_uint "$value" && (( value >= 1 && value <= 64 )) && INITCWND="$value" ;;
+      SHAPE_PCT)    is_uint "$value" && (( value >= 50 && value <= 100 )) && SHAPE_PCT="$value" ;;
+      SHAPE)        [[ "$value" =~ ^[01]$ ]] && SHAPE="$value" ;;
+      PERSIST)      [[ "$value" =~ ^[01]$ ]] && PERSIST="$value" ;;
+      PROFILE)      [[ "$value" =~ ^(stable|balanced|speed|noshape|custom)$ ]] && PROFILE="$value" ;;
+      IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+  # A rejected value on the final line leaves the loop with a non-zero status,
+  # which under errexit would take the whole script down instead of just
+  # ignoring that one key.
+  return 0
+}
+
+save_config() {
+  local tmp
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  tmp="$(mktemp "${CONFIG_FILE}.XXXXXX")"
+  chmod 0644 "$tmp"
+  {
+    printf '# tcpwide persistent configuration\n'
+    printf 'EGRESS_MBPS=%s\n'  "$EGRESS_MBPS"
+    printf 'COVER_RTT_MS=%s\n' "$COVER_RTT_MS"
+    printf 'INITCWND=%s\n'     "$INITCWND"
+    printf 'SHAPE_PCT=%s\n'    "$SHAPE_PCT"
+    printf 'SHAPE=%s\n'        "$SHAPE"
+    printf 'PERSIST=%s\n'      "$PERSIST"
+    printf 'PROFILE=%s\n'      "$PROFILE"
+    printf 'IFACE=%s\n'        "$IFACE"
+  } > "$tmp"
+  mv -f "$tmp" "$CONFIG_FILE"
 }
 
 # ── 当前状态 ───────────────────────────────────────────────────────────────
@@ -319,6 +393,55 @@ report_link() {
       "$DIM" "$INITCWND" "$RESET"
   fi
 }
+
+# ── 面板动态项 ─────────────────────────────────────────────────────────────
+
+# What the root qdisc should be versus what it is. Config drifting away from
+# reality is the normal state of a box that rebooted or that another tool
+# touched, and a panel that cannot see the difference will confidently report a
+# configuration that is not running.
+qdisc_drift() {
+  local want live
+  want="$(target_qdisc "${EGRESS_MBPS:-200}" "$COVER_RTT_MS" | awk '{print $1}')"
+  live="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | awk '{print $2}')"
+  [[ -n "$live" ]] || return 1
+  [[ "$live" != "$want" ]] || return 1
+  printf '%s\n' "$live"
+}
+
+# Retransmissions over a sampling window, not since boot. On a machine that has
+# been up for weeks the lifetime average is a number that cannot move and
+# therefore cannot tell you whether a change helped.
+retrans_rate() {
+  local secs="${1:-5}" a b out ra rb sa sb
+  has nstat || return 1
+  out="$(nstat -asz 2>/dev/null)" || return 1
+  ra="$(awk '$1 == "TcpRetransSegs" {print $2; exit}' <<< "$out")"
+  sa="$(awk '$1 == "TcpOutSegs" {print $2; exit}' <<< "$out")"
+  sleep "$secs"
+  out="$(nstat -asz 2>/dev/null)" || return 1
+  rb="$(awk '$1 == "TcpRetransSegs" {print $2; exit}' <<< "$out")"
+  sb="$(awk '$1 == "TcpOutSegs" {print $2; exit}' <<< "$out")"
+  is_uint "${ra:-}" && is_uint "${rb:-}" && is_uint "${sa:-}" && is_uint "${sb:-}" || return 1
+  a=$(( rb - ra )); b=$(( sb - sa ))
+  (( b > 0 )) || return 1
+  awk -v r="$a" -v s="$b" 'BEGIN {printf "%.4f\n", r * 100 / s}'
+}
+
+# The kernel sizes tcp_mem from RAM, and it is a global page budget shared by
+# every socket. A per-socket ceiling above a meaningful fraction of it means the
+# ceiling is theoretical: a handful of flows will hit global pressure first and
+# the kernel will shrink them all. Reporting the ceiling alone would be a lie by
+# omission on a small box.
+tcp_mem_high_bytes() {
+  local pages page
+  pages="$(sysctl -n net.ipv4.tcp_mem 2>/dev/null | awk '{print $3}')" || return 1
+  is_uint "${pages:-}" || return 1
+  page="$(getconf PAGESIZE 2>/dev/null || printf 4096)"
+  printf '%s\n' $(( pages * page ))
+}
+
+mb() { awk -v b="${1:-0}" 'BEGIN {printf "%.1f", b / 1048576}'; }
 
 # ── 命令 ───────────────────────────────────────────────────────────────────
 
@@ -546,9 +669,273 @@ cmd_revert() {
   log "已还原 $n 项 sysctl，并清除持久化"
 }
 
+# ── SSH 面板 ───────────────────────────────────────────────────────────────
+
+prompt_uint() {
+  local prompt="$1" default="$2" min="$3" max="$4" value
+  while true; do
+    if ! read -r -p "  $prompt [$default]: " value; then printf '\n' >&2; return 1; fi
+    value="${value:-$default}"
+    [[ "$value" == q || "$value" == Q ]] && return 1
+    if is_uint "$value" && (( value >= min && value <= max )); then
+      printf '%s\n' "$value"; return 0
+    fi
+    warn "请输入 $min-$max 之间的整数（q 返回）"
+  done
+}
+
+render_panel() {
+  local buf tcpmem drift live_cc live_q cwnd_now p1=' ' p2=' ' p3=' ' p4=' '
+  case "$PROFILE" in
+    stable) p1='▸' ;; balanced) p2='▸' ;; speed) p3='▸' ;; noshape) p4='▸' ;;
+  esac
+  buf="$(buffer_ceiling "${EGRESS_MBPS:-200}" "$COVER_RTT_MS")"
+  title 'tcpwide 调优面板'
+  if (( SHAPE == 1 )); then
+    printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
+      "${EGRESS_MBPS:-未设置}" "$DIM" "$SHAPE_PCT" \
+      "$(( ${EGRESS_MBPS:-0} * SHAPE_PCT / 100 ))" "$RESET"
+  else
+    printf '  %b出口带宽%b   %s Mbps%b（不整形，只做 pacing）%b\n' "$DIM" "$RESET" \
+      "${EGRESS_MBPS:-未设置}" "$DIM" "$RESET"
+  fi
+  printf '  %b覆盖 RTT%b   %s ms%b  ← 按最远的客户端，不是按你自己%b\n' \
+    "$DIM" "$RESET" "$COVER_RTT_MS" "$DIM" "$RESET"
+  live_cc="$(live_value net.ipv4.tcp_congestion_control)"
+  printf '  %b拥塞控制%b   %s' "$DIM" "$RESET" "${live_cc:-未知}"
+  [[ "$live_cc" == bbr ]] && printf '%b（主线只有 v1，容量剧变后估值滞后）%b' "$DIM" "$RESET"
+  [[ "$live_cc" == cubic ]] && printf '%b（每丢一次砍一次窗，无线链路上起不来）%b' "$YELLOW" "$RESET"
+  printf '\n'
+  live_q="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //' | cut -c1-58)"
+  printf '  %b根队列%b     %s\n' "$DIM" "$RESET" "${live_q:-未知}"
+  printf '  %b缓冲上限%b   %s MB/socket' "$DIM" "$RESET" "$(mb "$buf")"
+  if tcpmem="$(tcp_mem_high_bytes)"; then
+    printf '%b ｜ 全局 tcp_mem 高水位 %s MB（约 %s 条满上限就触发压力）%b' \
+      "$DIM" "$(mb "$tcpmem")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" "$RESET"
+  fi
+  printf '\n'
+  # A route without the metric makes grep exit 1, which under pipefail takes
+  # the whole panel down mid-render rather than reporting the kernel default.
+  cwnd_now="$(current_default_route | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}')"
+  printf '  %b首窗%b       initcwnd %s%b（内核默认 10）%b\n' "$DIM" "$RESET" \
+    "${cwnd_now:-10}" "$DIM" "$RESET"
+  printf '  %b持久化%b     %s\n' "$DIM" "$RESET" \
+    "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '是' || printf '否（重启后失效）' )"
+  if drift="$(qdisc_drift)"; then
+    printf '  %b[!] 实际生效的队列是 %s，与配置不一致%b\n' "$YELLOW" "$drift" "$RESET"
+    printf '      %b可能是重启后没应用，或被别的服务覆盖。按 a 重新应用%b\n' "$DIM" "$RESET"
+  fi
+  local other
+  if other="$(conflicting_tool)"; then
+    printf '  %b[!] 检测到 %s —— 它同样接管根队列和全局 sysctl，谁后跑谁生效%b\n' \
+      "$YELLOW" "$other" "$RESET"
+  fi
+  rule
+  printf '  %b档位%b%b                                          ▸ 当前%b\n' \
+    "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b1)%b 稳定优先   整形 90%%｜首窗 16%b  丢包敏感、跨境线路%b\n' \
+    "$GREEN" "$p1" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b2)%b 均衡       整形 95%%｜首窗 20%b  推荐%b\n' \
+    "$GREEN" "$p2" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b3)%b 速度优先   整形 98%%｜首窗 32%b  干净直连%b\n' \
+    "$GREEN" "$p3" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b4)%b 不整形     只做 pacing%b  放弃按设备公平和 AQM%b\n' \
+    "$GREEN" "$p4" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b设置%b\n' "$BOLD" "$RESET"
+  printf '    %b5)%b 出口带宽%b（当前 %s Mbps）%b   %b6)%b 覆盖 RTT%b（当前 %s ms）%b   %b7)%b 首窗%b（当前 %s）%b\n' \
+    "$BOLD" "$RESET" "$DIM" "${EGRESS_MBPS:-未设置}" "$RESET" \
+    "$BOLD" "$RESET" "$DIM" "$COVER_RTT_MS" "$RESET" \
+    "$BOLD" "$RESET" "$DIM" "$INITCWND" "$RESET"
+  printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
+  printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
+  printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
+  printf '    %ba)%b 重新应用（重启后或队列被覆盖时用）\n' "$BOLD" "$RESET"
+  printf '    %bp)%b 持久化开关%b（当前：%s）%b\n' "$BOLD" "$RESET" "$DIM" \
+    "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '开' || printf '关' )" "$RESET"
+  printf '    %br)%b 完整还原到 tcpwide 介入之前\n' "$BOLD" "$RESET"
+  printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
+  rule
+}
+
+# Actions run in a subshell so one that calls die drops back to the menu instead
+# of closing the panel. Everything durable goes through save_config, and the
+# loop reloads it, so nothing is lost across the boundary.
+run_action() { ( "$@" ) || warn "操作未完成，已返回菜单"; }
+
+pause_menu() {
+  [[ -t 0 ]] || return 0
+  printf '\n'
+  # shellcheck disable=SC2034 # the reply is deliberately discarded
+  read -r -p "  $(printf '%b按回车返回菜单…%b' "$DIM" "$RESET")" _discard || printf '\n'
+}
+
+panel_set_profile() {
+  apply_profile "$1" || die "未知档位"
+  save_config
+  log "已切换到「$(profile_label "$PROFILE")」，正在应用…"
+  cmd_apply
+}
+
+panel_reapply() { cmd_apply; }
+
+panel_diagnose() {
+  title 'tcpwide 诊断'
+  local pct drift other
+  printf '  %b正在采样 5 秒的实时重传率…%b\n' "$DIM" "$RESET"
+  if pct="$(retrans_rate 5)"; then
+    printf '  实时重传率:        %s%%%b（5 秒窗口增量，不是自开机累计）%b\n' "$pct" "$DIM" "$RESET"
+    if awk -v p="$pct" 'BEGIN {exit !(p >= 2)}'; then
+      warn "重传偏高。先确认根队列真的是 cake（有 pacing），再看是不是客户端侧无线丢包"
+    fi
+  else
+    printf '  实时重传率:        无法采样（缺少 nstat 或窗口内没有流量）\n'
+  fi
+  printf '  根队列:            %s\n' \
+    "$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //')"
+  if drift="$(qdisc_drift)"; then
+    warn "实际是 $drift，与配置不一致 —— 按 a 重新应用"
+  else
+    log "队列与配置一致"
+  fi
+  printf '  默认路由:          %s\n' "$(current_default_route)"
+  if other="$(conflicting_tool)"; then
+    warn "检测到 $other，它会盖掉这里的配置"
+  else
+    log "没有检测到冲突的调优工具"
+  fi
+  printf '\n'
+  render_plan "${EGRESS_MBPS:-200}" "$COVER_RTT_MS"
+}
+
+panel_toggle_persist() {
+  if [[ -e "$PERSIST_SYSCTL" ]]; then
+    rm -f "$PERSIST_SYSCTL"
+    if [[ -e "$PERSIST_UNIT" ]]; then
+      systemctl disable tcpwide-link.service >/dev/null 2>&1 || true
+      rm -f "$PERSIST_UNIT"; systemctl daemon-reload 2>/dev/null || true
+    fi
+    PERSIST=0; save_config
+    log "已关闭持久化。重启后会回到系统原样"
+  else
+    PERSIST=1; save_config
+    write_persistence "${EGRESS_MBPS:-200}" "$COVER_RTT_MS"
+  fi
+}
+
+menu() {
+  [[ -t 0 ]] || { usage; return 0; }
+  local answer value
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    warn "当前不是 root，面板为只读模式；要修改请运行：sudo $PROGRAM"
+  fi
+  resolve_iface
+  while true; do
+    load_config
+    render_panel
+    if ! read -r -p '  请选择 [0-9 / a / p / r]: ' answer; then printf '\n'; return 0; fi
+    case "$answer" in
+      1) run_action panel_set_profile stable ;;
+      2) run_action panel_set_profile balanced ;;
+      3) run_action panel_set_profile speed ;;
+      4) run_action panel_set_profile noshape ;;
+      5)
+        if value="$(prompt_uint '出口带宽（Mbps，按你套餐的实际端口速率，q 返回）' "${EGRESS_MBPS:-500}" 1 100000)"; then
+          EGRESS_MBPS="$value"; PROFILE=custom; save_config; run_action cmd_apply
+        else info "已取消"; continue; fi
+        ;;
+      6)
+        if value="$(prompt_uint '覆盖 RTT（ms，按最远的客户端填，不是按你自己，q 返回）' "$COVER_RTT_MS" 10 2000)"; then
+          COVER_RTT_MS="$value"; save_config; run_action cmd_apply
+        else info "已取消"; continue; fi
+        ;;
+      7)
+        if value="$(prompt_uint '默认路由首窗 initcwnd（内核默认 10，q 返回）' "$INITCWND" 1 64)"; then
+          INITCWND="$value"; PROFILE=custom; save_config; run_action cmd_apply
+        else info "已取消"; continue; fi
+        ;;
+      8) run_action panel_diagnose ;;
+      9) run_action cmd_plan ;;
+      a|A) run_action panel_reapply ;;
+      p|P) run_action panel_toggle_persist ;;
+      r|R) run_action cmd_revert ;;
+      0|q|Q) return 0 ;;
+      *) warn "无效选项"; continue ;;
+    esac
+    pause_menu
+  done
+}
+
+# ── 安装 ───────────────────────────────────────────────────────────────────
+
+cmd_install() {
+  need_root install
+  [[ -t 0 ]] || die "install 需要交互终端"
+  local other value answer
+  title 'tcpwide 安装向导'
+  if other="$(conflicting_tool)"; then
+    warn "检测到 $other"
+    printf '  %b它和 tcpwide 都会接管根队列和全局 sysctl，不是叠加关系，是谁后跑谁生效。%b\n' \
+      "$DIM" "$RESET"
+    printf '  %b请先卸载它，再回来装 tcpwide：%b\n' "$DIM" "$RESET"
+    printf '      %bsudo %s uninstall%b\n' "$BOLD" "$other" "$RESET"
+    # Uninstalling belongs to the other tool: it knows what it changed (its own
+    # HTB classes, nginx snippet, units, sysctl snapshot) and tcpwide would be
+    # guessing.
+    die "已中止，什么都没有改"
+  fi
+  has tc || die "缺少 tc；请安装 iproute2"
+  has sysctl || die "缺少 sysctl"
+  resolve_iface
+  printf '  出口网卡：%s\n' "$IFACE"
+  printf '  内核拥塞控制：%s → 将选用 %s\n\n' "$(available_cc)" "$(pick_cc "$(available_cc)")"
+  value="$(prompt_uint '这台机器的出口带宽（Mbps，按你套餐的端口速率）' 500 1 100000)" \
+    || die "已取消安装"
+  EGRESS_MBPS="$value"
+  printf '\n  %b覆盖 RTT 决定缓冲上限。按你最远的客户端填，不是按你自己——%b\n' "$DIM" "$RESET"
+  printf '  %b估高只多付一点拥塞控制超发，估低是每个远端客户端都撞得到、却查不出原因的硬顶。%b\n\n' \
+    "$DIM" "$RESET"
+  value="$(prompt_uint '覆盖 RTT（ms，跨境 200-300 常见）' 250 10 2000)" || die "已取消安装"
+  COVER_RTT_MS="$value"
+  printf '\n  %b档位%b\n' "$BOLD" "$RESET"
+  printf '    1) 稳定优先   整形 90%%｜首窗 16   丢包敏感、跨境线路\n'
+  printf '    2) 均衡       整形 95%%｜首窗 20   推荐\n'
+  printf '    3) 速度优先   整形 98%%｜首窗 32   干净直连\n'
+  printf '    4) 不整形     只做 pacing，放弃按设备公平和 AQM\n'
+  read -r -p '  请选择 [2]: ' answer || answer=2
+  case "${answer:-2}" in
+    1) apply_profile stable ;; 3) apply_profile speed ;;
+    4) apply_profile noshape ;; *) apply_profile balanced ;;
+  esac
+  save_config
+  printf '\n'
+  cmd_apply
+  mkdir -p "$(dirname "$INSTALL_PATH")"
+  if cp -f "${BASH_SOURCE[0]}" "$INSTALL_PATH" 2>/dev/null; then
+    chmod 0755 "$INSTALL_PATH"
+    ln -sfn "$INSTALL_PATH" "$CLI_PATH"
+    log "已安装。以后直接运行 sudo tcpwide 进面板"
+  else
+    warn "无法复制脚本到 $INSTALL_PATH，软链未创建；仍可用 bash 直接运行本脚本"
+  fi
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  cmd_revert
+  rm -f "$CONFIG_FILE" "$CLI_PATH" "$INSTALL_PATH"
+  rmdir "$(dirname "$INSTALL_PATH")" 2>/dev/null || true
+  log "已卸载 tcpwide 并还原配置"
+}
+
 usage() {
   cat <<'EOF'
-tcpwide - 面向多地区、多设备客户端的一套 TCP 配置
+tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板）
+
+首次安装（向导会问出口带宽、覆盖 RTT、档位，然后装好软链）：
+  sudo bash tcpwide.sh install
+
+之后直接进面板：
+  sudo tcpwide
 
 分散的客户端不需要「每个客户端一套参数」。它需要一套按最远客户端定尺寸的配置，
 再用能自己适应其余客户端的机制搭起来：
@@ -561,6 +948,9 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置
 它刻意不做的事：不设单流限速。按固定宽带调的限速会勒死固定宽带，而对移动客户端
 根本不会触发——它本来也没跑那么快。
 
+  tcpwide                              进面板（等同 tcpwide panel）
+  tcpwide install                      安装向导
+  tcpwide uninstall                    还原并卸载
   tcpwide check                        看内核支不支持、有没有冲突的工具
   tcpwide plan --egress 500            预演，什么都不改
   tcpwide apply --egress 500           应用（先快照，可完整还原）
@@ -585,7 +975,17 @@ EOF
 }
 
 main() {
-  local cmd="${1:-help}"; shift || true
+  local cmd="${1:-}"
+  # No arguments on a terminal means the panel, the way `netshape` behaves.
+  # Anywhere else (pipes, cron, CI) it must stay a predictable CLI.
+  if [[ -z "$cmd" ]]; then
+    if [[ -t 0 && -t 1 ]]; then cmd=panel; else cmd=help; fi
+  else
+    shift || true
+  fi
+  # Config first, flags second: a flag is this invocation, the file is the
+  # standing configuration.
+  load_config
   while (( $# )); do
     case "$1" in
       --egress)    [[ $# -ge 2 ]] || die "--egress 缺少值"; EGRESS_MBPS="$2"; shift 2 ;;
@@ -608,7 +1008,13 @@ main() {
   if ! is_uint "$SHAPE_PCT" || (( SHAPE_PCT < 50 || SHAPE_PCT > 100 )); then
     die "--shape-pct 需为 50-100"
   fi
+  # Not resolved here: resolve_iface dies when there is no default route, and
+  # `version`/`help` must work on a box that has none. Each command that needs
+  # an interface resolves it itself.
   case "$cmd" in
+    panel|menu) menu ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
     check)  cmd_check ;;
     plan)   cmd_plan ;;
     apply)  cmd_apply ;;

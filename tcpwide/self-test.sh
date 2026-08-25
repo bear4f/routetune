@@ -134,4 +134,115 @@ if ! ( SHAPE=0; EGRESS_MBPS=""; target_qdisc 200 250 >/dev/null ) 2>/dev/null; t
 fi
 pass 'no-shape mode needs no bandwidth figure'
 
+
+# ── 0.2.0 配置持久化 ───────────────────────────────────────────────────────
+tmp="$(mktemp -d)"; CONFIG_FILE="$tmp/tcpwide.conf"
+EGRESS_MBPS=750; COVER_RTT_MS=300; INITCWND=32; SHAPE_PCT=90
+SHAPE=1; PERSIST=1; PROFILE=stable; IFACE=ens3
+save_config
+EGRESS_MBPS=1; COVER_RTT_MS=10; INITCWND=1; SHAPE_PCT=50
+SHAPE=0; PERSIST=0; PROFILE=balanced; IFACE=lo
+load_config
+assert_eq '750'    "$EGRESS_MBPS"  'egress survives a config round trip'
+assert_eq '300'    "$COVER_RTT_MS" 'coverage RTT survives a config round trip'
+assert_eq '32'     "$INITCWND"     'initcwnd survives a config round trip'
+assert_eq '90'     "$SHAPE_PCT"    'shaping percentage survives a config round trip'
+assert_eq '1'      "$PERSIST"      'the persistence flag survives a config round trip'
+assert_eq 'stable' "$PROFILE"      'the profile survives a config round trip'
+assert_eq 'ens3'   "$IFACE"        'the interface survives a config round trip'
+
+# A junk value must be ignored without clobbering the in-memory default, and —
+# the trap netshape documents — a rejected value on the FINAL line leaves the
+# read loop non-zero, which under errexit would take the whole script down.
+printf 'COVER_RTT_MS=99999\nINITCWND=abc\n' > "$CONFIG_FILE"
+COVER_RTT_MS=250; INITCWND=20
+load_config || fail 'load_config must return 0 even when the last line is rejected'
+assert_eq '250' "$COVER_RTT_MS" 'an out-of-range value is ignored, not adopted'
+assert_eq '20'  "$INITCWND"     'a non-numeric value is ignored, not adopted'
+pass 'a rejected value on the final line does not abort under errexit'
+rm -rf "$tmp"
+
+# ── 0.2.0 档位 ─────────────────────────────────────────────────────────────
+# Profiles move three numbers and nothing else. A preset that quietly swapped in
+# a different mechanism would make the panel a liar about what is running.
+apply_profile stable
+assert_eq '90|16|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the stable profile trades peak for headroom'
+apply_profile balanced
+assert_eq '95|20|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the balanced profile is the documented middle'
+apply_profile speed
+assert_eq '98|32|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the speed profile shapes closer to the line rate'
+apply_profile noshape
+assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
+assert_eq fq "$(target_qdisc 500 250)" 'the no-shape profile yields fq, not cake'
+if apply_profile nonsense 2>/dev/null; then fail 'an unknown profile must be rejected'; fi
+pass 'an unknown profile is rejected'
+apply_profile balanced
+
+# ── 0.2.0 面板与应用同源 ───────────────────────────────────────────────────
+# The panel, the preview and the apply path must all read the same target
+# functions, or the panel will confidently report a configuration that is not
+# the one being written.
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+assert_eq "$(buffer_ceiling 500 250)" \
+  "$(target_sysctl 500 250 | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')" \
+  'the ceiling the panel shows is the one the apply path writes'
+
+# ── 0.2.0 队列漂移 ─────────────────────────────────────────────────────────
+# A box that rebooted, or that another tool touched, is the normal case. A panel
+# that cannot see the difference reports a configuration that is not running.
+IFACE=eth0; EGRESS_MBPS=500; COVER_RTT_MS=250; SHAPE=1
+tc() { printf 'qdisc mq 0: root \n'; }
+assert_eq 'mq' "$(qdisc_drift)" 'a live mq root against a cake config reports drift'
+tc() { printf 'qdisc cake 8001: root refcnt 2 bandwidth 475Mbit\n'; }
+if qdisc_drift >/dev/null 2>&1; then fail 'a matching qdisc must not report drift'; fi
+pass 'a matching qdisc reports no drift'
+SHAPE=0
+tc() { printf 'qdisc fq 8001: root refcnt 2\n'; }
+if qdisc_drift >/dev/null 2>&1; then fail 'fq matches the no-shape target'; fi
+pass 'fq matches the no-shape target'
+SHAPE=1
+unset -f tc
+
+# ── 0.2.0 默认路由空白归一 ─────────────────────────────────────────────────
+# `ip route show` emits a trailing space on some route types (onlink is one),
+# which produced "... onlink  initcwnd 20" with a doubled space on the live box.
+assert_eq 'default via 193.41.250.250 dev eth0 onlink initcwnd 20' \
+  "$(route_with_initcwnd 'default via 193.41.250.250 dev eth0 onlink ' 20)" \
+  'a trailing space in the route does not produce a doubled separator'
+# Re-applying must replace the metric, never stack a second one.
+assert_eq 'default via 10.0.0.1 dev eth0 initcwnd 32' \
+  "$(route_with_initcwnd 'default via 10.0.0.1 dev eth0 initcwnd 20' 32)" \
+  'reapplying replaces the metric rather than appending another'
+
+# ── 0.2.0 面板渲染不会中途崩 ───────────────────────────────────────────────
+# A default route carrying no initcwnd makes a naive grep exit 1, and under
+# pipefail that took the panel down mid-render instead of showing the default.
+ip() { printf 'default via 10.0.0.1 dev eth0 onlink \n'; }
+tc() { printf 'qdisc mq 0: root \n'; }
+sysctl() {
+  case "${1:-}" in
+    -n) case "${2:-}" in
+          *available*) printf 'reno cubic bbr\n' ;;
+          net.ipv4.tcp_mem) printf '42039\t56054\t84078\n' ;;
+          *) printf '\n' ;;
+        esac ;;
+  esac
+}
+has() { [[ "$1" == sysctl || "$1" == tc || "$1" == ip ]]; }
+conflicting_tool() { return 1; }
+PERSIST_SYSCTL="/nonexistent/tcpwide.conf"
+render_panel >/dev/null 2>&1 || fail 'the panel must render on a route without initcwnd'
+pass 'the panel renders on a default route that has no initcwnd yet'
+# And the global memory budget must be surfaced: a per-socket ceiling above a
+# meaningful share of tcp_mem is theoretical, because a handful of flows hit
+# global pressure first and the kernel shrinks them all.
+[[ "$(render_panel 2>/dev/null)" == *"tcp_mem"* ]] \
+  || fail 'the panel must surface the global tcp_mem budget beside the ceiling'
+pass 'the panel shows the global memory budget beside the per-socket ceiling'
+[[ "$(render_panel 2>/dev/null)" == *"实际生效的队列是 mq"* ]] \
+  || fail 'the panel must warn when the live qdisc differs from the config'
+pass 'the panel warns about a drifted qdisc'
+unset -f ip tc sysctl has conflicting_tool
+
 printf '%s\n' 'All tcpwide self-tests passed.'

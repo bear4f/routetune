@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -273,8 +273,9 @@ jitter_verdict() {
   }'
 }
 
-# Same thresholds as netshape: across seven real hosts the clean side topped
-# out at 0.0017% and the lowest reading from a policed path was 1.354%.
+# These are observation bands, not cause labels. A passive retransmission
+# counter cannot distinguish radio loss, random path loss and a policer by
+# itself, even when latency happens to be flat during one short window.
 retrans_verdict() {
   awk -v p="${1:-0}" 'BEGIN {
     if (p < 0.1) print "干净";
@@ -294,7 +295,7 @@ diagnose_peer() {
       -v tb="$tail" -v sp="$spread" \
       -v floor="$LOCAL_RTT_FLOOR_MS" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor) {
-      print "同机房或本机出站连接（RTT < " floor "ms）——这个量级上抖动和膨胀都是计时噪声，不用管";
+      print "同机房量级连接（RTT < " floor "ms）——这个量级上抖动和膨胀都是计时噪声，不用管";
       exit
     }
     trust_r = (sg >= minseg)
@@ -305,15 +306,25 @@ diagnose_peer() {
       print "接入网排队膨胀——瓶颈队列不在服务器上；先做更长观测，再在可控机器上 A/B 测试 pacing 或 BBRv3";
       exit
     }
-    if (r >= 1 && b >= 2) { print "既排队又丢包——多半打穿了限速器，优先降速率"; exit }
-    # A policer drops without adding delay variance: latency stays flat and
-    # only the loss rate moves. Radio loss comes with a spread tail and jitter,
-    # and is not a congestion signal — lowering the rate buys little.
+    if (r >= 1 && b >= 2) {
+      print "既排队又丢包——被动快照不能判断队列或丢包发生在哪一段；先延长观测，不据此直接降速";
+      exit
+    }
+    # A spread latency tail plus loss is useful evidence of radio scheduling.
+    # Flat latency is not proof of a policer: the same mobile prefix can be
+    # temporarily flat during one window and bursty during the next.
     if (r >= 1 && (j >= 0.15 || sp >= 1.4)) {
       print "无线接入层丢包（4G/5G 典型）——没有持续排队，但丢包和延迟尾部都高。这类丢包不是拥塞信号，降速率收益有限，客户端播放器多缓冲更有效";
       exit
     }
-    if (r >= 1) { print "路径丢包或限速器——延迟很稳却在丢包，降单流速率有用"; exit }
+    if (r >= 1) {
+      print "稳定延迟丢包——可能是暂时平稳的移动网、随机路径丢包或 policer；被动快照无法区分，不要据此直接降速，需主动复测";
+      exit
+    }
+    if (r >= 0.1) {
+      print "轻度丢包——高于干净线但不足以归因；继续用 watch 累积画像，不据此改路由参数";
+      exit
+    }
     if (tb >= 3) { print "间歇性排队——中位队列不深，但尾部涨到底噪的 " sprintf("%.1f", tb) " 倍，卡顿多半发生在这些尖峰上"; exit }
     if (j >= 0.3) { print "链路抖动大（无线接入或路径拥塞）——速率波动来自这里，不是你的配置"; exit }
     if (b >= 1.5) { print "轻微排队，可接受"; exit }
@@ -386,10 +397,12 @@ classify_peer() {
     if (t < floor)   { print "local";  exit }
     if (sg < minseg) { print "idle";   exit }
     if (b >= 3)      { print "bloated"; exit }
-    # Loss with a spread latency tail is the radio signature; loss with flat
-    # latency is a rate limiter. Same loss rate, opposite treatment.
+    # Loss with a spread latency tail is evidence of radio scheduling. Flat
+    # latency is deliberately not called a rate limiter: this DMIT mobile
+    # prefix was flat in consecutive windows while loss moved 3.07% -> 0.51%.
     if (r >= 1 && (j >= 0.15 || sp >= 1.4)) { print "mobile"; exit }
-    if (r >= 1)      { print "policed"; exit }
+    if (r >= 1)      { print "flatloss"; exit }
+    if (r >= 0.1)    { print "lossy"; exit }
     if (tb >= 3)     { print "spiky";  exit }
     if (j >= 0.3 || sp >= 1.4) { print "variable"; exit }
     if (t >= 120)    { print "far";    exit }
@@ -403,7 +416,8 @@ class_label() {
     idle)    printf '数据不足\n' ;;
     bloated) printf '接入网排队\n' ;;
     mobile)  printf '移动网络\n' ;;
-    policed) printf '限速器\n' ;;
+    flatloss) printf '稳定延迟丢包\n' ;;
+    lossy)    printf '轻度丢包\n' ;;
     spiky)   printf '间歇排队\n' ;;
     variable) printf '时变链路\n' ;;
     far)     printf '远端固网\n' ;;
@@ -426,9 +440,13 @@ class_policy() {
       printf '%s\n' 'initcwnd 10' \
         '保守起步，别把首窗突发灌进调度受限的无线链路。注意：不要给移动网段换 cubic —— BBR 忽略丢包这一点在随机无线丢包上恰恰是优势，cubic 会每丢一次就砍窗'
       ;;
-    policed)
+    flatloss)
       printf '%s\n' '' \
-        '延迟很稳却在丢包，形状像 policer。当前 delivery_rate 不是可靠容量估计，阶段一不据此生成 tc 限速；先用可控的 iperf3 对端做触发式复测'
+        '延迟较稳但重传 ≥1%。被动观测不能区分暂时平稳的移动网、随机路径丢包和 policer；阶段一不降速、不改路由，只有可控主动测速找到重复出现的速率拐点后才能讨论 policer'
+      ;;
+    lossy)
+      printf '%s\n' '' \
+        '重传在 0.1%–1% 之间，高于干净线但不足以判断原因。继续累积画像；它不会被当作健康远端固网，也不会获得 initcwnd 32'
       ;;
     bloated)
       printf '%s\n' '' \
@@ -545,7 +563,7 @@ cmd_scan() {
   collect_round "$samples" "$interval" "$group" "$agg" || {
     warn "采样窗口内没有活跃 TCP 连接（有流量时再测）"; return 0; }
 
-  printf '\n  %b前缀                      连接 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%  画像%b\n' "$BOLD" "$RESET"
+  printf '\n  %b前缀                      连接 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
   local prefix conns cc p50 p95 minrtt jit bloat rpct segs dir tail
   local spread class hidden=0 shown=0
@@ -555,13 +573,13 @@ cmd_scan() {
     spread="$(row_spread "$p95" "$p50")"
     class="$(classify_peer "$p50" "$jit" "$bloat" "$tail" "$rpct" "$spread" "$segs")"
     local color="$GREEN"
-    case "$class" in mobile|policed|bloated|spiky|variable) color="$YELLOW" ;; esac
+    case "$class" in mobile|flatloss|lossy|bloated|spiky|variable) color="$YELLOW" ;; esac
     local bt="$bloat" tt="$tail" rt="$rpct"
     awk -v b="$bloat" 'BEGIN {exit !(b < 0)}' && { bt="—"; tt="—"; }
     (( segs < MIN_SEGS_FOR_RETRANS )) && rt="—"
-    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s  %s\n' \
+    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %7s  %s\n' \
       "$color" "$prefix" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" \
-      "$bt" "$tt" "$rt" "$(class_label "$class")"
+      "$bt" "$tt" "$rt" "$segs" "$(class_label "$class")"
     printf '    %b→ %s%b\n' "$DIM" \
       "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs" "$tail" "$spread")" "$RESET"
   done < "$agg"
@@ -641,15 +659,15 @@ cmd_profiles() {
   rows="$(profile_rows)" || die "还没有画像，先跑：$PROGRAM watch --minutes 30"
   [[ -n "$rows" ]] || die "画像库是空的，先跑：$PROGRAM watch --minutes 30"
   panel_title 'routetune 画像'
-  printf '  %b前缀                      轮次 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%  画像%b\n' "$BOLD" "$RESET"
+  printf '  %b前缀                      轮次 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
   local prefix obs p50 p95 mn jit bl tl rt sg sp class
   while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
     class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg")"
     local color="$GREEN"
-    case "$class" in mobile|policed|bloated|spiky|variable) color="$YELLOW" ;; esac
-    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s  %s\n' \
-      "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" "$rt" \
+    case "$class" in mobile|flatloss|lossy|bloated|spiky|variable) color="$YELLOW" ;; esac
+    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %7s  %s\n' \
+      "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" "$rt" "$sg" \
       "$(class_label "$class")"
   done <<< "$rows"
   rule_light
@@ -725,8 +743,8 @@ cmd_recommend() {
     reason="$(class_policy "$class" | sed -n '2p')"
     printf '  %b%s%b  %b%s%b  %s轮观测\n' "$BOLD" "$prefix" "$RESET" \
       "$CYAN" "$(class_label "$class")" "$RESET" "$obs"
-    printf '    %bRTT %s/%s ms（底噪 %s）｜抖动 %s｜膨胀 %s｜重传 %s%%%b\n' \
-      "$DIM" "$p50" "$p95" "$mn" "$jit" "$bl" "$rt" "$RESET"
+    printf '    %bRTT %s/%s ms（底噪 %s）｜抖动 %s｜膨胀 %s｜重传 %s%%（%s 段）%b\n' \
+      "$DIM" "$p50" "$p95" "$mn" "$jit" "$bl" "$rt" "$sg" "$RESET"
     if [[ -n "$opts" ]]; then
       if commands="$(route_commands "$prefix" "$opts")"; then
         printf '    %b%s%b\n' "$GREEN" "$(sed -n '1p' <<< "$commands")" "$RESET"
@@ -858,7 +876,8 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
   远端固网   RTT ≥120ms 且稳定      → A/B 测试 initcwnd 32
   近端固网   RTT <120ms 且稳定      → 默认即可，加大起步只会制造突发
   移动网络   丢包 + 延迟尾部散开     → initcwnd 保守；不要换 cubic
-  限速器     丢包 + 延迟纹丝不动     → 对该前缀单独限速，而不是全局限速
+  稳定延迟丢包 重传 ≥1%、延迟较稳    → 不推断限速器；主动复测前不改参数
+  轻度丢包   重传 0.1%-1%           → 继续观测，不当作健康固网优化
   接入网排队 中位膨胀 ≥3            → 服务端限速无效，根治靠 BBRv3
   间歇排队   中位不深但尾部有尖峰    → 先观察
   时变链路   抖动或尾部散布高、无明确丢包 → 延长观测，不凭快照改参数

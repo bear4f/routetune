@@ -25,14 +25,22 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 # 2.9% loss, 11960 segments. Loss with a spread tail is radio, not a policer.
 assert_eq mobile "$(classify_peer 208.3 0.214 1.27 2.09 2.9181 1.65 11960)" \
   'the measured 4G client classifies as mobile'
-# Same loss rate, flat latency: that is a rate limiter and wants the opposite.
-assert_eq policed "$(classify_peer 161.9 0.031 1.02 1.05 3.30 1.05 260000)" \
-  'loss with flat latency classifies as a policer'
-# The two must never collapse into one class, or the policy flips.
+# Same loss rate with flat latency is ambiguous in a passive snapshot. It is
+# explicitly not enough evidence to claim that a policer exists.
+assert_eq flatloss "$(classify_peer 161.9 0.031 1.02 1.05 3.30 1.05 260000)" \
+  'loss with flat latency stays an unproven flat-loss observation'
+# The two must never collapse into one class, or the policy implication flips.
 [[ "$(classify_peer 208.3 0.214 1.27 2.09 2.9181 1.65 11960)" \
    != "$(classify_peer 161.9 0.031 1.02 1.05 3.30 1.05 260000)" ]] \
   || fail 'radio loss and a policer must not share a class'
-pass 'radio loss and a policer stay separate classes'
+pass 'radio-shaped and flat loss stay separate classes'
+
+# Two consecutive live DMIT samples from the same mobile /24 exposed the old
+# unstable decision: it was first called a policer, then healthy fixed-line.
+assert_eq flatloss "$(classify_peer 189.2 0.094 1.14 1.25 3.0651 1.10 11960)" \
+  'the first live DMIT window does not prove a policer'
+assert_eq lossy "$(classify_peer 189.3 0.071 1.14 1.20 0.5074 1.06 11960)" \
+  'the second live DMIT window is not misclassified as healthy far fixed-line'
 
 assert_eq far "$(classify_peer 151.4 0.060 1.04 1.06 0.0 1.01 60000)" \
   'a stable 151ms peer classifies as far'
@@ -50,7 +58,7 @@ assert_eq local "$(classify_peer 0.7 3.875 -1 -1 0.0 5.14 500000)" \
   'a same-datacentre peer is gated out'
 assert_eq idle "$(classify_peer 170.5 0.443 1.11 1.15 33.3 1.05 3)" \
   'three segments cannot classify as anything actionable'
-for c in mobile policed far near bloated spiky variable; do
+for c in mobile flatloss lossy far near bloated spiky variable; do
   [[ "$(classify_peer 170.5 0.443 4.0 5.0 33.3 2.0 3)" != "$c" ]] \
     || fail "an idle peer must never classify as $c"
 done
@@ -62,7 +70,8 @@ assert_eq 'initcwnd 32' "$(class_policy far | sed -n 1p)" \
 assert_eq 'initcwnd 10' "$(class_policy mobile | sed -n 1p)" \
   'mobile peers get a conservative initial window'
 assert_eq '' "$(class_policy near | sed -n 1p)" 'near peers get no route change'
-assert_eq '' "$(class_policy policed | sed -n 1p)" 'a policer is not fixed by route metrics'
+assert_eq '' "$(class_policy flatloss | sed -n 1p)" 'flat loss gets no unproven route change'
+assert_eq '' "$(class_policy lossy | sed -n 1p)" 'light loss gets no route change'
 # BBR ignoring loss is an advantage on random radio loss; cubic would halve
 # the window on every one. Recommending cubic here would be actively wrong.
 [[ "$(class_policy mobile | sed -n 2p)" == *"不要给移动网段换 cubic"* ]] \
@@ -71,7 +80,7 @@ pass 'the mobile policy warns against switching to cubic'
 [[ "$(class_policy far | sed -n 2p)" == *"初始窗"* ]] || fail 'far note should explain itself'
 pass 'the far policy explains why the window helps'
 
-for c in local idle far near mobile policed bloated spiky variable; do
+for c in local idle far near mobile flatloss lossy bloated spiky variable; do
   [[ -n "$(class_label "$c")" ]] || fail "class $c has no label"
 done
 pass 'every class has a human label'

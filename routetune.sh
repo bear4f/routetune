@@ -643,8 +643,8 @@ cmd_profiles() {
   panel_title 'routetune 画像'
   printf '  %b前缀                      轮次 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%  画像%b\n' "$BOLD" "$RESET"
   rule_light
-  local prefix obs p50 p95 mn jit bl tl rt sg mb cn sp class
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg mb cn sp; do
+  local prefix obs p50 p95 mn jit bl tl rt sg sp class
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
     class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg")"
     local color="$GREEN"
     case "$class" in mobile|policed|bloated|spiky|variable) color="$YELLOW" ;; esac

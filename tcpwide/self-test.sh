@@ -551,10 +551,10 @@ BUF_MB=0
 # things depending on what had been chosen before it.
 apply_profile speed
 apply_profile noshape
-assert_eq '98|0' "$SHAPE_PCT|$SHAPE" 'the no-shape profile sets its own percentage'
+assert_eq '98|20|0' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the no-shape profile sets every value it depends on'
 apply_profile stable
 apply_profile noshape
-assert_eq '98|0' "$SHAPE_PCT|$SHAPE" 'and does so regardless of what preceded it'
+assert_eq '98|20|0' "$SHAPE_PCT|$INITCWND|$SHAPE" 'and does so regardless of what preceded it'
 apply_profile balanced
 
 
@@ -594,5 +594,46 @@ assert_eq "$(grep -c '' < "$writes")" "$SYSCTL_WROTE" \
   'the reported count matches the keys actually written'
 rm -rf "$tmp"
 unset -f sysctl has total_ram_bytes
+
+
+# ── 0.8.0 一键安装 ─────────────────────────────────────────────────────────
+# Run as `bash <(curl ...)`, BASH_SOURCE points at a pipe under /dev/fd that
+# bash is still reading, so copying it yields a truncated install. Piped into
+# bash it is empty entirely. Both must end up with a real file.
+tmp="$(mktemp -d)"
+assert_eq "$ROOT/tcpwide.sh" "$(self_source)" \
+  'run from a real file, that file is what gets installed'
+# Simulate the pipe case: no BASH_SOURCE, fetch instead.
+(
+  SOURCE_URL="file://$ROOT/tcpwide.sh"
+  self_source() {
+    local src="" out
+    if [[ -n "$src" && -f "$src" ]]; then printf '%s\n' "$src"; return 0; fi
+    out="$tmp/fetched"; cp "$ROOT/tcpwide.sh" "$out"
+    # A failed fetch that still writes something must never be installed.
+    grep -q '^PROGRAM="tcpwide"' "$out" || { rm -f "$out"; return 1; }
+    printf '%s\n' "$out"
+  }
+  f="$(self_source)"
+  if [[ ! -f "$f" || "$(head -1 "$f")" != '#!/usr/bin/env bash' ]]; then
+    fail 'the fetched copy must be a complete script'
+  fi
+)
+pass 'without a real BASH_SOURCE a complete copy is fetched instead'
+# A truncated or error-page download must be rejected rather than installed.
+printf 'not the script\n' > "$tmp/junk"
+if grep -q '^PROGRAM="tcpwide"' "$tmp/junk"; then fail 'junk must not pass the sanity check'; fi
+pass 'a download that is not the script is rejected'
+rm -rf "$tmp"
+
+# Piped into bash, stdin IS the script: a prompt would read the next line of
+# source as the operator's answer, so every value has to come from flags.
+EGRESS_MBPS=""
+out="$( ( need_root() { :; }; cmd_install ) < /dev/null 2>&1 )" || true
+[[ "$out" == *"非交互安装需要 --egress"* ]] \
+  || fail 'a non-interactive install without an egress figure must say so'
+[[ "$out" == *"bash <(curl"* ]] || fail 'and must name the command that does get the wizard'
+pass 'a non-interactive install demands its parameters and names the wizard form'
+EGRESS_MBPS=500
 
 printf '%s\n' 'All tcpwide self-tests passed.'

@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -406,6 +406,23 @@ route_with_initcwnd() {
 CONFIG_FILE="/etc/tcpwide.conf"
 CLI_PATH="/usr/local/bin/tcpwide"
 INSTALL_PATH="/usr/local/lib/tcpwide/tcpwide.sh"
+SOURCE_URL="https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh"
+
+# Where to copy the installed script from. Run as `bash <(curl ...)`,
+# BASH_SOURCE points at a pipe under /dev/fd — bash is still reading it, so
+# copying it is a race that yields a truncated file. Piped into bash it is empty
+# altogether. Both cases fetch a real copy instead.
+self_source() {
+  local src="${BASH_SOURCE[0]:-}" tmp
+  if [[ -n "$src" && -f "$src" && -r "$src" ]]; then printf '%s\n' "$src"; return 0; fi
+  has curl || has wget || return 1
+  tmp="$(mktemp)" || return 1
+  if has curl; then curl -fsSL "$SOURCE_URL" -o "$tmp" 2>/dev/null
+  else wget -qO "$tmp" "$SOURCE_URL" 2>/dev/null; fi || { rm -f "$tmp"; return 1; }
+  # A failed fetch that still writes something must not be installed.
+  grep -q '^PROGRAM="tcpwide"' "$tmp" || { rm -f "$tmp"; return 1; }
+  printf '%s\n' "$tmp"
+}
 PROFILE=balanced
 
 # Profiles move three numbers and nothing else. A preset that quietly swapped in
@@ -418,7 +435,7 @@ apply_profile() {
     # Sets the percentage too, even though it does no aggregate shaping: it
     # still drives the per-flow fq maxrate, and leaving whatever the previous
     # profile set made "不整形" mean different things depending on history.
-    noshape)  SHAPE_PCT=98; SHAPE=0; PROFILE=noshape ;;
+    noshape)  SHAPE_PCT=98; INITCWND=20; SHAPE=0; PROFILE=noshape ;;
     *) return 1 ;;
   esac
   return 0
@@ -1380,8 +1397,15 @@ menu() {
 
 cmd_install() {
   need_root install
-  [[ -t 0 ]] || die "install 需要交互终端"
-  local other value answer
+  local other value answer interactive=1
+  # Piped into bash, stdin IS the script: a prompt would read the next line of
+  # source as the operator's answer. So when there is no terminal, every value
+  # has to come from flags instead of being asked for.
+  [[ -t 0 ]] || interactive=0
+  if (( interactive == 0 )) && [[ -z "$EGRESS_MBPS" ]]; then
+    die "非交互安装需要 --egress <Mbps>。想要向导就用：
+       bash <(curl -fsSL $SOURCE_URL) install"
+  fi
   title 'tcpwide 安装向导'
   if other="$(conflicting_tool)"; then
     warn "检测到 $other"
@@ -1399,31 +1423,42 @@ cmd_install() {
   resolve_iface
   printf '  出口网卡：%s\n' "$IFACE"
   printf '  内核拥塞控制：%s → 将选用 %s\n\n' "$(available_cc)" "$(pick_cc "$(available_cc)")"
-  drain_stdin
-  value="$(prompt_uint '这台机器的出口带宽（Mbps，按你套餐的端口速率）' 500 1 100000)" \
-    || die "已取消安装"
-  EGRESS_MBPS="$value"
-  printf '\n'
-  explain_cover_rtt "$EGRESS_MBPS"
   local sug_rtt=250 row
-  if row="$(suggest_cover_rtt)"; then sug_rtt="$(cut -f1 <<< "$row")"; fi
-  value="$(prompt_uint '覆盖 RTT（ms）' "$sug_rtt" 10 2000)" || die "已取消安装"
+  if (( interactive == 1 )); then
+    drain_stdin
+    value="$(prompt_uint '这台机器的出口带宽（Mbps，按你套餐的端口速率）' "${EGRESS_MBPS:-500}" 1 100000)" \
+      || die "已取消安装"
+    EGRESS_MBPS="$value"
+    printf '\n'
+    explain_cover_rtt "$EGRESS_MBPS"
+    if row="$(suggest_cover_rtt)"; then sug_rtt="$(cut -f1 <<< "$row")"; fi
+    value="$(prompt_uint '覆盖 RTT（ms）' "$sug_rtt" 10 2000)" || die "已取消安装"
+  else
+    # Measured if there is traffic to measure, otherwise the documented default.
+    if row="$(suggest_cover_rtt)"; then sug_rtt="$(cut -f1 <<< "$row")"; fi
+    value="$COVER_RTT_MS"
+    [[ "$COVER_RTT_MS" == 250 ]] && value="$sug_rtt"
+    info "非交互安装：出口 ${EGRESS_MBPS} Mbps，覆盖 RTT ${value} ms，档位 $(profile_label "$PROFILE")"
+  fi
   COVER_RTT_MS="$value"
-  printf '\n  %b档位%b\n' "$BOLD" "$RESET"
-  printf '    1) 稳定优先   整形 90%%｜首窗 16   丢包敏感、跨境线路\n'
-  printf '    2) 均衡       整形 95%%｜首窗 20   推荐\n'
-  printf '    3) 速度优先   整形 98%%｜首窗 32   干净直连\n'
-  printf '    4) 不整形     只做 pacing，放弃按设备公平和 AQM\n'
-  read -r -p '  请选择 [2]: ' answer || answer=2
-  case "${answer:-2}" in
-    1) apply_profile stable ;; 3) apply_profile speed ;;
-    4) apply_profile noshape ;; *) apply_profile balanced ;;
-  esac
+  if (( interactive == 1 )); then
+    printf '\n  %b档位%b\n' "$BOLD" "$RESET"
+    printf '    1) 稳定优先   整形 90%%｜首窗 16   丢包敏感、跨境线路\n'
+    printf '    2) 均衡       整形 95%%｜首窗 20   推荐\n'
+    printf '    3) 速度优先   整形 98%%｜首窗 32   干净直连\n'
+    printf '    4) 不整形     只做 pacing，放弃按设备公平和 AQM\n'
+    read -r -p '  请选择 [2]: ' answer || answer=2
+    case "${answer:-2}" in
+      1) apply_profile stable ;; 3) apply_profile speed ;;
+      4) apply_profile noshape ;; *) apply_profile balanced ;;
+    esac
+  fi
   save_config
   printf '\n'
   cmd_apply
   mkdir -p "$(dirname "$INSTALL_PATH")"
-  if cp -f "${BASH_SOURCE[0]}" "$INSTALL_PATH" 2>/dev/null; then
+  local src; src="$(self_source)" || src=""
+  if [[ -n "$src" ]] && cp -f "$src" "$INSTALL_PATH" 2>/dev/null; then
     chmod 0755 "$INSTALL_PATH"
     ln -sfn "$INSTALL_PATH" "$CLI_PATH"
     log "已安装。以后直接运行 sudo tcpwide 进面板"
@@ -1444,11 +1479,17 @@ usage() {
   cat <<'EOF'
 tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板）
 
-首次安装（向导会问出口带宽、覆盖 RTT、档位，然后装好软链）：
-  sudo bash tcpwide.sh install
+一键安装（向导问出口带宽、覆盖 RTT、档位，装好软链）：
+  sudo bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh) install
+
+一键安装（不进向导，直接指定参数）：
+  curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh | sudo bash -s -- install --egress 500 --profile noshape
 
 之后直接进面板：
   sudo tcpwide
+
+注意 `curl … | bash` 时 stdin 就是脚本本身，向导的提问会把脚本内容当成你的回答读走，
+所以那条路径必须用 --egress 指定参数；要向导就用上面 bash <(curl …) 那条。
 
 分散的客户端不需要「每个客户端一套参数」。它需要一套按最远客户端定尺寸的配置，
 再用能自己适应其余客户端的机制搭起来：
@@ -1477,6 +1518,8 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   --initcwnd <N>     默认路由首窗，默认 20（内核默认是 10）
   --shape-pct <N>    整形到出口带宽的百分之多少，默认 95
   --iface <名字>     出口网卡，默认自动探测
+  --profile <名字>   stable | balanced | speed | noshape
+  --buf-mb <N>       缓冲上限 MB，0=自动
   --no-shape         不接管根队列，只做 pacing。放弃按设备公平和 AQM
   --persist          写 /etc/sysctl.d 和 systemd unit
   --yes              检测到冲突工具时仍然继续
@@ -1506,7 +1549,11 @@ main() {
       --initcwnd)  [[ $# -ge 2 ]] || die "--initcwnd 缺少值"; INITCWND="$2"; shift 2 ;;
       --shape-pct) [[ $# -ge 2 ]] || die "--shape-pct 缺少值"; SHAPE_PCT="$2"; shift 2 ;;
       --iface)     [[ $# -ge 2 ]] || die "--iface 缺少值"; IFACE="$2"; shift 2 ;;
-      --no-shape)  SHAPE=0; shift ;;
+      --profile)   [[ $# -ge 2 ]] || die "--profile 缺少值"
+                   apply_profile "$2" || die "--profile 只能是 stable|balanced|speed|noshape"
+                   shift 2 ;;
+      --buf-mb)    [[ $# -ge 2 ]] || die "--buf-mb 缺少值"; BUF_MB="$2"; shift 2 ;;
+      --no-shape)  apply_profile noshape; shift ;;
       --persist)   PERSIST=1; shift ;;
       --yes)       ASSUME_YES=1; shift ;;
       *) die "未知参数：$1" ;;
@@ -1521,6 +1568,7 @@ main() {
   if ! is_uint "$SHAPE_PCT" || (( SHAPE_PCT < 50 || SHAPE_PCT > 100 )); then
     die "--shape-pct 需为 50-100"
   fi
+  if ! is_uint "$BUF_MB" || (( BUF_MB > 512 )); then die "--buf-mb 需为 0-512"; fi
   # Not resolved here: resolve_iface dies when there is no default route, and
   # `version`/`help` must work on a box that has none. Each command that needs
   # an interface resolves it itself.

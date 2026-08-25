@@ -2,12 +2,34 @@
 
 面向**多地区、多设备**客户端的一套 TCP 配置。一个脚本，直接落地，可完整还原。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh -o /tmp/tcpwide.sh
+**一键安装（进向导）**
 
-sudo bash /tmp/tcpwide.sh install    # 向导：问出口带宽、覆盖 RTT、档位，装好软链
-sudo tcpwide                          # 之后直接进面板
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh) install
 ```
+
+**一键安装（不进向导，直接给参数）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh \
+  | sudo bash -s -- install --egress 500 --profile noshape
+```
+
+装完直接进面板：
+
+```bash
+sudo tcpwide
+```
+
+> **为什么是两条不同的写法**：`curl … | bash` 时 **stdin 就是脚本本身**，向导提问会把脚本
+> 下一行当成你的回答读走。所以管道那条必须用 `--egress` 把参数给全（缺了会直接报错并告诉你
+> 该用哪条）；要向导就走 `bash <(curl …)`，那样 stdin 还是你的终端。
+>
+> 同理，`bash <(curl …)` 时脚本是个 `/dev/fd` 管道，bash 还在读它——直接复制会装进一个
+> 截断的文件。所以安装时会重新抓一份完整的，并检查抓到的确实是本脚本再落盘。
+
+`--profile` 可选 `stable | balanced | speed | noshape`，`--buf-mb N` 指定缓冲上限（0=自动），
+其余参数见 `--help`。
 
 ## 面板
 

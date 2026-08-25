@@ -419,4 +419,124 @@ assert_eq far "$(classify_peer "$(printf '%s' "$legacy" | cut -f3)" \
   'a pre-0.2.0 profile classifies exactly as it did before the upgrade'
 rm -rf "$tmp"
 
+
+# ── 0.3.0 全局层：按实测群体定尺寸 ─────────────────────────────────────────
+tmp="$(mktemp -d)"; STATE_DIR="$tmp"; PROFILE_DB="$tmp/profiles.tsv"
+SYSCTL_SNAPSHOT="$tmp/sysctl-before.tsv"
+{
+  printf 'prefix\tobs\ttrusted\tp50sum\tp95max\tminrtt\tjitsum\tbloatsum\ttailmax\tretrtotal\tsegtotal\tmbpsmax\tconnmax\tfirst\tlast\tp95sum\ttailsum\tspikes\n'
+  # The two profiles measured on the live DMIT relay.
+  printf '119.237.129.0/24\t46\t46\t6716\t155.1\t145.5\t0.46\t46.0\t1.07\t0\t81573\t95.0\t1\t0\t0\t7130\t49.2\t0\n'
+  printf '223.153.241.0/24\t43\t43\t9150\t609.5\t163.8\t10.7\t54.6\t3.64\t28633\t433794\t48.0\t38\t0\t0\t11895\t156.5\t12\n'
+} > "$PROFILE_DB"
+env_row="$(observed_envelope)"
+# The envelope must follow the widest TYPICAL round (11895/43 = 276.6), not the
+# single worst round ever recorded (609.5). A max never decays.
+assert_eq '277' "$(printf '%s' "$env_row" | cut -f1)" \
+  'the coverage RTT follows the widest typical round, not the worst one ever seen'
+assert_eq '95' "$(printf '%s' "$env_row" | cut -f2)" 'the peak rate is the highest observed'
+assert_eq '2'  "$(printf '%s' "$env_row" | cut -f3)" 'both prefixes are counted'
+# An empty database must not silently produce a confident number.
+: > "$PROFILE_DB"
+assert_eq '0	0	0' "$(observed_envelope)" 'an empty profile database yields no envelope'
+
+# ── 0.3.0 缓冲尺寸推导 ─────────────────────────────────────────────────────
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+buf="$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')"
+# 400 Mbps x 200 ms = 10 MB of bandwidth-delay product. tcp_adv_win_scale=1
+# hands the application only half of the receive buffer, so the ceiling is 2x.
+assert_eq '20000000' "$buf" 'the buffer ceiling is twice the bandwidth-delay product'
+# An explicit envelope must be honoured even below the floors: an operator who
+# states their population is local is making a decision, not a measurement.
+assert_eq '20000000' "$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')" \
+  'an explicit envelope is not silently raised to the observation floors'
+# Below the floor the asymmetry argument applies: a ceiling that is too small is
+# a hard cap nobody can diagnose, so a small envelope still gets 8 MiB.
+small="$(derive_tuning 10 10 | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')"
+assert_eq "$((8 * 1024 * 1024))" "$small" 'a tiny envelope still gets the 8 MiB floor'
+# A ceiling is per socket, so it must stay bounded relative to RAM.
+total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
+clamped="$(derive_tuning 2000 1000 | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')"
+assert_eq "$((512 * 1024 * 1024 / 16))" "$clamped" 'the ceiling is clamped against total RAM'
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+
+# The congestion control follows what the kernel actually carries.
+cc_of() { derive_tuning 200 400 | awk -F'\t' '$1 == "net.ipv4.tcp_congestion_control" {print $2}'; }
+assert_eq bbr "$(cc_of)" 'a stock kernel is tuned to bbr'
+available_cc() { printf 'reno cubic bbr bbr3\n'; }
+assert_eq bbr3 "$(cc_of)" 'bbr3 is preferred when the kernel carries it'
+available_cc() { printf 'reno cubic\n'; }
+assert_eq cubic "$(cc_of)" 'a kernel without bbr falls back rather than emitting a missing algorithm'
+available_cc() { printf 'reno cubic bbr\n'; }
+
+# fq is the single largest lever for retransmission on a mixed population and
+# must never quietly drop out of the set.
+assert_eq fq "$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.core.default_qdisc" {print $2}')" \
+  'pacing via fq is always part of the tuning'
+assert_eq '0' "$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.ipv4.tcp_slow_start_after_idle" {print $2}')" \
+  'cwnd is not reset between streaming chunks'
+# Every emitted key must carry the measurement it came from.
+derive_tuning 200 400 | while IFS=$'\t' read -r k v why; do
+  [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "tuning key $k has no value or no rationale"
+done
+pass 'every tuning key carries a value and a rationale'
+
+# ── 0.3.0 预演绝不写入 ─────────────────────────────────────────────────────
+writes="$tmp/writes"; : > "$writes"
+sysctl() {
+  case "${1:-}" in
+    -qw|-w) printf '%s\n' "$2" >> "$writes"; return 0 ;;
+    -n) case "${2:-}" in
+          *available*) printf 'reno cubic bbr\n' ;;
+          *) printf '\n' ;;
+        esac ;;
+  esac
+}
+has() { [[ "$1" == sysctl || "$1" == tc || "$1" == ip ]]; }
+netshape_present() { return 1; }
+ip() { printf '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5\n'; }
+tc() { printf 'qdisc htb 1: root\n'; }
+cmd_tune >/dev/null 2>&1
+assert_eq '0' "$(grep -c '' < "$writes")" 'tune without --yes performs zero writes'
+[[ ! -e "$SYSCTL_SNAPSHOT" ]] || fail 'a dry run must not create a snapshot'
+pass 'a dry run leaves no snapshot behind'
+
+# ── 0.3.0 快照与还原往返 ───────────────────────────────────────────────────
+# The machine starts with values that are not the target, so a revert has
+# something real to restore.
+sysctl() {
+  case "${1:-}" in
+    -qw|-w) printf '%s\n' "$2" >> "$writes"; return 0 ;;
+    -n) case "${2:-}" in
+          *available*)                 printf 'reno cubic bbr\n' ;;
+          net.ipv4.tcp_congestion_control) printf 'cubic\n' ;;
+          net.core.default_qdisc)      printf 'pfifo_fast\n' ;;
+          net.core.rmem_max)           printf '212992\n' ;;
+          *)                           printf '\n' ;;
+        esac ;;
+  esac
+}
+need_root() { :; }
+: > "$writes"
+cmd_tune --yes >/dev/null 2>&1
+[[ -e "$SYSCTL_SNAPSHOT" ]] || fail 'applying must snapshot first'
+pass 'applying writes a snapshot before touching anything'
+assert_eq 'cubic' "$(awk -F'\t' '$1 == "net.ipv4.tcp_congestion_control" {print $2}' "$SYSCTL_SNAPSHOT")" \
+  'the snapshot records the value from before routetune touched it'
+# Re-running must not overwrite the record of the original machine state.
+cmd_tune --yes >/dev/null 2>&1
+assert_eq 'cubic' "$(awk -F'\t' '$1 == "net.ipv4.tcp_congestion_control" {print $2}' "$SYSCTL_SNAPSHOT")" \
+  'a second apply keeps the original snapshot rather than recording its own writes'
+: > "$writes"
+cmd_revert >/dev/null 2>&1
+assert_eq 'cubic' "$(grep -c 'tcp_congestion_control=cubic' < "$writes" >/dev/null && printf cubic)" \
+  'revert restores the original congestion control'
+assert_eq 'pfifo_fast' "$(grep -o 'default_qdisc=.*' < "$writes" | cut -d= -f2)" \
+  'revert restores the original qdisc setting'
+[[ ! -e "$SYSCTL_SNAPSHOT" ]] || fail 'revert must consume the snapshot'
+pass 'revert consumes the snapshot so a later revert cannot replay stale values'
+rm -rf "$tmp"
+unset -f sysctl has netshape_present ip tc need_root available_cc total_ram_bytes
+
 printf '%s\n' 'All routetune self-tests passed.'

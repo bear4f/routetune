@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -1165,6 +1165,301 @@ cmd_doctor() {
   fi
 }
 
+# ── 全局层：按观测到的客户端群体定尺寸 ─────────────────────────────────────
+
+# Everything above this line is per-prefix. But the three things actually asked
+# for — low retransmission, fast ramp, no mid-stream collapse — are dominated by
+# machine-wide settings, and the reason a single global setting normally fails a
+# mixed population is that it gets sized for one client. routetune has measured
+# the population, so it can size for the real spread instead of guessing.
+
+# Cheapest correct answer for "how far away is the farthest client": the worst
+# typical round of the worst prefix, not the worst round ever seen anywhere.
+#
+# tcpfit deleted its RTT probe entirely and hardcoded 150ms, arguing the cost is
+# asymmetric: overestimating costs a little BBR overshoot, underestimating puts
+# a silent hard ceiling on every distant client. That argument is right, and its
+# floor is kept here — but tcpfit had to guess because it could not see the
+# clients. This can see them, so it takes the larger of the two.
+COVER_RTT_FLOOR_MS=150
+# A VPS that cannot be shown to be slower is assumed to be at least this fast,
+# for the same asymmetry: sizing buffers off an idle sample is how a link ends
+# up capped at a number the operator can never explain.
+PEAK_MBPS_FLOOR=200
+BUF_MIN_BYTES=$((8 * 1024 * 1024))
+BUF_ABS_MAX_BYTES=$((512 * 1024 * 1024))
+
+total_ram_bytes() {
+  local kb
+  kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || printf '')"
+  if ! is_uint "${kb:-}" || (( kb == 0 )); then printf '0\n'; return 0; fi
+  printf '%s\n' $(( kb * 1024 ))
+}
+
+# Widest typical RTT and highest delivery rate across trusted profiles. Prints
+# "rtt<TAB>mbps<TAB>prefixcount"; zeros when there is nothing to learn from.
+observed_envelope() {
+  local rows
+  rows="$(profile_rows 2>/dev/null || true)"
+  [[ -n "$rows" ]] || { printf '0\t0\t0\n'; return 0; }
+  awk -F '\t' '
+    { n++
+      p95 = $3 * $13            # mean p95 of this prefix, not its worst round
+      if (p95 > rtt) rtt = p95
+      if ($11 + 0 > mb) mb = $11 + 0 }
+    END { printf "%.0f\t%.0f\t%d\n", rtt + 0, mb + 0, n + 0 }
+  ' <<< "$rows"
+}
+
+# The sysctl set, with the measurement each value came from. Emits
+# key<TAB>value<TAB>why. Nothing here is applied by this function.
+derive_tuning() {
+  local force_rtt="${1:-}" force_peak="${2:-}"
+  local env rtt peak nprefix ram bdp buf cc qdisc avail
+  env="$(observed_envelope)"
+  IFS=$'\t' read -r rtt peak nprefix <<< "$env"
+  # The floors guard against sizing off an idle or unrepresentative sample.
+  # They do not override an operator who states a number outright: someone who
+  # knows their whole population is local should be able to say so.
+  if [[ -n "$force_rtt" ]]; then rtt="$force_rtt"
+  elif (( rtt < COVER_RTT_FLOOR_MS )); then rtt="$COVER_RTT_FLOOR_MS"; fi
+  if [[ -n "$force_peak" ]]; then peak="$force_peak"
+  elif (( peak < PEAK_MBPS_FLOOR )); then peak="$PEAK_MBPS_FLOOR"; fi
+  ram="$(total_ram_bytes)"
+  # BDP, then doubled: with tcp_adv_win_scale=1 the kernel reserves half the
+  # receive buffer for overhead, so a ceiling equal to the BDP delivers half of
+  # one.
+  # Mbps x ms in bytes: peak * 1e6 / 8 * rtt / 1000 reduces exactly to
+  # peak * 125 * rtt, which avoids an intermediate integer division.
+  bdp=$(( peak * 125 * rtt ))
+  buf=$(( bdp * 2 ))
+  (( buf < BUF_MIN_BYTES )) && buf="$BUF_MIN_BYTES"
+  (( buf > BUF_ABS_MAX_BYTES )) && buf="$BUF_ABS_MAX_BYTES"
+  # A ceiling is per socket. Leaving it unbounded relative to RAM is how a small
+  # box gets OOM-killed by its own tuning.
+  if (( ram > 0 )) && (( buf > ram / 16 )); then
+    buf=$(( ram / 16 ))
+    (( buf < BUF_MIN_BYTES )) && buf="$BUF_MIN_BYTES"
+  fi
+  avail="$(available_cc)"
+  case " $avail " in
+    *" bbr3 "*) cc=bbr3 ;;
+    *" bbr2 "*) cc=bbr2 ;;
+    *" bbr "*)  cc=bbr ;;
+    *) cc=cubic ;;
+  esac
+  qdisc=fq
+  printf 'net.core.default_qdisc\t%s\t%s\n' "$qdisc" \
+    '发送侧 pacing。混合客户端下降低重传的最大单一杠杆：没有 pacing 时一个突发按线速打出去，会直接冲垮最慢那条末端链路的缓冲'
+  printf 'net.ipv4.tcp_congestion_control\t%s\t%s\n' "$cc" \
+    '爬升快且不会因随机丢包塌陷——丢包型算法每丢一次砍一次窗，无线链路上永远起不来'
+  printf 'net.core.rmem_max\t%s\t%s\n' "$buf" \
+    "接收缓冲上限，按覆盖 RTT ${rtt}ms × 峰值 ${peak}Mbps 的 BDP 两倍算"
+  printf 'net.core.wmem_max\t%s\t%s\n' "$buf" '发送缓冲上限，同上'
+  printf 'net.ipv4.tcp_rmem\t4096 131072 %s\t%s\n' "$buf" \
+    '上限给足，autotuning 会让近端连接自己停在低处；给小了才是查不出来的硬天花板'
+  printf 'net.ipv4.tcp_wmem\t4096 16384 %s\t%s\n' "$buf" '同上'
+  printf 'net.ipv4.tcp_slow_start_after_idle\t0\t%s\n' \
+    '流媒体分块之间会短暂空闲，默认行为是把 cwnd 打回初始值再慢启动一次——这正是「看着看着掉速」的机制'
+  printf 'net.ipv4.tcp_notsent_lowat\t131072\t%s\n' \
+    '限制本机 socket 里堆积的未发送数据，降低本地排队延迟；不影响吞吐'
+  printf 'net.ipv4.tcp_mtu_probing\t1\t%s\n' \
+    '路径上有人钳制 MSS 时（scan 会提示）让内核自己探到能用的大小，而不是一直重传大包'
+}
+
+# What the machine currently has, for the same keys.
+current_sysctl() {
+  local k
+  while IFS=$'\t' read -r k _ _; do
+    printf '%s\t%s\n' "$k" "$(sysctl -n "$k" 2>/dev/null | tr -s ' \t' ' ' || printf '')"
+  done
+}
+
+SYSCTL_SNAPSHOT="$STATE_DIR/sysctl-before.tsv"
+
+# netshape drives the same knobs plus the root qdisc. Two tools writing one
+# machine-wide setting is not a merge, it is whichever ran last.
+netshape_present() {
+  [[ -x /usr/local/bin/netshape || -e /etc/netshape.conf ]] \
+    || systemctl list-unit-files 2>/dev/null | grep -q '^netshape'
+}
+
+cmd_tune() {
+  local apply=0 force_rtt='' force_peak=''
+  while (( $# )); do
+    case "$1" in
+      --yes) apply=1; shift ;;
+      --cover-rtt) [[ $# -ge 2 ]] || die "--cover-rtt 缺少值"; force_rtt="$2"; shift 2 ;;
+      --peak-mbps) [[ $# -ge 2 ]] || die "--peak-mbps 缺少值"; force_peak="$2"; shift 2 ;;
+      *) die "未知参数：$1" ;;
+    esac
+  done
+  [[ -z "$force_rtt" ]] || is_uint "$force_rtt" || die "--cover-rtt 需为正整数"
+  [[ -z "$force_peak" ]] || is_uint "$force_peak" || die "--peak-mbps 需为正整数"
+  has sysctl || die "缺少 sysctl"
+
+  panel_title 'routetune 全局调优'
+  local env rtt peak nprefix
+  env="$(observed_envelope)"
+  IFS=$'\t' read -r rtt peak nprefix <<< "$env"
+  if (( nprefix == 0 )); then
+    warn "画像库是空的，下面的尺寸完全来自保守默认值，不是你机器上的实测"
+    printf '  %b先跑 %s watch --minutes 30，让尺寸按你真实的客户端分布来算。%b\n\n' \
+      "$DIM" "$PROGRAM" "$RESET"
+  else
+    printf '  %b依据 %s 个前缀的实测：最远客户端典型 RTT95 %s ms，观测到的最高单流 %s Mbps%b\n' \
+      "$DIM" "$nprefix" "$rtt" "$peak" "$RESET"
+    [[ -z "$force_rtt" ]] && (( rtt < COVER_RTT_FLOOR_MS )) && \
+      printf '  %b实测 %s ms 低于 %s ms 下限，按下限取——没观测到的客户端可能更远，估低是硬天花板%b\n' \
+        "$DIM" "$rtt" "$COVER_RTT_FLOOR_MS" "$RESET"
+    [[ -z "$force_peak" ]] && (( peak < PEAK_MBPS_FLOOR )) && \
+      printf '  %b实测峰值 %s Mbps 低于 %s Mbps 下限，按下限取——观测期没跑满不等于跑不快，按空闲样本定尺寸正是那种查不出来的限速%b\n' \
+        "$DIM" "$peak" "$PEAK_MBPS_FLOOR" "$RESET"
+  fi
+  if netshape_present; then
+    warn "检测到 netshape：它和 routetune 都会写全局 sysctl 和根队列，同一台机器只能留一个"
+    printf '  %b两者不是叠加关系，是谁后跑谁生效。先卸载 netshape 再 --yes。%b\n' "$DIM" "$RESET"
+  fi
+  printf '\n'
+
+  local derived cur k v why now changed=0
+  derived="$(derive_tuning "$force_rtt" "$force_peak")"
+  cur="$(printf '%s\n' "$derived" | current_sysctl)"
+  printf '  %b参数                                  当前值 → 目标值%b\n' "$BOLD" "$RESET"
+  rule_light
+  while IFS=$'\t' read -r k v why; do
+    [[ -n "$k" ]] || continue
+    now="$(awk -F'\t' -v key="$k" '$1 == key {print $2; exit}' <<< "$cur")"
+    if [[ "$now" == "$v" ]]; then
+      printf '  %b%-36s %s（已经是目标值）%b\n' "$DIM" "$k" "$v" "$RESET"
+    else
+      changed=$((changed + 1))
+      printf '  %b%-36s%b %b%s%b → %b%s%b\n' "$BOLD" "$k" "$RESET" \
+        "$DIM" "${now:-未设置}" "$RESET" "$GREEN" "$v" "$RESET"
+      printf '    %b%s%b\n' "$DIM" "$why" "$RESET"
+    fi
+  done <<< "$derived"
+  rule_light
+
+  if (( apply == 0 )); then
+    printf '  %b这是预演，什么都没有改。%b\n' "$BOLD" "$RESET"
+    printf '  %b%s 项与目标不同。确认无误后加 --yes 才会真的写入。%b\n' "$DIM" "$changed" "$RESET"
+    printf '  %b写入前会先快照当前值，%s revert 可以完整还原。%b\n' "$DIM" "$PROGRAM" "$RESET"
+    return 0
+  fi
+
+  need_root tune --yes
+  mkdir -p "$STATE_DIR"
+  # Snapshot before the first write only: re-running tune must not overwrite the
+  # record of what the machine looked like before routetune ever touched it.
+  if [[ ! -e "$SYSCTL_SNAPSHOT" ]]; then
+    printf '%s\n' "$cur" > "$SYSCTL_SNAPSHOT"
+    chmod 0600 "$SYSCTL_SNAPSHOT"
+    log "已快照原始值到 $SYSCTL_SNAPSHOT"
+  else
+    info "已存在快照，保留最初那份（revert 要还原到 routetune 介入之前）"
+  fi
+  local failed=0
+  while IFS=$'\t' read -r k v _; do
+    [[ -n "$k" ]] || continue
+    if sysctl -qw "$k=$v" 2>/dev/null; then
+      printf '  %b[OK]%b %s = %s\n' "$GREEN" "$RESET" "$k" "$v"
+    else
+      failed=$((failed + 1))
+      printf '  %b[跳过]%b %s —— 这个内核不接受该键\n' "$YELLOW" "$RESET" "$k"
+    fi
+  done <<< "$derived"
+  # default_qdisc only affects interfaces brought up afterwards.
+  local iface
+  iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [[ -n "$iface" ]] && has tc; then
+    if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
+      log "已把 $iface 的根队列换成 fq（default_qdisc 只对之后启动的接口生效，所以这里直接换）"
+    else
+      warn "无法在 $iface 上设置 fq，pacing 不会生效——这是低重传最重要的一项"
+    fi
+  fi
+  if (( failed == 0 )); then
+    log "全局调优已生效。还原：$PROGRAM revert"
+  else
+    warn "$failed 项未生效，其余已生效。还原：$PROGRAM revert"
+  fi
+}
+
+cmd_revert() {
+  need_root revert
+  [[ -r "$SYSCTL_SNAPSHOT" ]] || die "没有快照可还原（没跑过 $PROGRAM tune --yes）"
+  panel_title 'routetune 还原'
+  local k v n=0
+  while IFS=$'\t' read -r k v; do
+    [[ -n "$k" ]] || continue
+    if [[ -z "$v" ]]; then
+      printf '  %b[跳过]%b %s 原本就没有值\n' "$DIM" "$RESET" "$k"
+      continue
+    fi
+    if sysctl -qw "$k=$v" 2>/dev/null; then
+      n=$((n + 1)); printf '  %b[还原]%b %s = %s\n' "$GREEN" "$RESET" "$k" "$v"
+    else
+      printf '  %b[失败]%b %s\n' "$RED" "$RESET" "$k"
+    fi
+  done < "$SYSCTL_SNAPSHOT"
+  rm -f "$SYSCTL_SNAPSHOT"
+  log "已还原 $n 项到 routetune 介入之前的值，并删除快照"
+  printf '  %b根队列没有自动还原——它原本是什么由发行版决定；用 tc qdisc replace dev <网卡> root <原值> 手动改回。%b\n' \
+    "$DIM" "$RESET"
+}
+
+cmd_status() {
+  panel_title 'routetune 状态'
+  local derived cur k v now drift=0 applied=0
+  derived="$(derive_tuning)"
+  cur="$(printf '%s\n' "$derived" | current_sysctl)"
+  if [[ -e "$SYSCTL_SNAPSHOT" ]]; then
+    applied=1
+    printf '  全局调优:          %b已应用%b（快照在 %s）\n' "$GREEN" "$RESET" "$SYSCTL_SNAPSHOT"
+  else
+    printf '  全局调优:          %b未应用%b（%s tune 看预演）\n' "$YELLOW" "$RESET" "$PROGRAM"
+  fi
+  local iface qdisc
+  iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [[ -n "$iface" ]] && has tc; then
+    qdisc="$(tc qdisc show dev "$iface" 2>/dev/null | awk '$1 == "qdisc" {print $2; exit}')"
+    if [[ "$qdisc" == fq ]]; then
+      printf '  %s 根队列:      %bfq%b（pacing 生效）\n' "$iface" "$GREEN" "$RESET"
+    else
+      printf '  %s 根队列:      %b%s%b —— 不是 fq，发送侧没有 pacing\n' \
+        "$iface" "$YELLOW" "${qdisc:-未知}" "$RESET"
+    fi
+  fi
+  printf '\n  %b当前值与目标值的差异%b\n' "$BOLD" "$RESET"
+  rule_light
+  while IFS=$'\t' read -r k v _; do
+    [[ -n "$k" ]] || continue
+    now="$(awk -F'\t' -v key="$k" '$1 == key {print $2; exit}' <<< "$cur")"
+    if [[ "$now" == "$v" ]]; then
+      printf '  %b✓ %-36s %s%b\n' "$GREEN" "$k" "$v" "$RESET"
+    else
+      drift=$((drift + 1))
+      printf '  %b✗ %-36s%b %s（目标 %s）\n' "$YELLOW" "$k" "$RESET" "${now:-未设置}" "$v"
+    fi
+  done <<< "$derived"
+  rule_light
+  if (( drift == 0 )); then
+    log "全部与目标一致"
+  elif (( applied == 1 )); then
+    warn "$drift 项已偏离目标——可能是重启后失效（tune 不持久化），重跑 $PROGRAM tune --yes"
+  else
+    printf '  %b%s 项与目标不同。%s tune 看逐项理由。%b\n' "$DIM" "$drift" "$PROGRAM" "$RESET"
+  fi
+  printf '\n'
+  if [[ -r "$PROFILE_DB" ]]; then
+    local n; n="$(profile_rows 2>/dev/null | grep -c "" || printf '0')"
+    printf '  画像库:            %s 个前缀\n' "$n"
+  else
+    printf '  画像库:            还是空的，跑 %s watch 开始积累\n' "$PROGRAM"
+  fi
+}
+
 cmd_reset() {
   need_root reset
   [[ -e "$PROFILE_DB" ]] || { info "画像库本来就是空的"; return 0; }
@@ -1183,15 +1478,38 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
 能表达这种差异的是路由表：initcwnd / initrwnd / rto_min / window / advmss / congctl
 都是 per-route 的。routetune 观测每个对端、聚成画像、再输出画像对应的 per-route 策略。
 
+  观测
   routetune scan                    看当前一轮的分布
   routetune scan --group ip         按 IP 而不是前缀聚合
   routetune scan --all              连本机出站对端一起看
   routetune watch --minutes 30      持续观测并累积画像
   routetune profiles                看已累积的画像
+
+  调优
+  routetune tune                    按观测到的客户端群体算全局参数（预演，不写）
+  routetune tune --yes              真的写入，写前自动快照
+  routetune tune --cover-rtt 250    手动指定覆盖 RTT，不用实测值
+  routetune status                  当前生效情况与目标值的差异
+  routetune revert                  还原到 routetune 介入之前
+
+  per-route
   routetune recommend               输出 per-route 策略命令（不执行）
   routetune recommend --min-obs 5   只对观测够 5 轮的前缀出建议
+
+  其他
   routetune doctor                  内核能力、BBR 判定与全机 DSACK 旁证
   routetune reset                   清空画像库
+
+全局层为什么能兼顾多地区：单一 sysctl 之所以在混合客户端上失效，是因为它总是按
+「某一个客户端」定的尺寸。routetune 观测过整个群体，所以缓冲上限按**最远那个客户端**
+算——上限只是上限，autotuning 会让近端连接自己停在低处，给大几乎不亏；给小才是查不
+出来的硬天花板（这条论证来自 tcpfit，它因为看不到客户端只能硬编码 150ms，这里取实测
+与 150ms 的较大者）。
+
+三个目标各自靠什么：
+  低重传     fq pacing——没有 pacing 时突发按线速打出去，冲垮最慢那条末端链路
+  爬升快     缓冲上限给足 + BBR + slow_start_after_idle=0 + 干净远端路径的 initcwnd
+  不掉速     BBR 不因随机丢包塌陷；不设会绑死的单流限速；分块间不重置 cwnd
 
 画像分类与对应策略：
 
@@ -1229,6 +1547,9 @@ main() {
     watch) shift; cmd_watch "$@" ;;
     profiles) cmd_profiles ;;
     recommend) shift; cmd_recommend "$@" ;;
+    tune) shift; cmd_tune "$@" ;;
+    status) cmd_status ;;
+    revert) cmd_revert ;;
     doctor) cmd_doctor ;;
     reset) cmd_reset ;;
     help|-h|--help) usage ;;

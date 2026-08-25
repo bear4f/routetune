@@ -464,4 +464,43 @@ assert_eq none "$(bbr_variant 'reno cubic' '6.1.0-50-amd64')" 'a kernel without 
   || fail 'the v1 note must explain the stale bandwidth estimate'
 pass 'each variant carries an explanation of what it means'
 
+
+# ── 0.4.0 对端窗口决定的单流上限 ───────────────────────────────────────────
+# A single flow can never exceed the peer's advertised window divided by the
+# round trip, and nothing on this machine changes that number. On the live node
+# the fastest flow peaked at 427.79 Mbps at 171ms — which is exactly what an
+# 8.72 MB peer window permits, so the shortfall against the 500 Mbps line was
+# never server-side.
+has() { [[ "$1" == ss ]]; }
+ss() {
+  case "$1" in
+    -tlnH) printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n' ;;
+    -tinH) cat <<'SS'
+ESTAB 0 0 10.0.0.1:443 203.0.113.9:51234
+	 bbr rtt:171.0/8.0 snd_wnd:9143255 delivery_rate 427.8Mbps data_segs_out:99999
+ESTAB 0 0 10.0.0.1:443 203.0.113.10:44000
+	 bbr rtt:20.0/2.0 snd_wnd:262144 delivery_rate 90.0Mbps data_segs_out:5000
+ESTAB 0 0 10.0.0.1:51999 104.21.67.144:443
+	 bbr rtt:5.0/1.0 snd_wnd:99999999 delivery_rate 9000.0Mbps data_segs_out:99999
+SS
+    ;;
+  esac
+}
+win="$(peer_window_ceiling)"
+assert_eq '203.0.113.9' "$(printf '%s' "$win" | cut -f1)" \
+  'the ceiling is reported for the fastest inbound flow'
+assert_eq '427.8' "$(printf '%s' "$win" | cut -f4)" \
+  'the ceiling is the peer window divided by the round trip'
+assert_eq '427.8' "$(printf '%s' "$win" | cut -f5)" \
+  'the observed rate is reported alongside so the two can be compared'
+# An outbound connection to a CDN is not a client and must not be picked, even
+# though it is by far the fastest thing on the box.
+[[ "$(printf '%s' "$win" | cut -f1)" != "104.21.67.144" ]] \
+  || fail 'an outbound connection must never set the reported ceiling'
+pass 'an outbound connection is excluded from the ceiling report'
+ss() { case "$1" in -tlnH) printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n' ;; -tinH) : ;; esac; }
+if peer_window_ceiling >/dev/null 2>&1; then fail 'no flows means no ceiling to report'; fi
+pass 'with no active flows there is no ceiling to report'
+unset -f ss has
+
 printf '%s\n' 'All tcpwide self-tests passed.'

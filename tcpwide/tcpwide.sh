@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.7"
+VERSION="0.4.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -984,6 +984,63 @@ observed_client_rtt() {
     END { if (n > 0) printf "%.0f\t%d\n", max, n; else exit 1 }'
 }
 
+# A single flow can never exceed what the PEER is willing to receive: its
+# advertised window divided by the round trip. Nothing on this machine changes
+# that number, so when a single-flow test falls short of the line rate this is
+# the first thing to rule out — otherwise the search goes looking for a
+# server-side cause that does not exist.
+#
+# Prints "peer<TAB>rtt<TAB>windowbytes<TAB>ceilingmbps<TAB>observedmbps" for the
+# fastest inbound connection.
+peer_window_ceiling() {
+  local ports
+  has ss || return 1
+  ports="$(ss -tlnH 2>/dev/null | awk '{
+    for (i = NF; i >= 1; i--) if ($i ~ /:[0-9]+$/) {
+      j = length($i); while (j > 0 && substr($i, j, 1) != ":") j--
+      print substr($i, j + 1); break
+    }
+  }' | sort -u | tr '\n' ' ')" || return 1
+  ss -tinH 2>/dev/null | awk -v listen=" $ports " '
+    function portof(a,   i) {
+      i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
+      return (i > 0) ? substr(a, i + 1) : ""
+    }
+    function ipof(a,   i) {
+      if (substr(a, 1, 1) == "[") { i = index(a, "]"); return (i > 2) ? substr(a, 2, i - 2) : a }
+      i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
+      return (i > 1) ? substr(a, 1, i - 1) : a
+    }
+    function tomb(v,   n) {
+      n = v + 0
+      if (v ~ /Gbps/) return n * 1000
+      if (v ~ /Mbps/) return n
+      if (v ~ /Kbps/) return n / 1000
+      return n / 1000000
+    }
+    /^[ \t]/ {
+      if (local == "") next
+      rtt = 0; wnd = 0; rate = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^rtt:/) { s = substr($i, 5); p = index(s, "/")
+          rtt = ((p > 0) ? substr(s, 1, p - 1) : s) + 0 }
+        else if ($i ~ /^snd_wnd:/) wnd = substr($i, 9) + 0
+        else if ($i == "delivery_rate" && i < NF) rate = tomb($(i + 1))
+      }
+      if (rtt > 0 && wnd > 0 && rate > best && index(listen, " " portof(local) " ") > 0) {
+        best = rate; brtt = rtt; bwnd = wnd; bpeer = ipof(peer)
+      }
+      local = ""; peer = ""; next
+    }
+    { local = ""; peer = ""
+      if (NF >= 5 && $1 ~ /^[A-Z][A-Z0-9_-]*$/) { local = $4; peer = $5 }
+      else if (NF >= 4) { local = $3; peer = $4 } }
+    END {
+      if (best <= 0) exit 1
+      printf "%s\t%.1f\t%d\t%.1f\t%.1f\n", bpeer, brtt, bwnd, bwnd * 8 / (brtt * 1000), best
+    }'
+}
+
 # Round the measurement up to a round number and keep a little headroom: a
 # mobile client that was calm during the sample will not be calm later.
 suggest_cover_rtt() {
@@ -1115,7 +1172,19 @@ panel_diagnose() {
   else
     printf '  实时重传率:        无法采样（缺少 nstat 或窗口内没有流量）\n'
   fi
-  printf '  根队列:            %s\n' \
+  local win peer wrtt wbytes wceil wobs
+  if win="$(peer_window_ceiling)"; then
+    IFS=$'\t' read -r peer wrtt wbytes wceil wobs <<< "$win"
+    printf '\n  %b最快的那条连接：%s%b\n' "$BOLD" "$peer" "$RESET"
+    printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \
+      "$wrtt" "$(mb "$wbytes")" "$wobs"
+    printf '    %b对端窗口决定的单流上限：%s Mbps%b\n' "$BOLD" "$wceil" "$RESET"
+    printf '    %b单流永远不会超过「对端愿意收多少 ÷ 往返时间」。这台机器改不了那个数——%b\n' \
+      "$DIM" "$RESET"
+    printf '    %b单线程跑分到不了线速时，先排除这一条，否则会一直在服务端找不存在的原因。%b\n' \
+      "$DIM" "$RESET"
+  fi
+  printf '\n  根队列:            %s\n' \
     "$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //')"
   if drift="$(qdisc_drift)"; then
     warn "实际是 $drift，与配置不一致 —— 按 a 重新应用"

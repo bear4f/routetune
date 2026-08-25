@@ -267,6 +267,7 @@ assert_eq nonstock "$(bbr_variant 'reno cubic bbr' '6.6.7-x64v3-xanmod1')" 'XanM
 expect_arrow() {
   case "$1" in
     bloated)    printf '接入网排' ;;  mixed)      printf '既排队又' ;;
+    spurious)   printf '虚假重传' ;;
     mobile)     printf '无线接入' ;;  flatloss)   printf '稳定延迟' ;;
     lossy)      printf '轻度丢包' ;;  spiky)      printf '间歇性排' ;;
     variable)   printf '链路抖动|延迟尾部' ;;
@@ -318,5 +319,104 @@ assert_eq far "$(classify_peer 146.0 0.010 1.00 1.07 0.0000 1.06 81573 0.05)" \
   'the DMIT fixed-line profile still classifies as a healthy far path'
 assert_eq mobile "$(classify_peer 212.8 0.248 1.27 3.64 6.6001 1.30 433794 0.30)" \
   'the DMIT 4G profile still classifies as mobile'
+
+
+# ── 0.2.0 新证据：解析层 ───────────────────────────────────────────────────
+# ss only prints dsack_dups/reord_seen/rwnd_limited when non-zero, and prints
+# the limited timers as "1800ms(20.0%)".
+ev="$(cat <<'SS'
+ESTAB 0 0 10.0.0.1:443 203.0.113.5:51234
+	 bbr rtt:35.5/2.25 mss:1448 pmtu:1500 rcvmss:536 advmss:1448 cwnd:120 data_segs_out:35900 data_segs_in:412 delivery_rate 240.0Mbps busy:9000ms rwnd_limited:1800ms(20.0%) sndbuf_limited:450ms(5.0%) retrans:0/125 dsack_dups:37 reord_seen:4 minrtt:32.1
+SS
+)"
+ev="$(printf '%s\n' "$ev" | ss_parse " 443 ")"
+assert_eq '37'   "$(printf '%s' "$ev" | cut -f12)" 'dsack_dups parses'
+assert_eq '4'    "$(printf '%s' "$ev" | cut -f13)" 'reord_seen parses'
+assert_eq '412'  "$(printf '%s' "$ev" | cut -f14)" 'data_segs_in parses'
+# advmss: and rcvmss: both end in "mss:"; only the anchored mss: may match.
+assert_eq '1448' "$(printf '%s' "$ev" | cut -f15)" 'mss parses without matching advmss or rcvmss'
+assert_eq '1500' "$(printf '%s' "$ev" | cut -f16)" 'pmtu parses'
+assert_eq '1800' "$(printf '%s' "$ev" | cut -f17)" 'rwnd_limited drops its unit and percentage'
+assert_eq '450'  "$(printf '%s' "$ev" | cut -f18)" 'sndbuf_limited drops its unit and percentage'
+assert_eq '9000' "$(printf '%s' "$ev" | cut -f19)" 'busy parses'
+# A socket without any of the optional fields must read as zero, not empty.
+plain="$(printf 'ESTAB 0 0 10.0.0.1:443 203.0.113.5:51234\n\t bbr rtt:35.5/2.25 data_segs_out:100 retrans:0/0 minrtt:32.1\n' | ss_parse " 443 ")"
+assert_eq '0' "$(printf '%s' "$plain" | cut -f12)" 'an absent dsack_dups reads as zero'
+
+# ── 0.2.0 新证据：聚合层 ───────────────────────────────────────────────────
+# Two samples of one connection: 100 retransmissions in the window, 80 of them
+# reported back by the receiver as duplicates.
+sp="$(printf 'k\t203.0.113.5\tbbr\t35\t1\t32\t100\t10000\t1\t10\tin\t10\t1\t100\t1448\t1500\t100\t0\t1000\nk\t203.0.113.5\tbbr\t35\t1\t32\t200\t20000\t1\t10\tin\t90\t5\t300\t1448\t1500\t900\t0\t3000\n' | awk -v mode=ip "$AGGREGATE_AWK")"
+assert_eq '80.0' "$(printf '%s' "$sp" | cut -f16)" 'the spurious share is a window delta, not a lifetime ratio'
+assert_eq '4'    "$(printf '%s' "$sp" | cut -f17)" 'reordering events are a window delta'
+assert_eq '40.0' "$(printf '%s' "$sp" | cut -f19)" 'receive-window stall is a share of active sending time'
+# No retransmissions at all means no denominator: -1, never a measured 0%.
+nr="$(printf 'k\t203.0.113.5\tbbr\t35\t1\t32\t0\t10000\t1\t10\tin\t0\t0\t0\t1448\t1500\t0\t0\t1000\nk\t203.0.113.5\tbbr\t35\t1\t32\t0\t20000\t1\t10\tin\t0\t0\t0\t1448\t1500\t0\t0\t3000\n' | awk -v mode=ip "$AGGREGATE_AWK")"
+assert_eq '-1.0' "$(printf '%s' "$nr" | cut -f16)" 'no retransmissions yields no spurious share rather than zero'
+
+# ── 0.2.0 虚假重传分类 ─────────────────────────────────────────────────────
+# The same 6.6% retransmission rate is two different links depending on whether
+# the receiver confirmed those retransmissions were duplicates.
+assert_eq spurious "$(classify_peer 212.8 0.248 1.27 3.64 6.6 1.30 433794 0.30 80 5000)" \
+  'a majority-DSACK retransmission rate is not read as loss'
+assert_eq mobile "$(classify_peer 212.8 0.248 1.27 3.64 6.6 1.30 433794 0.30 5 5000)" \
+  'the same rate with little DSACK evidence stays radio loss'
+# Below the retransmission floor the ratio is noise and must not classify.
+assert_eq mobile "$(classify_peer 212.8 0.248 1.27 3.64 6.6 1.30 433794 0.30 100 3)" \
+  'three retransmissions cannot prove a spurious majority'
+# Unknown (-1) evidence must behave exactly like the pre-0.2.0 default.
+assert_eq mobile "$(classify_peer 212.8 0.248 1.27 3.64 6.6 1.30 433794 0.30 -1 0)" \
+  'absent DSACK evidence leaves the old classification untouched'
+assert_eq '' "$(class_policy spurious | sed -n 1p)" \
+  'a spurious-retransmission prefix gets no route parameters'
+[[ "$(class_policy spurious | sed -n 2p)" == *"RACK"* ]] \
+  || fail 'the spurious note must explain why reordering is a no-op on modern kernels'
+pass 'the spurious policy explains why it prescribes nothing'
+
+# ── 0.2.0 no-op 闸门 ───────────────────────────────────────────────────────
+# The script runs under IFS=$'\n\t'. A default read -a would keep "initcwnd 32"
+# as one word and every gate below would be skipped without examining anything.
+assert_eq 'initcwnd 32' "$(gate_metrics 'initcwnd 32' 5 | sed -n 1p)" \
+  'a metric survives when nothing disproves it'
+assert_eq '' "$(gate_metrics 'initcwnd 32' 60 | sed -n 1p)" \
+  'a wider first window is dropped when the receiver window is the ceiling'
+[[ "$(gate_metrics 'initcwnd 32' 60 | sed -n 2p | cut -f1)" == initcwnd ]] \
+  || fail 'the dropped metric must be named'
+pass 'a dropped metric is reported with the metric name'
+assert_eq 'congctl bbr3' "$(gate_metrics 'initcwnd 32 congctl bbr3' 60 | sed -n 1p)" \
+  'gating drops only the metric that fails, keeping the rest'
+# Unknown receive-window evidence must not silently suppress a recommendation.
+assert_eq 'initcwnd 32' "$(gate_metrics 'initcwnd 32' -1 | sed -n 1p)" \
+  'unknown receive-window evidence does not block the recommendation'
+
+# ── 0.2.0 per-route congctl 只在内核真有更好算法时才提议 ────────────────────
+if better_cc 'reno cubic bbr' bbr >/dev/null 2>&1; then
+  fail 'a stock kernel must not offer a per-route congestion control upgrade'
+fi
+pass 'a stock reno/cubic/bbr kernel proposes no congctl'
+assert_eq bbr3 "$(better_cc 'reno cubic bbr bbr3' bbr)" 'bbr3 is offered over bbr'
+assert_eq bbr2 "$(better_cc 'reno cubic bbr bbr2' bbr)" 'bbr2 is offered over bbr'
+if better_cc 'reno cubic bbr bbr3' bbr3 >/dev/null 2>&1; then
+  fail 'already running the best available algorithm must offer nothing'
+fi
+pass 'no congctl is proposed when the best algorithm is already running'
+
+# ── 0.2.0 旧画像库仍可读 ───────────────────────────────────────────────────
+tmp="$(mktemp -d)"; STATE_DIR="$tmp"; PROFILE_DB="$tmp/profiles.tsv"
+{
+  printf 'prefix\tobs\ttrusted\tp50sum\tp95max\tminrtt\tjitsum\tbloatsum\ttailmax\tretrtotal\tsegtotal\tmbpsmax\tconnmax\tfirst\tlast\tp95sum\ttailsum\tspikes\n'
+  printf '203.0.113.0/24\t40\t40\t8000\t215\t195\t0.40\t41.2\t1.12\t0\t80000\t400\t4\t0\t0\t8320\t44.4\t0\n'
+} > "$PROFILE_DB"
+legacy="$(profile_rows)"
+assert_eq '-1.0' "$(printf '%s' "$legacy" | cut -f16)" \
+  'a pre-0.2.0 profile reports unknown spurious evidence, not a measured zero'
+assert_eq far "$(classify_peer "$(printf '%s' "$legacy" | cut -f3)" \
+  "$(printf '%s' "$legacy" | cut -f6)" "$(printf '%s' "$legacy" | cut -f7)" \
+  "$(printf '%s' "$legacy" | cut -f8)" "$(printf '%s' "$legacy" | cut -f9)" \
+  "$(printf '%s' "$legacy" | cut -f13)" "$(printf '%s' "$legacy" | cut -f10)" \
+  "$(printf '%s' "$legacy" | cut -f14)" "$(printf '%s' "$legacy" | cut -f16)" \
+  "$(printf '%s' "$legacy" | cut -f23)")" \
+  'a pre-0.2.0 profile classifies exactly as it did before the upgrade'
+rm -rf "$tmp"
 
 printf '%s\n' 'All routetune self-tests passed.'

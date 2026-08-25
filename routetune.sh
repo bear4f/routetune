@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.5"
+VERSION="0.2.0"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -103,6 +103,8 @@ function portof(a,   i) {
 /^[ \t]/ {
   if (peer == "") next
   cc = $1; rtt = ""; rttvar = ""; minrtt = ""; retr = 0; dsegs = 0; cwnd = 0; mbps = 0
+  dsack = 0; reord = 0; dsegsin = 0; mss = 0; pmtu = 0
+  rwndlim = 0; sndlim = 0; busy = 0
   for (i = 1; i <= NF; i++) {
     f = $i
     if (f ~ /^rtt:/) {
@@ -113,7 +115,22 @@ function portof(a,   i) {
     else if (f ~ /^minrtt:/) minrtt = substr(f, 8) + 0
     else if (f ~ /^retrans:/) { s = substr(f, 9); p = index(s, "/"); retr = ((p > 0) ? substr(s, p + 1) : s) + 0 }
     else if (f ~ /^data_segs_out:/) dsegs = substr(f, 15) + 0
+    else if (f ~ /^data_segs_in:/) dsegsin = substr(f, 14) + 0
     else if (f ~ /^cwnd:/) cwnd = substr(f, 6) + 0
+    # ss only prints these when non-zero, so an absent field means zero.
+    # dsack_dups is the receiver telling us a retransmit was unnecessary: the
+    # per-socket version of the whole-host DSACK counter doctor already shows,
+    # except this one can be attributed to a prefix.
+    else if (f ~ /^dsack_dups:/) dsack = substr(f, 12) + 0
+    else if (f ~ /^reord_seen:/) reord = substr(f, 12) + 0
+    # advmss: and rcvmss: also end in "mss:", so these stay anchored.
+    else if (f ~ /^mss:/) mss = substr(f, 5) + 0
+    else if (f ~ /^pmtu:/) pmtu = substr(f, 6) + 0
+    # Printed as "100ms(10.5%)". Numeric coercion takes the leading run of
+    # digits, so the unit and the lifetime percentage fall away on their own.
+    else if (f ~ /^rwnd_limited:/) rwndlim = substr(f, 14) + 0
+    else if (f ~ /^sndbuf_limited:/) sndlim = substr(f, 16) + 0
+    else if (f ~ /^busy:/) busy = substr(f, 6) + 0
     else if (f == "delivery_rate" && i < NF) mbps = tomb($(i + 1))
   }
   # No RTT estimate yet, or nothing ever sent: nothing to say about this one.
@@ -124,8 +141,9 @@ function portof(a,   i) {
   # Those are not clients, and mixing them in makes the table unreadable, so
   # the direction is decided by whether the local side is a listening port.
   dir = (index(listen, " " portof(local) " ") > 0) ? "in" : "out"
-  printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.3f\t%d\t%s\n", \
-    local "|" peer, ipof(peer), cc, rtt, rttvar, minrtt, retr, dsegs, mbps, cwnd, dir
+  printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.3f\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+    local "|" peer, ipof(peer), cc, rtt, rttvar, minrtt, retr, dsegs, mbps, cwnd, dir, \
+    dsack, reord, dsegsin, mss, pmtu, rwndlim, sndlim, busy
   peer = ""
   next
 }
@@ -198,12 +216,24 @@ function groupof(ip,   i) {
   key = $1; base = groupof($2); cc = $3
   rtt = $4 + 0; rttvar = $5 + 0; minrtt = $6 + 0
   retr = $7 + 0; dsegs = $8 + 0; mbps = $9 + 0; cwnd = $10 + 0; dir = $11
+  dsack = $12 + 0; reord = $13 + 0; dsegsin = $14 + 0; mss = $15 + 0; pmtu = $16 + 0
+  rwndlim = $17 + 0; sndlim = $18 + 0; busy = $19 + 0
   # Keep inbound and outbound sockets in separate buckets even when they share
   # a prefix. watch persists only inbound rows; otherwise a CDN connection in
   # the same /24 could contaminate a client profile.
   g = base SUBSEP dir; glabel[g] = base
-  if (!(key in firstseen)) { firstseen[key] = 1; fretr[key] = retr; fsegs[key] = dsegs; kgroup[key] = g; kdir[key] = dir }
+  if (!(key in firstseen)) {
+    firstseen[key] = 1; fretr[key] = retr; fsegs[key] = dsegs; kgroup[key] = g; kdir[key] = dir
+    fdsack[key] = dsack; freord[key] = reord; fdsin[key] = dsegsin
+    frwnd[key] = rwndlim; fsnd[key] = sndlim; fbusy[key] = busy
+  }
   lretr[key] = retr; lsegs[key] = dsegs
+  ldsack[key] = dsack; lreord[key] = reord; ldsin[key] = dsegsin
+  lrwnd[key] = rwndlim; lsnd[key] = sndlim; lbusy[key] = busy
+  # Point-in-time, not counters. The conservative reading of a group is its
+  # smallest segment size against its smallest path MTU.
+  if (mss > 0 && (!(g in gmss) || mss < gmss[g])) gmss[g] = mss
+  if (pmtu > 0 && (!(g in gpmtu) || pmtu < gpmtu[g])) gpmtu[g] = pmtu
   n = ++cnt[g]
   rtts[g, n] = rtt
   rates[g, n] = mbps
@@ -222,7 +252,20 @@ END {
     # have millions of lifetime segments and would otherwise pass the activity
     # gate even though this window observed no traffic at all.
     if (dr < 0) dr = 0
-    if (ds > 0) { sumretr[g] += dr; sumsegs[g] += ds }
+    # Everything the receiver reports about our sending shares the send-side
+    # activity gate, so an idle socket cannot dilute the evidence of a busy one.
+    if (ds > 0) {
+      sumretr[g] += dr; sumsegs[g] += ds
+      dk = ldsack[key] - fdsack[key]; if (dk > 0) sumdsack[g] += dk
+      dz = lreord[key] - freord[key]; if (dz > 0) sumreord[g] += dz
+      dw = lrwnd[key] - frwnd[key];   if (dw > 0) sumrwnd[g] += dw
+      dn = lsnd[key]  - fsnd[key];    if (dn > 0) sumsnd[g]  += dn
+      db = lbusy[key] - fbusy[key];   if (db > 0) sumbusy[g] += db
+    }
+    # The upload direction has its own gate: a client can be sending to us
+    # while we send it almost nothing.
+    di = ldsin[key] - fdsin[key]
+    if (di > 0) sumdsin[g] += di
   }
   for (g in cnt) {
     n = cnt[g]
@@ -236,9 +279,22 @@ END {
     bloat = (gmin[g] >= 0.1) ? p50 / gmin[g] : -1
     tail = (gmin[g] >= 0.1) ? p95 / gmin[g] : -1
     rpct = (sumsegs[g] > 0) ? sumretr[g] * 100 / sumsegs[g] : 0
+    # What share of our retransmissions the receiver told us were unnecessary.
+    # -1 means "no retransmissions to attribute", which is not the same as 0%.
+    spur = (sumretr[g] > 0) ? sumdsack[g] * 100 / sumretr[g] : -1
+    # How much of the time we were actively sending we spent blocked, and on
+    # what. These are the only two signals that say why a peer is not faster.
+    rwpct = (sumbusy[g] > 0) ? sumrwnd[g] * 100 / sumbusy[g] : -1
+    sbpct = (sumbusy[g] > 0) ? sumsnd[g] * 100 / sumbusy[g] : -1
+    tot = sumsegs[g] + sumdsin[g]
+    upl = (tot > 0) ? sumdsin[g] * 100 / tot : 0
     d = (nout[g] == 0) ? "in" : ((nin[g] == 0) ? "out" : "mix")
-    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\t%.2f\t%d\n", \
-      glabel[g], conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d, tail, sumretr[g]
+    # 16-22 are ready-to-print ratios for a single scan; 23-27 are the raw
+    # additive counters, because only sums can be merged across rounds.
+    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\t%.2f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+      glabel[g], conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d, tail, sumretr[g], \
+      spur, sumreord[g], upl, rwpct, sbpct, gmss[g], gpmtu[g], \
+      sumdsack[g], sumrwnd[g], sumsnd[g], sumbusy[g], sumdsin[g]
   }
 }
 '
@@ -258,6 +314,15 @@ MIN_SEGS_FOR_RETRANS=1000
 # spike. What matters for policy is how OFTEN that happens, not how bad the
 # single worst round was, so this is a counting threshold rather than a verdict.
 SPIKE_TAIL=2
+# Share of our retransmissions that the receiver reported back as duplicates.
+# dsack_dups counts DSACK blocks and retrans counts segments, so one block can
+# cover several segments and the ratio is close but not exactly a percentage.
+# Hence a deliberately conservative bar: a clear majority, not a plurality.
+SPURIOUS_SHARE=50
+MIN_RETRANS_FOR_SPURIOUS=20
+# Share of active sending time spent blocked on the receiver window. Above
+# this the peer, not the path and not our first window, is the constraint.
+RWND_LIMITED_SHARE=25
 
 # rtt / minrtt is how many times the path has grown above the connection's
 # observed floor. It is evidence of queueing, not proof of where that queue is.
@@ -296,9 +361,10 @@ retrans_verdict() {
 # wobbling radio link, and an idle one reads as a policed path.
 diagnose_peer() {
   local bloat="${1:-1}" jitter="${2:-0}" retrans="${3:-0}" rtt="${4:-999}" segs="${5:-999999}"
-  local tail="${6:-$1}" spread="${7:-1}"
+  local tail="${6:-$1}" spread="${7:-1}" spurious="${8:--1}" retrcount="${9:-0}"
   awk -v b="$bloat" -v j="$jitter" -v r="$retrans" -v t="$rtt" -v sg="$segs" \
-      -v tb="$tail" -v sp="$spread" \
+      -v tb="$tail" -v sp="$spread" -v spur="$spurious" -v rc="$retrcount" \
+      -v spshare="$SPURIOUS_SHARE" -v minrc="$MIN_RETRANS_FOR_SPURIOUS" \
       -v floor="$LOCAL_RTT_FLOOR_MS" -v minpath="$MIN_SEGS_FOR_PATH" \
       -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor) {
@@ -312,6 +378,10 @@ diagnose_peer() {
     trust_r = (sg >= minseg)
     if (b >= 3 && (!trust_r || r < 1)) {
       print "接入网排队膨胀——瓶颈队列不在服务器上；先做更长观测，再在可控机器上 A/B 测试 pacing 或 BBRv3";
+      exit
+    }
+    if (trust_r && r >= 0.1 && rc >= minrc && spur >= spshare) {
+      printf "虚假重传——%d%% 的重传被对端 DSACK 确认是重复包，这 %.2f%% 不是丢包，是乱序或过早重传；不要按这个数字降速\n", spur, r;
       exit
     }
     if (trust_r && r >= 1 && b >= 2) {
@@ -393,6 +463,71 @@ bbr_variant_note() {
 }
 
 
+# Is there a congestion control in this kernel that is a real upgrade over
+# what is running? BBRv3 has never been in mainline, so on a stock kernel the
+# honest answer is no, and per-route congctl has nothing better to offer than
+# the global default. Saying so is the point: the alternative is proposing a
+# switch to cubic, which on random radio loss is a downgrade.
+better_cc() {
+  local avail=" ${1:-} " cur="${2:-}"
+  case "$avail" in
+    *" bbr3 "*) [[ "$cur" != bbr3 ]] && { printf 'bbr3\n'; return 0; } ;;
+  esac
+  case "$avail" in
+    *" bbr2 "*) [[ "$cur" != bbr2 && "$cur" != bbr3 ]] && { printf 'bbr2\n'; return 0; } ;;
+  esac
+  return 1
+}
+
+# Every metric must be shown to bind before it is proposed. A parameter that
+# provably changes nothing is not a cautious suggestion — it is noise that
+# costs the reader time and the tool its credibility. Prints the surviving
+# option string on line 1 and one "metric<TAB>why it was dropped" line after.
+gate_metrics() {
+  local opts="${1:-}" rwndpct="${2:--1}" keepers=() skipped=() name
+  local -a words
+  # The script runs under IFS=$'\n\t', so a default read -a would keep
+  # "initcwnd 32" as a single word and every metric would sail past the case
+  # below unexamined. Split on spaces here and nowhere else.
+  local IFS=' '
+  read -r -a words <<< "$opts"
+  local i=0
+  while (( i < ${#words[@]} )); do
+    name="${words[i]}"
+    case "$name" in
+      initcwnd|initrwnd|rto_min|advmss|congctl|reordering)
+        if metric_binds "$name" "$rwndpct"; then
+          keepers+=("$name" "${words[i+1]:-}")
+        else
+          skipped+=("$name	$(metric_skip_reason "$name" "$rwndpct")")
+        fi
+        i=$((i + 2))
+        ;;
+      *) keepers+=("$name"); i=$((i + 1)) ;;
+    esac
+  done
+  printf '%s\n' "${keepers[*]:-}"
+  local line; for line in "${skipped[@]:-}"; do [[ -n "$line" ]] && printf '%s\n' "$line"; done
+  return 0
+}
+
+metric_binds() {
+  case "${1:-}" in
+    # A bigger first window cannot help a transfer that is already stalling on
+    # the receiver's advertised window: the peer, not our opening burst, is the
+    # ceiling.
+    initcwnd) awk -v w="${2:--1}" -v lim="$RWND_LIMITED_SHARE" 'BEGIN {exit !(w < lim)}' ;;
+    *) return 0 ;;
+  esac
+}
+
+metric_skip_reason() {
+  case "${1:-}" in
+    initcwnd) printf '该前缀 %s%% 的发送时间卡在对端接收窗口上，首窗不是瓶颈，加大它不会生效\n' "${2:-?}" ;;
+    *) printf '证据不足以证明这个参数会生效\n' ;;
+  esac
+}
+
 # ── 画像分类 ───────────────────────────────────────────────────────────────
 
 # The classes exist because each one implies a different per-route policy.
@@ -400,9 +535,12 @@ bbr_variant_note() {
 # never be filed under a class that would earn it a routing change.
 classify_peer() {
   local p50="${1:-0}" jit="${2:-0}" bloat="${3:-1}" tail="${4:-1}" \
-        retrans="${5:-0}" spread="${6:-1}" segs="${7:-0}" spikefrac="${8:-0}"
+        retrans="${5:-0}" spread="${6:-1}" segs="${7:-0}" spikefrac="${8:-0}" \
+        spurious="${9:--1}" retrcount="${10:-0}"
   awk -v t="$p50" -v j="$jit" -v b="$bloat" -v tb="$tail" -v r="$retrans" \
       -v sp="$spread" -v sg="$segs" -v spf="$spikefrac" -v floor="$LOCAL_RTT_FLOOR_MS" \
+      -v spur="$spurious" -v rc="$retrcount" -v spshare="$SPURIOUS_SHARE" \
+      -v minrc="$MIN_RETRANS_FOR_SPURIOUS" \
       -v minpath="$MIN_SEGS_FOR_PATH" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor)   { print "local";  exit }
     if (sg < minpath) { print "idle";  exit }
@@ -412,6 +550,11 @@ classify_peer() {
     # the queue or the drops, so it gets its own class rather than being
     # filed under one cause and handed the policy text for that cause.
     if (b >= 3 && (!trust_r || r < 1)) { print "bloated"; exit }
+    # Before any class that treats the retransmission rate as loss, ask whether
+    # those retransmissions were real. If the receiver told us most of them were
+    # duplicates, the headline percentage is measuring our own impatience, and
+    # every loss class below would be reasoning from a number that is not loss.
+    if (trust_r && r >= 0.1 && rc >= minrc && spur >= spshare) { print "spurious"; exit }
     if (trust_r && r >= 1 && b >= 2)   { print "mixed";   exit }
     # Loss with a spread latency tail is evidence of radio scheduling. Flat
     # latency is deliberately not called a rate limiter: this DMIT mobile
@@ -442,6 +585,7 @@ class_label() {
     local)   printf '同机房\n' ;;
     idle)    printf '数据不足\n' ;;
     bloated) printf '接入网排队\n' ;;
+    spurious) printf '虚假重传\n' ;;
     mixed)   printf '排队且丢包\n' ;;
     mobile)  printf '移动网络\n' ;;
     flatloss) printf '稳定延迟丢包\n' ;;
@@ -481,6 +625,10 @@ class_policy() {
     bloated)
       printf '%s\n' '' \
         '对端接入网在囤队列。服务器无法直接管理对方队列；若要试降 pacing 或 BBRv3，请在可回滚测试机上做 A/B，阶段一不自动下发'
+      ;;
+    spurious)
+      printf '%s\n' '' \
+        '重传的大部分被对端 DSACK 确认是重复包——这条链路没在丢包，是乱序或重传触发得太早。不改路由参数：现代内核默认用 RACK-TLP 按时间判丢包，per-route 的 reordering 基本不再参与这条路径，写上去多半是个 no-op。这一条的价值是诊断——它说明该前缀的重传率高估了真实丢包，别拿那个数字去降速'
       ;;
     mixed)
       printf '%s\n' '' \
@@ -528,6 +676,13 @@ FNR == NR && FILENAME == db {
   # It decays toward the truth as new rounds land.
   if (NF >= 18 && $16 != "") { p95s[$1] = $16; tls[$1] = $17; spk[$1] = $18 }
   else { p95s[$1] = $5 * $3; tls[$1] = $9 * $3; spk[$1] = ($9 >= spiketail ? $3 : 0) }
+  # Pre-0.2.0 rows carry none of the new evidence. Zero is the right seed here
+  # (unlike the spike count): these are counters, and "we never observed any"
+  # is exactly what the derived ratios should report as unknown.
+  if (NF >= 26) {
+    dsk[$1] = $19; rdr[$1] = $20; rwl[$1] = $21; sbl[$1] = $22
+    bsy[$1] = $23; dsi[$1] = $24; msm[$1] = $25; pmt[$1] = $26
+  }
   next
 }
 {
@@ -551,6 +706,10 @@ FNR == NR && FILENAME == db {
     if ($14 >= spiketail) spk[k]++
     retrs[k] += $15
     sgs[k] += $12
+    dsk[k] += $23; rdr[k] += $17; rwl[k] += $24; sbl[k] += $25
+    bsy[k] += $26; dsi[k] += $27
+    if (($21 + 0) > 0 && (!(k in msm) || msm[k] == 0 || $21 < msm[k])) msm[k] = $21
+    if (($22 + 0) > 0 && (!(k in pmt) || pmt[k] == 0 || $22 < pmt[k])) pmt[k] = $22
     if ($10 > mbm[k]) mbm[k] = $10
     if ($2 > cmx[k]) cmx[k] = $2
   }
@@ -559,11 +718,13 @@ FNR == NR && FILENAME == db {
 END {
   print "prefix", "obs", "trusted", "p50sum", "p95max", "minrtt", "jitsum", \
         "bloatsum", "tailmax", "retrtotal", "segtotal", "mbpsmax", "connmax", "first", "last", \
-        "p95sum", "tailsum", "spikes"
+        "p95sum", "tailsum", "spikes", \
+        "dsacktotal", "reordtotal", "rwndms", "sndbufms", "busyms", "uploadsegs", "mssmin", "pmtumin"
   for (k in n)
     print k, n[k], trusted[k], p50s[k], p95m[k], mins[k], jits[k], bls[k], tlm[k], \
           retrs[k], sgs[k], mbm[k], cmx[k], first[k], (k in seen ? seen[k] : last[k]), \
-          p95s[k] + 0, tls[k] + 0, spk[k] + 0
+          p95s[k] + 0, tls[k] + 0, spk[k] + 0, \
+          dsk[k] + 0, rdr[k] + 0, rwl[k] + 0, sbl[k] + 0, bsy[k] + 0, dsi[k] + 0, msm[k] + 0, pmt[k] + 0
 }
 '
 
@@ -619,25 +780,31 @@ cmd_scan() {
   collect_round "$samples" "$interval" "$group" "$agg" || {
     warn "采样窗口内没有活跃 TCP 连接（有流量时再测）"; return 0; }
 
-  printf '\n  %b前缀                      连接 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%    段数  画像%b\n' "$BOLD" "$RESET"
+  printf '\n  %b前缀                      连接 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%   虚假%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
   local prefix conns cc p50 p95 minrtt jit bloat rpct segs dir tail
-  local spread class hidden=0 shown=0
-  while IFS=$'\t' read -r prefix conns cc p50 p95 minrtt jit bloat rpct _ _ segs dir tail _; do
+  local retrc spur rwpct spread class hidden=0 shown=0
+  while IFS=$'\t' read -r prefix conns cc p50 p95 minrtt jit bloat rpct _ _ segs dir tail \
+      retrc spur _ _ rwpct _ _ _ _ _ _ _ _; do
     if [[ "$dir" == out ]] && (( show_all == 0 )); then hidden=$((hidden + 1)); continue; fi
     shown=$((shown + 1))
     spread="$(row_spread "$p95" "$p50")"
-    class="$(classify_peer "$p50" "$jit" "$bloat" "$tail" "$rpct" "$spread" "$segs")"
+    class="$(classify_peer "$p50" "$jit" "$bloat" "$tail" "$rpct" "$spread" "$segs" 0 "$spur" "$retrc")"
     local color="$GREEN"
-    case "$class" in mobile|flatloss|lossy|bloated|mixed|spiky|variable) color="$YELLOW" ;; esac
-    local bt="$bloat" tt="$tail" rt="$rpct"
+    case "$class" in mobile|flatloss|lossy|bloated|mixed|spurious|spiky|variable) color="$YELLOW" ;; esac
+    local bt="$bloat" tt="$tail" rt="$rpct" sr="$spur"
     awk -v b="$bloat" 'BEGIN {exit !(b < 0)}' && { bt="—"; tt="—"; }
     (( segs < MIN_SEGS_FOR_RETRANS )) && rt="—"
-    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %7s  %s\n' \
+    awk -v v="${spur:--1}" -v m="${retrc:-0}" -v n="$MIN_RETRANS_FOR_SPURIOUS" \
+      'BEGIN {exit !(v < 0 || m < n)}' && sr="—"
+    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %6s %7s  %s\n' \
       "$color" "$prefix" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" \
-      "$bt" "$tt" "$rt" "$segs" "$(class_label "$class")"
+      "$bt" "$tt" "$rt" "$sr" "$segs" "$(class_label "$class")"
     printf '    %b→ %s%b\n' "$DIM" \
-      "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs" "$tail" "$spread")" "$RESET"
+      "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs" "$tail" "$spread" "$spur" "$retrc")" "$RESET"
+    awk -v w="${rwpct:--1}" -v lim="$RWND_LIMITED_SHARE" 'BEGIN {exit !(w >= lim)}' && \
+      printf '    %b  发送时间里有 %s%% 卡在对端接收窗口——瓶颈是对端的窗口，不是路径，也不是首窗%b\n' \
+        "$DIM" "$rwpct" "$RESET"
   done < "$agg"
   rule_light
   (( hidden > 0 )) && printf '  %b已隐藏 %s 个本机出站对端；--all 可以看%b\n' "$DIM" "$hidden" "$RESET"
@@ -714,8 +881,21 @@ NR == 1 || $1 == "prefix" || $1 == "" { next }
   # the display say so instead of claiming a clean record we never observed.
   spk  = (NF >= 18 && $18 != "") ? $18 + 0 : -1
   sp   = (p50 > 0) ? p95t / p50 : 1
-  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\t%.3f\t%d\n", \
-    $1, obs, p50, p95mx, mn, jit, bl, tlt, rt, sg, mb, cn, sp, (spk >= 0 ? spk / obs : 0), spk
+  rc   = $10 + 0
+  # -1 throughout means "no denominator", which downstream must not confuse
+  # with a measured zero.
+  spur = (NF >= 26 && rc > 0) ? $19 * 100 / rc : -1
+  rdr  = (NF >= 26) ? $20 + 0 : 0
+  bsy  = (NF >= 26) ? $23 + 0 : 0
+  rwp  = (bsy > 0) ? $21 * 100 / bsy : -1
+  sbp  = (bsy > 0) ? $22 * 100 / bsy : -1
+  upt  = (NF >= 26) ? $24 + 0 : 0
+  upl  = (sg + upt > 0) ? upt * 100 / (sg + upt) : 0
+  mssv = (NF >= 26) ? $25 + 0 : 0
+  pmtv = (NF >= 26) ? $26 + 0 : 0
+  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\t%.3f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\n", \
+    $1, obs, p50, p95mx, mn, jit, bl, tlt, rt, sg, mb, cn, sp, (spk >= 0 ? spk / obs : 0), spk, \
+    spur, rdr, rwp, sbp, upl, mssv, pmtv, rc
 }
 '
 
@@ -729,17 +909,23 @@ cmd_profiles() {
   rows="$(profile_rows)" || die "还没有画像，先跑：$PROGRAM watch --minutes 30"
   [[ -n "$rows" ]] || die "画像库是空的，先跑：$PROGRAM watch --minutes 30"
   panel_title 'routetune 画像'
-  printf '  %b前缀                      轮次 RTT50 峰95  最低  抖动  膨胀  尾涨   尖峰 重传%%    段数  画像%b\n' "$BOLD" "$RESET"
+  printf '  %b前缀                      轮次 RTT50 峰95  最低  抖动  膨胀  尾涨   尖峰 重传%%  虚假%%    段数  画像%b\n' "$BOLD" "$RESET"
   rule_light
-  local prefix obs p50 p95 mn jit bl tl rt sg sp spf spk class
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk; do
-    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf")"
+  local prefix obs p50 p95 mn jit bl tl rt sg sp spf spk spur rwp rc class
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk \
+      spur _ rwp _ _ _ _ rc; do
+    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf" "$spur" "$rc")"
     local color="$GREEN"
-    case "$class" in mobile|flatloss|lossy|bloated|mixed|spiky|variable) color="$YELLOW" ;; esac
+    case "$class" in mobile|flatloss|lossy|bloated|mixed|spurious|spiky|variable) color="$YELLOW" ;; esac
     local spike="$spk/$obs"; (( spk < 0 )) && spike='—'
-    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %5s %7s  %s\n' \
+    local sr="$spur"
+    awk -v v="${spur:--1}" -v m="${rc:-0}" -v n="$MIN_RETRANS_FOR_SPURIOUS" \
+      'BEGIN {exit !(v < 0 || m < n)}' && sr="—"
+    printf '  %b%-24s%b %4s %5s %5s %5s %5s %5s %5s %6s %5s %6s %7s  %s\n' \
       "$color" "$prefix" "$RESET" "$obs" "$p50" "$p95" "$mn" "$jit" "$bl" "$tl" \
-      "$spike" "$rt" "$sg" "$(class_label "$class")"
+      "$spike" "$rt" "$sr" "$sg" "$(class_label "$class")"
+    awk -v w="${rwp:--1}" -v lim="$RWND_LIMITED_SHARE" 'BEGIN {exit !(w >= lim)}' && \
+      printf '    %b发送时间 %s%% 卡在对端接收窗口——加大首窗对它无效%b\n' "$DIM" "$rwp" "$RESET"
   done <<< "$rows"
   rule_light
   printf '  %b轮次 = 这个前缀被观测到多少轮；轮次越多画像越可信%b\n' "$DIM" "$RESET"
@@ -747,6 +933,7 @@ cmd_profiles() {
   printf '  %b尾涨/抖动/膨胀 = 各轮的平均值；尖峰 = 有多少轮 RTT95 涨到底噪的 %s 倍以上%b\n' "$DIM" "$SPIKE_TAIL" "$RESET"
   printf '  %b膨胀用的是每轮自己的底噪，不是「最低」这一列（那是全程最低），所以它不等于 RTT50÷最低%b\n' "$DIM" "$RESET"
   printf '  %b分类看的是尖峰出现的频率，不是最差那一轮——偶发一次不该把一条链路永久打上标签%b\n' "$DIM" "$RESET"
+  printf '  %b虚假%% = 重传里被对端 DSACK 确认是重复包的比例；高说明重传率高估了真实丢包%b\n' "$DIM" "$RESET"
   printf '  %b出策略：%s recommend%b\n' "$DIM" "$PROGRAM" "$RESET"
 }
 
@@ -809,18 +996,66 @@ cmd_recommend() {
   printf '  %b重启后失效（阶段一不做持久化），先手动跑一条看效果再说。%b\n\n' "$DIM" "$RESET"
 
   local prefix obs p50 p95 mn jit bl tl rt sg sp spf spk class opts reason commands rc
-  local emitted=0 few_obs=0 not_actionable=0 route_skipped=0
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk; do
+  local spur rdr rwp sbp upl mss pmtu retrc gated skips bettercc avail curcc
+  local emitted=0 few_obs=0 not_actionable=0 route_skipped=0 noop_skipped=0
+  avail="$(available_cc)"
+  curcc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '')"
+  bettercc="$(better_cc "$avail" "$curcc" || true)"
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp spf spk \
+      spur rdr rwp sbp upl mss pmtu retrc; do
     if (( obs < min_obs )); then few_obs=$((few_obs + 1)); continue; fi
-    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf")"
+    class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg" "$spf" "$spur" "$retrc")"
     case "$class" in local|idle) not_actionable=$((not_actionable + 1)); continue ;; esac
     opts="$(class_policy "$class" | sed -n '1p')"
     reason="$(class_policy "$class" | sed -n '2p')"
+    # A kernel that actually carries a better congestion control turns
+    # per-route congctl from a downgrade into a scoped experiment: roll the new
+    # algorithm out to one prefix, leave every other client on the old one.
+    case "$class" in
+      mobile|bloated|variable|spiky)
+        [[ -n "$bettercc" ]] && opts="${opts:+$opts }congctl $bettercc" ;;
+    esac
     printf '  %b%s%b  %b%s%b  %s轮观测\n' "$BOLD" "$prefix" "$RESET" \
       "$CYAN" "$(class_label "$class")" "$RESET" "$obs"
     printf '    %bRTT %s ms 中位／最差一轮 %s（底噪 %s）｜抖动 %s｜膨胀 %s｜尖峰 %s/%s 轮｜重传 %s%%（%s 段）%b\n' \
       "$DIM" "$p50" "$p95" "$mn" "$jit" "$bl" "$( (( spk < 0 )) && printf '未知' || printf '%s' "$spk" )" \
       "$obs" "$rt" "$sg" "$RESET"
+    awk -v v="${spur:--1}" -v m="${retrc:-0}" -v n="$MIN_RETRANS_FOR_SPURIOUS" \
+      'BEGIN {exit !(v >= 0 && m >= n)}' && \
+      printf '    %b其中 %s%% 的重传被对端 DSACK 确认是重复包（%s 次重传，乱序事件 %s）%b\n' \
+        "$DIM" "$spur" "$retrc" "${rdr:-0}" "$RESET"
+    awk -v w="${rwp:--1}" -v lim="$RWND_LIMITED_SHARE" 'BEGIN {exit !(w >= lim)}' && \
+      printf '    %b发送时间 %s%% 卡在对端接收窗口，%s%% 卡在本机发送缓冲%b\n' \
+        "$DIM" "$rwp" "${sbp:-0}" "$RESET"
+    # A negotiated MSS far under what the path MTU allows means something on
+    # the way is clamping it — usually a tunnel. Worth knowing before blaming
+    # the transport for the throughput.
+    awk -v m="${mss:-0}" -v u="${pmtu:-0}" 'BEGIN {exit !(m > 0 && u > 0 && m < u - 80)}' && \
+      printf '    %bMSS %s 明显低于 PMTU %s 所允许的大小——路径上有人在钳制 MSS（多半是隧道）%b\n' \
+        "$DIM" "$mss" "$pmtu" "$RESET"
+    # Every policy here assumes the client is downloading. If it is mostly
+    # uploading, that assumption is wrong and the reader should know.
+    awk -v u="${upl:-0}" 'BEGIN {exit !(u >= 40)}' && \
+      printf '    %b该前缀 %s%% 的段是上行——本工具的策略都是按下载场景推的，对它未必适用%b\n' \
+        "$DIM" "$upl" "$RESET"
+    # Drop any metric that cannot be shown to bind, and say why.
+    gated="$(gate_metrics "$opts" "${rwp:--1}")"
+    skips="$(printf '%s\n' "$gated" | sed -n '2,$p')"
+    local had_opts="$opts"
+    opts="$(printf '%s\n' "$gated" | sed -n '1p')"
+    # If the gate emptied the list, the class reason below would still be
+    # arguing for a parameter we just refused to emit. Say what actually
+    # happened instead of printing both halves of a contradiction.
+    if [[ -n "$had_opts" && -z "$opts" ]]; then
+      reason="这个画像本身适用 ${had_opts%% *}，但该前缀的实测证据表明它不会生效，所以不出命令"
+    fi
+    if [[ -n "$skips" ]]; then
+      while IFS=$'\t' read -r _ why; do
+        [[ -n "$why" ]] || continue
+        noop_skipped=$((noop_skipped + 1))
+        printf '    %b（跳过：%s）%b\n' "$YELLOW" "$why" "$RESET"
+      done <<< "$skips"
+    fi
     if [[ -n "$opts" ]]; then
       if commands="$(route_commands "$prefix" "$opts")"; then
         printf '    %b%s%b\n' "$GREEN" "$(sed -n '1p' <<< "$commands")" "$RESET"
@@ -844,7 +1079,13 @@ cmd_recommend() {
   (( few_obs > 0 )) && printf '；%s 个前缀观测不足 %s 轮，先攒够再说' "$few_obs" "$min_obs"
   (( not_actionable > 0 )) && printf '；%s 个是同机房或样本太少的对端，本来就不该动' "$not_actionable"
   (( route_skipped > 0 )) && printf '；%s 个前缀因路由安全检查跳过' "$route_skipped"
+  (( noop_skipped > 0 )) && printf '；%s 个参数因证明不了会生效而被丢弃' "$noop_skipped"
   printf '\n'
+  if [[ -z "$bettercc" ]]; then
+    printf '  %b内核只提供 %s，没有比当前 %s 更适合移动链路的算法，所以不会给任何前缀建议 congctl。%b\n' \
+      "$DIM" "${avail:-未知}" "${curcc:-未知}" "$RESET"
+    printf '  %b换成带 BBRv3 的内核之后，这里会开始建议只给移动网段灰度，而不必整机切换。%b\n' "$DIM" "$RESET"
+  fi
 }
 
 # ── 体检 ───────────────────────────────────────────────────────────────────
@@ -955,6 +1196,7 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
 画像分类与对应策略：
 
   远端固网   RTT ≥120ms、无排队、已证实低重传 → A/B 测试 initcwnd 32
+  虚假重传   多数重传被对端 DSACK 确认是重复包 → 没在丢包；别按重传率降速
   近端固网   RTT <120ms 且稳定      → 默认即可，加大起步只会制造突发
   轻微排队   膨胀 1.5-3、无明显丢包  → 已有存量队列，不加大首窗
   丢包未证实 延迟形状够看、段数不够   → 没证实低重传就不算干净固网
@@ -968,6 +1210,11 @@ sysctl 是全机器一套的：一个拥塞控制、一个缓冲上限、一个�
 
 只有「远端固网」会输出命令。任何一项证据不成立——有存量队列、有丢包、或段数不够
 证实低重传——都会落到别的类，拿不到 initcwnd 32。
+
+而且每个参数还要单独过一道「它会不会真的生效」的闸门：证明不了就丢掉，并说明原因。
+例如某前缀的发送时间大量卡在对端接收窗口上时，首窗就不是瓶颈，initcwnd 不会下发。
+congctl 同理——只有内核里真的存在比当前更合适的算法（bbr2/bbr3）时才会提议，
+在只有 reno/cubic/bbr 的内核上不会建议你降级到 cubic。
 
 阶段一只出建议不落地。画像准不准要先用真实流量验证过，再谈自动下发。
 

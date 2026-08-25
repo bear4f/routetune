@@ -417,4 +417,28 @@ out="$(explain_cover_rtt 500 2>&1)"
 pass 'a box with memory to spare reports no clamp'
 unset -f has sysctl suggest_cover_rtt total_ram_bytes
 
+
+# ── 0.3.5 被拒的 CAKE 选项要指名道姓 ───────────────────────────────────────
+# The live node refused the full spec while accepting plain fq, so the useful
+# question is which option was refused: a kernel can carry sch_cake while the
+# local tc does not know a keyword, and the reverse happens too.
+has() { [[ "$1" == tc ]]; }
+tc() { local IFS=' '; case "$*" in *dual-dsthost*) return 1 ;; *) return 0 ;; esac; }
+assert_eq 'cake bandwidth 490000kbit dual-dsthost' \
+  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms')" \
+  'the probe names the option that starts failing'
+# A value-taking option is only testable once its value is in, or the probe
+# would blame "bandwidth" for an incomplete pair.
+tc() { local IFS=' '; case "$*" in *"rtt 250ms"*) return 1 ;; *) return 0 ;; esac; }
+assert_eq 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms' \
+  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms')" \
+  'an option that takes a value is tested with its value attached'
+# Nothing to report when every option is accepted.
+tc() { return 0; }
+if probe_cake_options 'cake bandwidth 100kbit ecn' >/dev/null 2>&1; then
+  fail 'a fully accepted spec must report no offending option'
+fi
+pass 'a fully accepted spec reports nothing'
+unset -f tc has
+
 printf '%s\n' 'All tcpwide self-tests passed.'

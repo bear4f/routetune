@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.4"
+VERSION="0.3.5"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -137,6 +137,31 @@ have_cake() {
   tc qdisc add dev lo root cake 2>/dev/null || return 1
   tc qdisc del dev lo root 2>/dev/null || true
   return 0
+}
+
+# When the full spec is refused, the useful question is WHICH option was
+# refused: a kernel can carry sch_cake while the local tc does not know a
+# keyword, and the reverse happens too. Build the spec up one option at a time
+# and name the point where it starts failing. Loopback is used because it is the
+# one interface where a momentary qdisc cannot disturb real traffic.
+probe_cake_options() {
+  local spec="${1:-}" acc=() w
+  has tc || return 1
+  split_words "$spec"
+  for w in "${SPLIT_WORDS[@]}"; do
+    acc+=("$w")
+    # Options that take a value are only testable once the value is in.
+    case "$w" in bandwidth|rtt) continue ;; esac
+    if ! tc qdisc replace dev lo root "${acc[@]}" >/dev/null 2>&1; then
+      tc qdisc del dev lo root >/dev/null 2>&1 || true
+      # ${acc[*]} joins on the first character of IFS, which is a newline here.
+      local IFS=' '
+      printf '%s\n' "${acc[*]}"
+      return 0
+    fi
+  done
+  tc qdisc del dev lo root >/dev/null 2>&1 || true
+  return 1
 }
 
 # Mbps x ms in bytes: rate * 1e6 / 8 * rtt / 1000 reduces exactly to
@@ -625,13 +650,23 @@ apply_link() {
     chmod 0600 "$QDISC_SNAP" 2>/dev/null || true
   fi
   split_words "$want_q"
-  if tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>/dev/null; then
+  local tc_err bad
+  if tc_err="$(tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>&1)"; then
     log "根队列已设为：$want_q"
   else
     warn "无法设置根队列：tc qdisc replace dev $IFACE root $want_q"
-    printf '  %b手动跑一次上面这条看内核报什么。没有 pacing 的话，突发会按线速打出去%b\n' \
-      "$DIM" "$RESET"
-    printf '  %b——这是重传的主要来源，也是整套配置里最重要的一项。%b\n' "$DIM" "$RESET"
+    [[ -z "$tc_err" ]] || printf '  %btc 报错：%s%b\n' "$DIM" "$tc_err" "$RESET"
+    if bad="$(probe_cake_options "$want_q")"; then
+      printf '  %b逐项试出来，加到这里就被拒绝：%b%s%b\n' "$DIM" "$RESET" "$bad" "$RESET"
+      printf '  %b最后那一项要么本机 tc 不认识，要么内核的 sch_cake 不支持。%b\n' "$DIM" "$RESET"
+    fi
+    # Pacing is the single most important item in the whole set, so falling back
+    # to fq is far better than leaving the interface on whatever it had.
+    if tc qdisc replace dev "$IFACE" root fq >/dev/null 2>&1; then
+      warn "已退回 fq：pacing 保住了，但没有按设备公平和 AQM"
+    else
+      printf '  %b没有 pacing 的话，突发会按线速打出去——这是重传的主要来源。%b\n' "$DIM" "$RESET"
+    fi
     return 0
   fi
   cur_r="$(current_default_route)"

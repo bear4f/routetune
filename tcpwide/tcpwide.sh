@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.3"
+VERSION="0.3.4"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -815,12 +815,27 @@ explain_cover_rtt() {
     printf '
   %b填大一点不是没有代价——它决定几条连接能同时吃满上限：%b
 ' "$DIM" "$RESET"
-    local r
+    local r ram clamp knee
+    ram="$(total_ram_bytes)"
+    clamp=$(( ram / 32 ))
     for r in 100 250 400; do
       buf="$(buffer_ceiling "$rate" "$r")"
-      printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%b
-'         "$DIM" "$r" "$(mb "$buf")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" "$RESET"
+      printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%s%b
+'         "$DIM" "$r" "$(mb "$buf")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" \
+        "$( (( ram > 0 && buf >= clamp )) && printf '  <- 已被内存夹住' )" "$RESET"
     done
+    # Two identical rows in that table read as "it makes no difference", when
+    # what they actually mean is that the RAM clamp is already binding. Say so
+    # rather than leaving the operator to notice the numbers repeat.
+    if (( ram > 0 && rate > 0 )); then
+      knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
+      if (( knee >= 10 && knee <= 2000 )); then
+        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB（全局预算的 1/8，保证至少%b\n' \
+          "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
+        printf '  %b8 条大流能同时到顶）。所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' \
+          "$DIM" "$knee" "$RESET"
+      fi
+    fi
   fi
   printf '
 '

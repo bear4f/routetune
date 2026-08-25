@@ -393,4 +393,28 @@ assert_eq '13' "$(cat "$argc_file")" 'tc receives the qdisc spec as separate arg
 rm -f "$argc_file"
 unset -f tc ip has
 
+
+# ── 0.3.4 内存夹子生效点要说出来 ───────────────────────────────────────────
+# On a 958 MB box at 500 Mbps the RAM/32 clamp binds at 234ms, so the cost table
+# printed identical ceilings for 250 and 400 and read as "it makes no
+# difference" — when it actually means the clamp is already binding.
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+assert_eq "$(buffer_ceiling 500 250)" "$(buffer_ceiling 500 400)" \
+  'past the clamp a wider coverage RTT buys nothing'
+has() { [[ "$1" == sysctl ]]; }
+sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '15328\t30656\t61312\n'; }
+suggest_cover_rtt() { printf '250\t169\t14\n'; }
+out="$(explain_cover_rtt 500 2>&1)"
+[[ "$out" == *"已被内存夹住"* ]] || fail 'a clamped row must be marked as clamped'
+pass 'a clamped row in the cost table is marked'
+[[ "$out" == *"超过 234 ms 不会再增加缓冲"* ]] \
+  || fail 'the point where the clamp starts binding must be named'
+pass 'the coverage RTT past which nothing changes is stated outright'
+# A box with room to spare must not claim a clamp it is nowhere near.
+total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }
+out="$(explain_cover_rtt 500 2>&1)"
+[[ "$out" != *"已被内存夹住"* ]] || fail 'an unclamped box must not be told it is clamped'
+pass 'a box with memory to spare reports no clamp'
+unset -f has sysctl suggest_cover_rtt total_ram_bytes
+
 printf '%s\n' 'All tcpwide self-tests passed.'

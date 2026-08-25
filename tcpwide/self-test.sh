@@ -529,4 +529,32 @@ if peer_window_ceiling >/dev/null 2>&1; then fail 'no flows means no ceiling to 
 pass 'with no active flows there is no ceiling to report'
 unset -f ss has
 
+
+# ── 0.6.0 缓冲上限可手动覆盖 ───────────────────────────────────────────────
+# The RAM ladder is derived from memory alone and ignores RTT. 16 MB with
+# tcp_adv_win_scale=1 advertises an 8 MB receive window, capping an incoming
+# transfer at 419 Mbps on a 160ms path — and the live node measured a 421 Mbps
+# peak there. Overriding it is how that gets tested one variable at a time.
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+BUF_MB=0
+assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 500 250)" 'auto still follows the ladder'
+BUF_MB=32
+# The override must skip the ladder, or testing the ladder would be impossible.
+assert_eq "$((32 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+  'an explicit ceiling is not clamped back by the rule it exists to test'
+assert_eq "$((32 * 1024 * 1024))" "$(buffer_ceiling 10 10)" \
+  'an explicit ceiling ignores the derivation entirely'
+BUF_MB=0
+
+# ── 0.6.0 档位必须自成一体 ─────────────────────────────────────────────────
+# Picking 速度优先 then 不整形 left SHAPE_PCT at 98, so "不整形" meant different
+# things depending on what had been chosen before it.
+apply_profile speed
+apply_profile noshape
+assert_eq '98|0' "$SHAPE_PCT|$SHAPE" 'the no-shape profile sets its own percentage'
+apply_profile stable
+apply_profile noshape
+assert_eq '98|0' "$SHAPE_PCT|$SHAPE" 'and does so regardless of what preceded it'
+apply_profile balanced
+
 printf '%s\n' 'All tcpwide self-tests passed.'

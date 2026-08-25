@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -104,6 +104,20 @@ ASSUME_YES=0
 # mechanism predicts and matches the usual server guidance of 128KB, so it is
 # the default rather than a claim. Set it to 0 to keep the system value.
 NOTSENT_LOWAT=131072
+# 0 means "derive it". An explicit value in MB overrides the whole derivation.
+#
+# netshape's RAM ladder exists because oversized buffers let BBR hold a huge
+# cwnd on a policed link. But netshape pairs that ladder with fq maxrate, and
+# once per-flow pacing is in place the overshoot is bounded by the pacing rate
+# rather than by the window — so the ladder may now be costing receive window
+# it no longer needs to protect.
+#
+# It matters because the ladder is derived from RAM alone and ignores RTT.
+# 16 MB with tcp_adv_win_scale=1 advertises an 8 MB receive window, which caps
+# an incoming transfer at 419 Mbps on a 160ms path and 298 on a 225ms one. The
+# live node measured 421 and 234. This knob is here to settle whether that is
+# the binding constraint, one variable at a time.
+BUF_MB=0
 
 total_ram_bytes() {
   local kb
@@ -246,6 +260,11 @@ netshape_memory_cap() {
 
 buffer_ceiling() {
   local rate="${1:-0}" rtt="${2:-0}" ram buf cap ladder
+  # An explicit figure skips both the derivation and the ladder: the point of
+  # the override is to test the ladder, so the ladder must not clamp it back.
+  if is_uint "$BUF_MB" && (( BUF_MB > 0 )); then
+    printf '%s\n' $(( BUF_MB * 1024 * 1024 )); return 0
+  fi
   buf=$(( $(bdp_bytes "$rate" "$rtt") * 2 + BUF_SLACK ))
   (( buf > BUF_CAP )) && buf="$BUF_CAP"
   ram="$(total_ram_bytes)"
@@ -396,7 +415,10 @@ apply_profile() {
     stable)   SHAPE_PCT=90; INITCWND=16; SHAPE=1; PROFILE=stable ;;
     balanced) SHAPE_PCT=95; INITCWND=20; SHAPE=1; PROFILE=balanced ;;
     speed)    SHAPE_PCT=98; INITCWND=32; SHAPE=1; PROFILE=speed ;;
-    noshape)  SHAPE=0; PROFILE=noshape ;;
+    # Sets the percentage too, even though it does no aggregate shaping: it
+    # still drives the per-flow fq maxrate, and leaving whatever the previous
+    # profile set made "不整形" mean different things depending on history.
+    noshape)  SHAPE_PCT=98; SHAPE=0; PROFILE=noshape ;;
     *) return 1 ;;
   esac
   return 0
@@ -424,6 +446,7 @@ load_config() {
       SHAPE)        [[ "$value" =~ ^[01]$ ]] && SHAPE="$value" ;;
       PERSIST)      [[ "$value" =~ ^[01]$ ]] && PERSIST="$value" ;;
       NOTSENT_LOWAT) is_uint "$value" && (( value <= 16777216 )) && NOTSENT_LOWAT="$value" ;;
+      BUF_MB)       is_uint "$value" && (( value <= 512 )) && BUF_MB="$value" ;;
       PROFILE)      [[ "$value" =~ ^(stable|balanced|speed|noshape|custom)$ ]] && PROFILE="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
@@ -448,6 +471,7 @@ save_config() {
     printf 'SHAPE=%s\n'        "$SHAPE"
     printf 'PERSIST=%s\n'      "$PERSIST"
     printf 'NOTSENT_LOWAT=%s\n' "$NOTSENT_LOWAT"
+    printf 'BUF_MB=%s\n'        "$BUF_MB"
     printf 'PROFILE=%s\n'      "$PROFILE"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
@@ -1171,6 +1195,10 @@ render_panel() {
   printf '    %bn)%b 未发送数据上限 notsent_lowat%b（当前 %s，没有可靠依据，留给你 A/B）%b\n' \
     "$BOLD" "$RESET" "$DIM" \
     "$( (( NOTSENT_LOWAT > 0 )) && printf '%s' "$NOTSENT_LOWAT" || printf '不改' )" "$RESET"
+  printf '    %bb)%b 缓冲上限%b（当前 %s，接收窗口是它的一半，直接决定单流上限）%b\n' \
+    "$BOLD" "$RESET" "$DIM" \
+    "$( (( BUF_MB > 0 )) && printf '%s MB（手动）' "$BUF_MB" || printf '自动 %s MB' "$(mb "$(buffer_ceiling "${EGRESS_MBPS:-500}" "$COVER_RTT_MS")")" )" \
+    "$RESET"
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
@@ -1273,7 +1301,7 @@ menu() {
   while true; do
     load_config
     render_panel
-    if ! read -r -p '  请选择 [0-9 / a / n / p / r]: ' answer; then printf '\n'; return 0; fi
+    if ! read -r -p '  请选择 [0-9 / a / b / n / p / r]: ' answer; then printf '\n'; return 0; fi
     case "$answer" in
       1) run_action panel_set_profile stable ;;
       2) run_action panel_set_profile balanced ;;
@@ -1301,6 +1329,24 @@ menu() {
         printf '  %b只有一个 B 样本，证据不算强。填 0 = 保持系统现值。%b\n' "$DIM" "$RESET"
         if value="$(prompt_uint 'notsent_lowat 字节（0=不改，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
           NOTSENT_LOWAT="$value"; save_config; run_action cmd_apply
+        else info "已取消"; continue; fi
+        ;;
+      b|B)
+        printf '  %b接收窗口 = 缓冲上限 ÷ 2（tcp_adv_win_scale=1），单流上限 = 窗口 ÷ RTT。%b\n' \
+          "$DIM" "$RESET"
+        local bw
+        for bw in 16 32 64; do
+          printf '    %b%2s MB → 窗口 %2s MB → %3.0f Mbps @160ms，%3.0f Mbps @%sms%b\n' \
+            "$DIM" "$bw" "$((bw / 2))" \
+            "$(awk -v b="$bw" 'BEGIN {print b * 1048576 / 2 * 8 / 0.160 / 1e6}')" \
+            "$(awk -v b="$bw" -v r="$COVER_RTT_MS" 'BEGIN {print b * 1048576 / 2 * 8 / (r / 1000) / 1e6}')" \
+            "$COVER_RTT_MS" "$RESET"
+        done
+        printf '  %b填 0 = 自动推导（会被 netshape 的内存档位夹住）。往大调之前先确认 fq maxrate 生效，%b\n' \
+          "$DIM" "$RESET"
+        printf '  %b否则大缓冲会让 BBR 攒出巨大 cwnd，超发被丢、重传爆掉。%b\n' "$DIM" "$RESET"
+        if value="$(prompt_uint '缓冲上限 MB（0=自动，q 返回）' "$BUF_MB" 0 512)"; then
+          BUF_MB="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi
         ;;
       8) run_action panel_diagnose ;;

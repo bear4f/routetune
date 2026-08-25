@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.8.0"
+VERSION="0.8.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1403,8 +1403,8 @@ cmd_install() {
   # has to come from flags instead of being asked for.
   [[ -t 0 ]] || interactive=0
   if (( interactive == 0 )) && [[ -z "$EGRESS_MBPS" ]]; then
-    die "非交互安装需要 --egress <Mbps>。想要向导就用：
-       bash <(curl -fsSL $SOURCE_URL) install"
+    die "非交互安装需要 --egress <Mbps>。想要向导就先把脚本落到磁盘：
+       curl -fsSL $SOURCE_URL -o /tmp/tcpwide.sh && sudo bash /tmp/tcpwide.sh install"
   fi
   title 'tcpwide 安装向导'
   if other="$(conflicting_tool)"; then
@@ -1463,7 +1463,10 @@ cmd_install() {
     ln -sfn "$INSTALL_PATH" "$CLI_PATH"
     log "已安装。以后直接运行 sudo tcpwide 进面板"
   else
-    warn "无法复制脚本到 $INSTALL_PATH，软链未创建；仍可用 bash 直接运行本脚本"
+    warn "无法复制脚本到 $INSTALL_PATH，软链未创建"
+    printf '  %b先落到磁盘再装最稳（也避免 sudo 关掉进程替换的 fd）：%b\n' "$DIM" "$RESET"
+    printf '      %bcurl -fsSL %s -o /tmp/tcpwide.sh && sudo bash /tmp/tcpwide.sh install%b\n' \
+      "$BOLD" "$SOURCE_URL" "$RESET"
   fi
 }
 
@@ -1479,17 +1482,23 @@ usage() {
   cat <<'EOF'
 tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板）
 
-一键安装（向导问出口带宽、覆盖 RTT、档位，装好软链）：
-  sudo bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh) install
+一键安装（进向导）：
+  curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh -o /tmp/tcpwide.sh && sudo bash /tmp/tcpwide.sh install
 
-一键安装（不进向导，直接指定参数）：
+一键安装（不进向导，直接给参数）：
   curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh | sudo bash -s -- install --egress 500 --profile noshape
 
 之后直接进面板：
   sudo tcpwide
 
-注意 `curl … | bash` 时 stdin 就是脚本本身，向导的提问会把脚本内容当成你的回答读走，
-所以那条路径必须用 --egress 指定参数；要向导就用上面 bash <(curl …) 那条。
+两条不能互换，各有各的坑：
+
+  sudo bash <(curl …)  ——  不要用。sudo 默认关掉 2 号以上的文件描述符，而 <(…) 造出来的
+                           /dev/fd/63 属于外层 shell，sudo bash 启动时它已经没了，
+                           报 "No such file or directory"。已经是 root 时去掉 sudo 才行。
+
+  curl … | sudo bash   ——  stdin 就是脚本本身，向导提问会把脚本下一行当成你的回答读走。
+                           所以这条必须用 --egress 把参数给全（缺了会直接报错）。
 
 分散的客户端不需要「每个客户端一套参数」。它需要一套按最远客户端定尺寸的配置，
 再用能自己适应其余客户端的机制搭起来：

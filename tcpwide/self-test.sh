@@ -632,7 +632,11 @@ EGRESS_MBPS=""
 out="$( ( need_root() { :; }; cmd_install ) < /dev/null 2>&1 )" || true
 [[ "$out" == *"非交互安装需要 --egress"* ]] \
   || fail 'a non-interactive install without an egress figure must say so'
-[[ "$out" == *"bash <(curl"* ]] || fail 'and must name the command that does get the wizard'
+# The suggested wizard form must be one that survives sudo. `sudo bash <(curl …)`
+# does not: sudo closes descriptors above 2, so the /dev/fd entry the process
+# substitution created in the outer shell is gone before bash opens it.
+[[ "$out" == *"-o /tmp/tcpwide.sh"* ]] || fail 'and must name a wizard form that works under sudo'
+[[ "$out" != *"bash <(curl"* ]] || fail 'must not suggest a form sudo breaks'
 pass 'a non-interactive install demands its parameters and names the wizard form'
 EGRESS_MBPS=500
 

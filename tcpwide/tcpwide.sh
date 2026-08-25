@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -671,17 +671,132 @@ cmd_revert() {
 
 # ── SSH 面板 ───────────────────────────────────────────────────────────────
 
+# Both the wizard and the panel explain the coverage RTT through this, so the
+# advice cannot drift between them.
+explain_cover_rtt() {
+  local rate="${1:-500}" row sug max n buf tcpmem
+  printf '  %b覆盖 RTT 决定缓冲上限，填的是「这台机器上最远那个客户端」的延迟——%b
+' "$DIM" "$RESET"
+  printf '  %b不是你自己到这台机器的延迟，也不是平均值。%b
+' "$DIM" "$RESET"
+  printf '  %b上限只是上限：近端客户端的 autotuning 会自己停在低处，用不到那么多；%b
+' "$DIM" "$RESET"
+  printf '  %b但填低了，每个远端客户端都会撞到一个查不出原因的硬顶。%b
+' "$DIM" "$RESET"
+  if row="$(suggest_cover_rtt)"; then
+    IFS=$'	' read -r sug max n <<< "$row"
+    printf '
+  %b实测：当前 %s 个活跃客户端里，最远的 RTT 是 %s ms%b
+'       "$GREEN" "$n" "$max" "$RESET"
+    printf '  %b建议填 %s（实测 ×1.2 后向上取整，给移动客户端留波动余量）%b
+'       "$GREEN" "$sug" "$RESET"
+    printf '  %b注意这是一次瞬时采样。如果刚好抓到某个客户端的尖峰，这个数会偏高。%b
+'       "$DIM" "$RESET"
+  else
+    printf '
+  %b当前没有活跃的入站连接，量不到。用 routetune scan 在有流量时看一次，%b
+' "$DIM" "$RESET"
+    printf '  %b或者按经验：同区域 100，跨洋 250-300。%b
+' "$DIM" "$RESET"
+  fi
+  # Over-filling is not free on a small box, and this is the only place the
+  # operator can see that trade before choosing.
+  if tcpmem="$(tcp_mem_high_bytes)"; then
+    printf '
+  %b填大一点不是没有代价——它决定几条连接能同时吃满上限：%b
+' "$DIM" "$RESET"
+    local r
+    for r in 100 250 400; do
+      buf="$(buffer_ceiling "$rate" "$r")"
+      printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%b
+'         "$DIM" "$r" "$(mb "$buf")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" "$RESET"
+    done
+  fi
+  printf '
+'
+}
+
+# Pasting a multi-line block leaves the later lines sitting in the terminal
+# buffer, and the first prompt swallows one as if it were an answer. Throw away
+# anything already waiting before the wizard starts asking.
+drain_stdin() {
+  [[ -t 0 ]] || return 0
+  while read -r -t 0 2>/dev/null; do
+    # shellcheck disable=SC2034 # the buffered line is deliberately discarded
+    read -r -t 0.1 _junk 2>/dev/null || break
+  done
+  return 0
+}
+
 prompt_uint() {
   local prompt="$1" default="$2" min="$3" max="$4" value
   while true; do
     if ! read -r -p "  $prompt [$default]: " value; then printf '\n' >&2; return 1; fi
+    # Trim surrounding whitespace and any stray carriage return: a terminal that
+    # sends CRLF, or a pasted line with trailing spaces, would otherwise fail
+    # the numeric test for reasons the operator cannot see.
+    value="${value//$'\r'/}"
+    value="$(awk '{$1 = $1; print}' <<< "$value")"
     value="${value:-$default}"
     [[ "$value" == q || "$value" == Q ]] && return 1
     if is_uint "$value" && (( value >= min && value <= max )); then
       printf '%s\n' "$value"; return 0
     fi
-    warn "请输入 $min-$max 之间的整数（q 返回）"
+    warn "请输入 $min-$max 之间的整数（直接回车用默认值 $default，q 返回）"
   done
+}
+
+# ── 覆盖 RTT 的实测建议 ────────────────────────────────────────────────────
+
+# The coverage RTT is the one number an operator cannot guess from their own
+# latency, because it is a property of the FARTHEST client, not of the console
+# they are typing into. So measure it rather than asking them to estimate.
+#
+# Prints "max<TAB>count" over inbound connections that have actually sent data.
+# Idle sockets carry a stale rtt field that is not a path sample.
+observed_client_rtt() {
+  local ports
+  has ss || return 1
+  ports="$(ss -tlnH 2>/dev/null | awk '{
+    for (i = NF; i >= 1; i--) if ($i ~ /:[0-9]+$/) {
+      j = length($i); while (j > 0 && substr($i, j, 1) != ":") j--
+      print substr($i, j + 1); break
+    }
+  }' | sort -u | tr '\n' ' ')" || return 1
+  ss -tinH 2>/dev/null | awk -v listen=" $ports " '
+    function portof(a,   i) {
+      i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
+      return (i > 0) ? substr(a, i + 1) : ""
+    }
+    /^[ \t]/ {
+      if (local == "") next
+      rtt = 0; sent = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^rtt:/) { s = substr($i, 5); p = index(s, "/")
+          rtt = ((p > 0) ? substr(s, 1, p - 1) : s) + 0 }
+        else if ($i ~ /^data_segs_out:/) sent = substr($i, 15) + 0
+      }
+      # Inbound only: a relay opens its own connections outward to CDNs and
+      # origins, and those are not the client population being sized for.
+      if (rtt > 0 && sent > 0 && index(listen, " " portof(local) " ") > 0) {
+        n++; if (rtt > max) max = rtt
+      }
+      local = ""; next
+    }
+    { local = ""
+      if (NF >= 5 && $1 ~ /^[A-Z][A-Z0-9_-]*$/) local = $4
+      else if (NF >= 4) local = $3 }
+    END { if (n > 0) printf "%.0f\t%d\n", max, n; else exit 1 }'
+}
+
+# Round the measurement up to a round number and keep a little headroom: a
+# mobile client that was calm during the sample will not be calm later.
+suggest_cover_rtt() {
+  local row max n
+  row="$(observed_client_rtt)" || return 1
+  IFS=$'\t' read -r max n <<< "$row"
+  is_uint "${max:-}" && (( max > 0 )) || return 1
+  printf '%s\t%s\t%s\n' $(( (max * 12 / 10 + 49) / 50 * 50 )) "$max" "$n"
 }
 
 render_panel() {
@@ -844,7 +959,8 @@ menu() {
         else info "已取消"; continue; fi
         ;;
       6)
-        if value="$(prompt_uint '覆盖 RTT（ms，按最远的客户端填，不是按你自己，q 返回）' "$COVER_RTT_MS" 10 2000)"; then
+        explain_cover_rtt "${EGRESS_MBPS:-500}"
+        if value="$(prompt_uint '覆盖 RTT（ms，q 返回）' "$COVER_RTT_MS" 10 2000)"; then
           COVER_RTT_MS="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi
         ;;
@@ -888,13 +1004,15 @@ cmd_install() {
   resolve_iface
   printf '  出口网卡：%s\n' "$IFACE"
   printf '  内核拥塞控制：%s → 将选用 %s\n\n' "$(available_cc)" "$(pick_cc "$(available_cc)")"
+  drain_stdin
   value="$(prompt_uint '这台机器的出口带宽（Mbps，按你套餐的端口速率）' 500 1 100000)" \
     || die "已取消安装"
   EGRESS_MBPS="$value"
-  printf '\n  %b覆盖 RTT 决定缓冲上限。按你最远的客户端填，不是按你自己——%b\n' "$DIM" "$RESET"
-  printf '  %b估高只多付一点拥塞控制超发，估低是每个远端客户端都撞得到、却查不出原因的硬顶。%b\n\n' \
-    "$DIM" "$RESET"
-  value="$(prompt_uint '覆盖 RTT（ms，跨境 200-300 常见）' 250 10 2000)" || die "已取消安装"
+  printf '\n'
+  explain_cover_rtt "$EGRESS_MBPS"
+  local sug_rtt=250 row
+  if row="$(suggest_cover_rtt)"; then sug_rtt="$(cut -f1 <<< "$row")"; fi
+  value="$(prompt_uint '覆盖 RTT（ms）' "$sug_rtt" 10 2000)" || die "已取消安装"
   COVER_RTT_MS="$value"
   printf '\n  %b档位%b\n' "$BOLD" "$RESET"
   printf '    1) 稳定优先   整形 90%%｜首窗 16   丢包敏感、跨境线路\n'

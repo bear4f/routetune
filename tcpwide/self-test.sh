@@ -245,4 +245,56 @@ pass 'the panel shows the global memory budget beside the per-socket ceiling'
 pass 'the panel warns about a drifted qdisc'
 unset -f ip tc sysctl has conflicting_tool
 
+
+# ── 0.2.1 覆盖 RTT 的实测 ──────────────────────────────────────────────────
+# The coverage RTT is the one number an operator cannot infer from their own
+# latency: it is a property of the farthest client, not of the console they are
+# typing into. So it gets measured rather than estimated.
+has() { [[ "$1" == ss ]]; }
+ss() {
+  case "$1" in
+    -tlnH) printf 'LISTEN 0 128 0.0.0.0:8096 0.0.0.0:*\n' ;;
+    -tinH) cat <<'SS'
+ESTAB 0 0 10.0.0.1:8096 119.237.129.39:51234
+	 bbr rtt:146.5/2.2 data_segs_out:5000 minrtt:145.5
+ESTAB 0 0 10.0.0.1:8096 223.153.241.126:44000
+	 bbr rtt:277.4/30.1 data_segs_out:9000 minrtt:163.8
+ESTAB 0 0 10.0.0.1:51999 104.21.67.144:443
+	 bbr rtt:900.0/2.0 data_segs_out:900000 minrtt:1.0
+ESTAB 0 0 10.0.0.1:8096 198.51.100.7:33333
+	 bbr rtt:500.0/2.0 data_segs_out:0 minrtt:499.0
+SS
+    ;;
+  esac
+}
+row="$(observed_client_rtt)"
+# A relay opens its own connections outward to CDNs and origins. At 900ms that
+# outbound socket would dominate the sizing, and it is not a client.
+assert_eq '277' "$(printf '%s' "$row" | cut -f1)" \
+  'an outbound connection does not set the coverage RTT'
+# An idle socket carries a stale rtt field that is not a path sample.
+assert_eq '2' "$(printf '%s' "$row" | cut -f2)" \
+  'a socket that has sent nothing is not counted as a client'
+assert_eq '350' "$(suggest_cover_rtt | cut -f1)" \
+  'the suggestion rounds the measurement up with headroom for variable links'
+# No inbound traffic at all means no measurement — not a confident default.
+ss() { case "$1" in -tlnH) printf 'LISTEN 0 128 0.0.0.0:8096 0.0.0.0:*\n' ;; -tinH) : ;; esac; }
+if suggest_cover_rtt >/dev/null 2>&1; then fail 'with no active clients there is nothing to measure'; fi
+pass 'no active clients yields no suggestion rather than a made-up number'
+unset -f ss has
+
+# ── 0.2.1 输入防呆 ─────────────────────────────────────────────────────────
+# A terminal sending CRLF, or a pasted line with trailing spaces, would fail the
+# numeric test for a reason the operator cannot see on screen.
+assert_eq '500' "$(printf '\r\n' | prompt_uint 'x' 500 1 100000 2>/dev/null)" \
+  'a bare carriage return still takes the default'
+assert_eq '750' "$(printf '  750  \n' | prompt_uint 'x' 500 1 100000 2>/dev/null)" \
+  'surrounding whitespace is trimmed rather than rejected'
+assert_eq '500' "$(printf '\n' | prompt_uint 'x' 500 1 100000 2>/dev/null)" \
+  'an empty line takes the default'
+if printf 'q\n' | prompt_uint 'x' 500 1 100000 >/dev/null 2>&1; then
+  fail 'q must cancel'
+fi
+pass 'q cancels the prompt'
+
 printf '%s\n' 'All tcpwide self-tests passed.'

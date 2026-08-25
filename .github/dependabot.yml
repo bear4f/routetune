@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # GitHub Actions —— 无论技术栈如何都适用
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci
+
+  # ↓ 技术栈确定后，取消对应块的注释即可。
+  #   注意：清单文件不存在时 Dependabot 会报错，所以先注释掉。
+  #
+  # - package-ecosystem: npm
+  #   directory: "/"
+  #   schedule:
+  #     interval: weekly
+  #   open-pull-requests-limit: 10
+  #   commit-message:
+  #     prefix: "chore"
+  #   labels: [dependencies]
+  #   groups:
+  #     dev-dependencies:
+  #       dependency-type: development
+  #
+  # - package-ecosystem: pip
+  #   directory: "/"
+  #   schedule:
+  #     interval: weekly
+  #
+  # - package-ecosystem: gomod
+  #   directory: "/"
+  #   schedule:
+  #     interval: weekly
+  #
+  # - package-ecosystem: cargo
+  #   directory: "/"
+  #   schedule:
+  #     interval: weekly

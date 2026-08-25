@@ -1,0 +1,94 @@
+# ---------- OS ----------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ---------- Editors / IDE ----------
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# ---------- Logs & temp ----------
+*.log
+logs/
+tmp/
+temp/
+*.pid
+*.seed
+*.pid.lock
+
+# ---------- Env & secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/**/*.key
+secrets.json
+credentials.json
+
+# ---------- Node / TypeScript ----------
+node_modules/
+dist/
+build/
+out/
+.next/
+.nuxt/
+.turbo/
+.vite/
+coverage/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+site/
+
+# ---------- Go ----------
+bin/
+vendor/
+*.test
+*.out
+
+# ---------- Rust ----------
+target/
+**/*.rs.bk
+
+# ---------- Misc ----------
+.cache/
+*.tgz
+*.zip
+!docs/**/*.zip

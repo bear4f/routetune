@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 提问与讨论
+    url: https://github.com/bear4f/routetune/discussions
+    about: 使用问题、想法交流请到 Discussions（需先在仓库设置中开启）
+  - name: 🔒 安全漏洞上报
+    url: https://github.com/bear4f/routetune/security/advisories/new
+    about: 安全问题请走私密上报通道，不要开公开 Issue

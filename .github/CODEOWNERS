@@ -1,0 +1,8 @@
+# 代码所有者：这些人会被自动请求评审对应路径的改动。
+# 语法见 https://docs.github.com/articles/about-code-owners
+
+# 默认：所有文件
+*                   @bear4f
+
+# 工程配置与 CI
+/.github/           @bear4f

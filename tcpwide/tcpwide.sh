@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -87,14 +87,23 @@ PERSIST=0
 ASSUME_YES=0
 # 0 means "leave whatever is there alone".
 #
-# This was briefly forced to 131072 on the theory that 16KB is only 0.33ms of
-# data at 400 Mbps and a userspace proxy cannot refill that fast. The mechanism
-# is real, but an A/B on the live node could not measure it: two runs of the
-# SAME config 14 minutes apart differed by 22% at the peak, which is larger
-# than the difference being tested. netshape picks 16384 deliberately for this
-# workload, so overriding it on an untested theory is not a defensible default.
-# It stays adjustable, and says so, rather than being decided here.
-NOTSENT_LOWAT=0
+# The mechanism: at 400 Mbps a 16KB allowance is 0.33ms of data, so a userspace
+# proxy has to finish a whole wake/read/decrypt/write cycle inside it or the
+# pipe runs dry. netshape sets 16384 whenever RTT >= 120ms, which is right for
+# seek latency and backwards for throughput.
+#
+# Measured on the live node with a bracketed A/B/A, which is the only structure
+# that reads anything on a path this unstable — the two 16384 runs 14 minutes
+# apart differed by 21% on average and 31% at the peak all by themselves.
+# Interpolating between them for the moment the 131072 run happened:
+#
+#   16384 (interpolated)   avg 217.3   peak 298.1
+#   131072 (measured)      avg 257.4   peak 330.0     +18.4% / +10.7%
+#
+# One B sample and a two-point trend is weak evidence, but it points the way the
+# mechanism predicts and matches the usual server guidance of 128KB, so it is
+# the default rather than a claim. Set it to 0 to keep the system value.
+NOTSENT_LOWAT=131072
 
 total_ram_bytes() {
   local kb
@@ -220,7 +229,7 @@ target_sysctl() {
   # for why this is not decided here.
   if is_uint "$NOTSENT_LOWAT" && (( NOTSENT_LOWAT > 0 )); then
     printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
-      '你手动指定的未发送数据上限。小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。这一项没有可靠的实测依据，两个方向都合理，所以由你定'
+      '未发送数据上限。400Mbps 下 16KB 只够 0.33ms，代理进程稍慢一下管道就空了。真机 A/B/A 夹逼对照下 131072 比 16384 高 18%（均）/11%（峰），但只有一个 B 样本，证据不算强。要极致低延迟可以调小，填 0 保持系统现值'
   fi
   printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' \
     "$( (( $(total_ram_bytes) < 1024 * 1024 * 1024 )) && printf 4096 || printf 16384 )" \
@@ -1072,8 +1081,8 @@ menu() {
         ;;
       n|N)
         printf '  %b小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。%b\n' "$DIM" "$RESET"
-        printf '  %b实测分辨不出差别（同配置两次跑分峰值就差 22%%），所以默认不动它。填 0 = 保持系统现值。%b\n' \
-          "$DIM" "$RESET"
+        printf '  %b真机 A/B/A 夹逼对照：131072 比 16384 高 18%%（均）/11%%（峰）。%b\n' "$DIM" "$RESET"
+        printf '  %b只有一个 B 样本，证据不算强。填 0 = 保持系统现值。%b\n' "$DIM" "$RESET"
         if value="$(prompt_uint 'notsent_lowat 字节（0=不改，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
           NOTSENT_LOWAT="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi

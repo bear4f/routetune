@@ -77,17 +77,22 @@ pass 'the global TCP page budget is set alongside the per-socket ceiling'
 # cross-border middleboxes blackhole ECN negotiation, and these are exactly
 # cross-border paths. That beats the theory that passive mode is inherently safe.
 assert_eq '0' "$(key net.ipv4.tcp_ecn)" 'ECN stays off on cross-border paths'
-# notsent_lowat was briefly forced to 131072 on the theory that 16KB is only
-# 0.33ms of data at 400 Mbps and a userspace proxy cannot refill that fast. An
-# A/B on the live node could not measure it: two runs of the SAME config 14
-# minutes apart differed by 22% at the peak, larger than the effect under test.
-# So it is a knob with no default opinion, not an assertion.
-assert_eq '' "$(key net.ipv4.tcp_notsent_lowat)" \
-  'an untested theory does not become a default'
-NOTSENT_LOWAT=131072; tgt="$(target_sysctl 500 250)"
+# At 400 Mbps a 16KB allowance is 0.33ms of data, so a userspace proxy has to
+# finish a whole wake/read/decrypt/write cycle inside it. A bracketed A/B/A on
+# the live node — the only structure that reads anything on a path where the
+# same config drifted 21% in 14 minutes — put 131072 at +18% average and +11%
+# peak against the interpolated 16384 baseline.
 assert_eq '131072' "$(key net.ipv4.tcp_notsent_lowat)" \
-  'an explicitly chosen unsent allowance is applied exactly'
+  'the measured unsent allowance is the default'
+# It stays a knob, because one B sample and a two-point trend is weak evidence
+# and the latency direction is a legitimate choice.
 NOTSENT_LOWAT=0; tgt="$(target_sysctl 500 250)"
+assert_eq '' "$(key net.ipv4.tcp_notsent_lowat)" \
+  'zero means leave the system value alone'
+NOTSENT_LOWAT=262144; tgt="$(target_sysctl 500 250)"
+assert_eq '262144' "$(key net.ipv4.tcp_notsent_lowat)" \
+  'an explicitly chosen allowance is applied exactly'
+NOTSENT_LOWAT=131072; tgt="$(target_sysctl 500 250)"
 while IFS=$'\t' read -r k v dir why; do
   [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "key $k is missing a value or a rationale"
   [[ "$dir" =~ ^(exact|raise|lower)$ ]] || fail "key $k has no safe direction"

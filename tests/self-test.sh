@@ -617,4 +617,42 @@ pass 'revert consumes the snapshot so a later revert cannot replay stale values'
 rm -rf "$tmp"
 unset -f sysctl has netshape_present ip tc need_root available_cc total_ram_bytes
 
+
+# ── 0.3.2 尺寸用峰值速率，不是中位速率 ─────────────────────────────────────
+# The rate column that feeds sizing was the median across a prefix's
+# connections. A prefix with one socket pulling 400 Mbps and three idle ones
+# has a median of 0.1, and sizing off that puts a demanding client behind a
+# ceiling nobody can explain — the exact failure this layer exists to prevent.
+# Two samples per connection, because every counter here is a window delta.
+mixed_fixture() {
+  printf 'a\t203.0.113.5\tbbr\t250\t1\t240\t0\t100000\t400\t10\tin\n'
+  printf 'a\t203.0.113.5\tbbr\t250\t1\t240\t0\t200000\t400\t10\tin\n'
+  local i
+  for i in 6 7 8; do
+    printf 'x%s\t203.0.113.%s\tbbr\t250\t1\t240\t0\t50\t0.1\t10\tin\n' "$i" "$i"
+    printf 'x%s\t203.0.113.%s\tbbr\t250\t1\t240\t0\t60\t0.1\t10\tin\n' "$i" "$i"
+  done
+}
+mixed_load="$(mixed_fixture | awk -v mode=net "$AGGREGATE_AWK")"
+assert_eq '0.1'   "$(printf '%s' "$mixed_load" | cut -f10)" 'the median rate still reports the typical connection'
+assert_eq '400.0' "$(printf '%s' "$mixed_load" | cut -f28)" 'the peak rate reports the fastest connection seen'
+
+tmp="$(mktemp -d)"; STATE_DIR="$tmp"; PROFILE_DB="$tmp/profiles.tsv"
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+printf '%s\n' "$mixed_load" > "$tmp/agg"; merge_profiles "$tmp/agg"
+assert_eq '400.0' "$(profile_rows | cut -f11)" 'the profile carries the peak, not the median'
+# 250ms x 400 Mbps = 12.5 MB of BDP, doubled for tcp_adv_win_scale=1.
+assert_eq "$((2 * 250 * 125 * 400))" \
+  "$(derive_tuning | awk -F'\t' '$1 == "net.core.rmem_max" {print $2}')" \
+  'a busy prefix sizes from the connection that was actually fast'
+assert_eq 'observed' "$(sizing_bdp | cut -f2)" 'a real fast client overrides the headroom'
+# Rows produced before 0.3.2 have no peak column and must still merge.
+rm -f "$PROFILE_DB"
+printf '203.0.113.0/24\t4\tbbr\t250.0\t260.0\t240.0\t0.010\t1.04\t0.0\t42.0\t10\t100000\tin\t1.08\t0\n' > "$tmp/legacy"
+merge_profiles "$tmp/legacy"
+assert_eq '42.0' "$(profile_rows | cut -f11)" 'a pre-0.3.2 aggregate row falls back to its median column'
+rm -rf "$tmp"
+unset -f available_cc total_ram_bytes
+
 printf '%s\n' 'All routetune self-tests passed.'

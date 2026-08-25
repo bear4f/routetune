@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -237,6 +237,11 @@ function groupof(ip,   i) {
   n = ++cnt[g]
   rtts[g, n] = rtt
   rates[g, n] = mbps
+  # Sizing needs the fastest this prefix was ever seen to go, not its typical
+  # connection. A prefix with 38 sockets where most sit idle has a median near
+  # zero while one socket pulls 400 Mbps, and sizing off the median is how a
+  # demanding client ends up behind a ceiling nobody can explain.
+  if (mbps > gmbpeak[g]) gmbpeak[g] = mbps
   vsum[g] += rttvar
   if (!(g in gmin) || minrtt < gmin[g]) gmin[g] = minrtt
   if (cwnd > gcwnd[g]) gcwnd[g] = cwnd
@@ -291,10 +296,10 @@ END {
     d = (nout[g] == 0) ? "in" : ((nin[g] == 0) ? "out" : "mix")
     # 16-22 are ready-to-print ratios for a single scan; 23-27 are the raw
     # additive counters, because only sums can be merged across rounds.
-    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\t%.2f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\t%.2f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", \
       glabel[g], conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d, tail, sumretr[g], \
       spur, sumreord[g], upl, rwpct, sbpct, gmss[g], gpmtu[g], \
-      sumdsack[g], sumrwnd[g], sumsnd[g], sumbusy[g], sumdsin[g]
+      sumdsack[g], sumrwnd[g], sumsnd[g], sumbusy[g], sumdsin[g], gmbpeak[g]
   }
 }
 '
@@ -710,7 +715,10 @@ FNR == NR && FILENAME == db {
     bsy[k] += $26; dsi[k] += $27
     if (($21 + 0) > 0 && (!(k in msm) || msm[k] == 0 || $21 < msm[k])) msm[k] = $21
     if (($22 + 0) > 0 && (!(k in pmt) || pmt[k] == 0 || $22 < pmt[k])) pmt[k] = $22
-    if ($10 > mbm[k]) mbm[k] = $10
+    # $28 is the peak; $10 is the median kept for compatibility with rows
+    # produced before 0.3.2.
+    peak = (NF >= 28) ? $28 : $10
+    if (peak > mbm[k]) mbm[k] = peak
     if ($2 > cmx[k]) cmx[k] = $2
   }
   seen[k] = stamp

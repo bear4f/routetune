@@ -430,15 +430,92 @@ SYSCTL_SNAPSHOT="$tmp/sysctl-before.tsv"
   printf '223.153.241.0/24\t43\t43\t9150\t609.5\t163.8\t10.7\t54.6\t3.64\t28633\t433794\t48.0\t38\t0\t0\t11895\t156.5\t12\n'
 } > "$PROFILE_DB"
 env_row="$(observed_envelope)"
-# The envelope must follow the widest TYPICAL round (11895/43 = 276.6), not the
-# single worst round ever recorded (609.5). A max never decays.
-assert_eq '277' "$(printf '%s' "$env_row" | cut -f1)" \
-  'the coverage RTT follows the widest typical round, not the worst one ever seen'
-assert_eq '95' "$(printf '%s' "$env_row" | cut -f2)" 'the peak rate is the highest observed'
-assert_eq '2'  "$(printf '%s' "$env_row" | cut -f3)" 'both prefixes are counted'
+# The envelope is one prefix's own RTT paired with its own rate. The fixed line
+# is 155ms x 95 Mbps = 1.84 MB; the mobile prefix is 277ms (11895/43, its widest
+# TYPICAL round, not the 609.5 worst round ever) x 48 Mbps = 1.66 MB. The fixed
+# line wins on product even though the mobile prefix has the higher RTT.
+assert_eq "$((155 * 125 * 95))" "$(printf '%s' "$env_row" | cut -f1)" \
+  'the envelope is the largest per-prefix bandwidth-delay product'
+assert_eq '155' "$(printf '%s' "$env_row" | cut -f2)" 'the RTT reported is the one belonging to that prefix'
+assert_eq '95'  "$(printf '%s' "$env_row" | cut -f3)" 'the rate reported is the one belonging to that prefix'
+assert_eq '119.237.129.0/24' "$(printf '%s' "$env_row" | cut -f4)" 'the driving prefix is named'
+assert_eq '2'  "$(printf '%s' "$env_row" | cut -f5)" 'both prefixes are counted'
+
+# ── 0.3.1 交叉乘积回归 ─────────────────────────────────────────────────────
+# The bug this replaces: taking max(RTT) across prefixes and max(rate) across
+# prefixes and multiplying them. A sampling window taken on a moving train
+# produced 975ms from a link delivering 9 Mbps. Pairing that RTT with the
+# 200 Mbps floor sized the machine at 46 MB for an operating point that does
+# not exist — high-RTT links are the slow ones.
+{
+  printf 'prefix	obs	trusted	p50sum	p95max	minrtt	jitsum	bloatsum	tailmax	retrtotal	segtotal	mbpsmax	connmax	first	last	p95sum	tailsum	spikes
+'
+  printf '119.237.129.0/24	14	14	2044	160	145.5	0.14	14.0	1.07	0	30000	95.0	1	0	0	2170	15.0	0
+'
+  printf '223.153.241.0/24	14	14	9800	1400	300	3.5	30.0	4.6	900	20000	9.0	20	0	0	13650	64.4	9
+'
+} > "$PROFILE_DB"
+train="$(observed_envelope)"
+assert_eq '119.237.129.0/24' "$(printf '%s' "$train" | cut -f4)" \
+  'a slow high-RTT link does not drive the sizing just because its RTT is highest'
+assert_eq "$((155 * 125 * 95))" "$(printf '%s' "$train" | cut -f1)" \
+  'the train sample contributes its own product, not its RTT times another rate'
+# 975ms x 200 Mbps would have been 46.5 MB. The real answer is the 8 MiB floor,
+# because both observed products fall under the unobserved-client headroom.
+available_cc() { printf 'reno cubic bbr
+'; }
+total_ram_bytes() { printf '%s
+' $((8 * 1024 * 1024 * 1024)); }
+assert_eq "$((8 * 1024 * 1024))" \
+  "$(derive_tuning | awk -F'	' '$1 == "net.core.rmem_max" {print $2}')" \
+  'the train profile sizes the machine at the floor, not at 46 MB'
+assert_eq 'headroom' "$(sizing_bdp | cut -f2)" \
+  'when every observed product is small, the unobserved-client headroom decides'
+# A genuinely large single prefix must still drive the sizing upward.
+{
+  printf 'prefix	obs	trusted	p50sum	p95max	minrtt	jitsum	bloatsum	tailmax	retrtotal	segtotal	mbpsmax	connmax	first	last	p95sum	tailsum	spikes
+'
+  printf '198.51.100.0/24	10	10	2500	260	240	0.1	10	1.1	0	50000	400.0	2	0	0	2500	11	0
+'
+} > "$PROFILE_DB"
+assert_eq 'observed' "$(sizing_bdp | cut -f2)" \
+  'a real high-product prefix overrides the headroom'
+assert_eq "$((2 * 250 * 125 * 400))" \
+  "$(derive_tuning | awk -F'	' '$1 == "net.core.rmem_max" {print $2}')" \
+  'a 250ms 400Mbps client sizes the ceiling from its own product'
+
 # An empty database must not silently produce a confident number.
 : > "$PROFILE_DB"
-assert_eq '0	0	0' "$(observed_envelope)" 'an empty profile database yields no envelope'
+assert_eq '0	0	0		0' "$(observed_envelope)" 'an empty profile database yields no envelope'
+
+# ── 0.3.1 方向安全 ─────────────────────────────────────────────────────────
+# The asymmetry that justifies the floor forbids shrinking just as much: a
+# ceiling larger than needed costs almost nothing because autotuning stops well
+# below it, while one that is too small is a cap nobody can diagnose.
+assert_eq '16777216' "$(safe_target 16777216 8388608 raise)" \
+  'a ceiling already above the target is left alone'
+assert_eq '20000000' "$(safe_target 6291456 20000000 raise)" \
+  'a ceiling below the target is raised'
+# An operator who already tightened a knob must not have it quietly loosened.
+assert_eq '16384' "$(safe_target 16384 131072 lower)" \
+  'a value already tighter than the target is left alone'
+assert_eq '16384' "$(safe_target 131072 16384 lower)" \
+  'a loose value is tightened'
+assert_eq 'bbr' "$(safe_target cubic bbr exact)" 'an exact key takes the target as given'
+# tcp_rmem is min/default/max and the fields do not share a direction: the
+# middle one wants raising for a faster ramp while the ceiling is already
+# higher than we would ask for. Writing the tuple naively raised one and shrank
+# the other in the same call.
+assert_eq '4096 131072 16777216' \
+  "$(safe_target '4096 87380 16777216' '4096 131072 8388608' raise)" \
+  'a multi-value key merges field by field instead of overwriting the tuple'
+needs_change '4096 87380 16777216' '4096 131072 8388608' raise \
+  || fail 'a raisable middle field must still count as needing a change'
+pass 'a raisable field is acted on even when its siblings are already fine'
+if needs_change 16777216 8388608 raise; then fail 'an adequate ceiling must not be flagged'; fi
+pass 'an adequate ceiling is not flagged as drift'
+if needs_change 16384 131072 lower; then fail 'a tighter value must not be flagged'; fi
+pass 'a value tighter than the target is not flagged as drift'
 
 # ── 0.3.0 缓冲尺寸推导 ─────────────────────────────────────────────────────
 available_cc() { printf 'reno cubic bbr\n'; }
@@ -477,10 +554,11 @@ assert_eq fq "$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.core.default_qdis
 assert_eq '0' "$(derive_tuning 200 400 | awk -F'\t' '$1 == "net.ipv4.tcp_slow_start_after_idle" {print $2}')" \
   'cwnd is not reset between streaming chunks'
 # Every emitted key must carry the measurement it came from.
-derive_tuning 200 400 | while IFS=$'\t' read -r k v why; do
+derive_tuning 200 400 | while IFS=$'\t' read -r k v why dir; do
   [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "tuning key $k has no value or no rationale"
+  [[ "$dir" =~ ^(exact|raise|lower)$ ]] || fail "tuning key $k has no safe direction"
 done
-pass 'every tuning key carries a value and a rationale'
+pass 'every tuning key carries a value, a rationale and a safe direction'
 
 # ── 0.3.0 预演绝不写入 ─────────────────────────────────────────────────────
 writes="$tmp/writes"; : > "$writes"

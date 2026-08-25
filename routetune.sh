@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 PROGRAM="routetune"
 STATE_DIR="/var/lib/routetune"
 PROFILE_DB="$STATE_DIR/profiles.tsv"
@@ -893,9 +893,11 @@ NR == 1 || $1 == "prefix" || $1 == "" { next }
   upl  = (sg + upt > 0) ? upt * 100 / (sg + upt) : 0
   mssv = (NF >= 26) ? $25 + 0 : 0
   pmtv = (NF >= 26) ? $26 + 0 : 0
-  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\t%.3f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\n", \
+  # p95t is also emitted verbatim: sizing reads it, and reconstructing it from
+  # the two-decimal sp ratio loses enough precision to move a buffer figure.
+  printf "%s\t%d\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.2f\t%.4f\t%d\t%.1f\t%d\t%.2f\t%.3f\t%d\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%.1f\n", \
     $1, obs, p50, p95mx, mn, jit, bl, tlt, rt, sg, mb, cn, sp, (spk >= 0 ? spk / obs : 0), spk, \
-    spur, rdr, rwp, sbp, upl, mssv, pmtv, rc
+    spur, rdr, rwp, sbp, upl, mssv, pmtv, rc, p95t
 }
 '
 
@@ -1196,42 +1198,61 @@ total_ram_bytes() {
   printf '%s\n' $(( kb * 1024 ))
 }
 
-# Widest typical RTT and highest delivery rate across trusted profiles. Prints
-# "rtt<TAB>mbps<TAB>prefixcount"; zeros when there is nothing to learn from.
+# The largest bandwidth-delay product any single observed prefix actually
+# reaches, and which prefix reaches it. Prints
+# "bdpbytes<TAB>rtt<TAB>mbps<TAB>prefix<TAB>prefixcount"; zeros when the
+# database has nothing to say.
+#
+# It has to be per prefix. Taking the widest RTT across all prefixes and the
+# highest rate across all prefixes and multiplying them describes an operating
+# point that does not exist: high-RTT links are the slow ones. A single
+# sampling window taken on a train produced 975ms from a link doing 9 Mbps,
+# and pairing that RTT with an unrelated rate sized the machine at 46 MB.
 observed_envelope() {
   local rows
   rows="$(profile_rows 2>/dev/null || true)"
-  [[ -n "$rows" ]] || { printf '0\t0\t0\n'; return 0; }
+  [[ -n "$rows" ]] || { printf '0\t0\t0\t\t0\n'; return 0; }
   awk -F '\t' '
     { n++
-      p95 = $3 * $13            # mean p95 of this prefix, not its worst round
-      if (p95 > rtt) rtt = p95
-      if ($11 + 0 > mb) mb = $11 + 0 }
-    END { printf "%.0f\t%.0f\t%d\n", rtt + 0, mb + 0, n + 0 }
+      p95 = $24 + 0             # mean p95 of this prefix, not its worst round
+      rate = $11 + 0
+      bdp = p95 * 125 * rate    # Mbps x ms in bytes
+      if (bdp > best) { best = bdp; brtt = p95; brate = rate; bpfx = $1 } }
+    END { printf "%.0f\t%.0f\t%.0f\t%s\t%d\n", best + 0, brtt + 0, brate + 0, bpfx, n + 0 }
   ' <<< "$rows"
 }
 
 # The sysctl set, with the measurement each value came from. Emits
 # key<TAB>value<TAB>why. Nothing here is applied by this function.
+# Prints "bdp<TAB>source" where source is 'observed' or 'headroom'.
+sizing_bdp() {
+  local force_rtt="${1:-}" force_peak="${2:-}"
+  local env obs_bdp rtt peak _pfx _n head_bdp
+  env="$(observed_envelope)"
+  IFS=$'\t' read -r obs_bdp rtt peak _pfx _n <<< "$env"
+  # An operator stating an envelope outright is making a decision, not a
+  # measurement, so it replaces both terms rather than competing with them.
+  if [[ -n "$force_rtt" || -n "$force_peak" ]]; then
+    [[ -n "$force_rtt" ]]  || force_rtt="$COVER_RTT_FLOOR_MS"
+    [[ -n "$force_peak" ]] || force_peak="$PEAK_MBPS_FLOOR"
+    printf '%s\tforced\n' $(( force_peak * 125 * force_rtt ))
+    return 0
+  fi
+  # Headroom for clients we have never seen. The floors belong here and only
+  # here: applied to the measurement they would inflate a slow link's RTT by a
+  # rate that link never reaches.
+  head_bdp=$(( PEAK_MBPS_FLOOR * 125 * COVER_RTT_FLOOR_MS ))
+  if (( obs_bdp > head_bdp )); then printf '%s\tobserved\n' "$obs_bdp"
+  else printf '%s\theadroom\n' "$head_bdp"; fi
+}
+
 derive_tuning() {
   local force_rtt="${1:-}" force_peak="${2:-}"
-  local env rtt peak nprefix ram bdp buf cc qdisc avail
-  env="$(observed_envelope)"
-  IFS=$'\t' read -r rtt peak nprefix <<< "$env"
-  # The floors guard against sizing off an idle or unrepresentative sample.
-  # They do not override an operator who states a number outright: someone who
-  # knows their whole population is local should be able to say so.
-  if [[ -n "$force_rtt" ]]; then rtt="$force_rtt"
-  elif (( rtt < COVER_RTT_FLOOR_MS )); then rtt="$COVER_RTT_FLOOR_MS"; fi
-  if [[ -n "$force_peak" ]]; then peak="$force_peak"
-  elif (( peak < PEAK_MBPS_FLOOR )); then peak="$PEAK_MBPS_FLOOR"; fi
+  local ram bdp buf cc qdisc avail rmem_default
+  IFS=$'\t' read -r bdp _ <<< "$(sizing_bdp "$force_rtt" "$force_peak")"
   ram="$(total_ram_bytes)"
-  # BDP, then doubled: with tcp_adv_win_scale=1 the kernel reserves half the
-  # receive buffer for overhead, so a ceiling equal to the BDP delivers half of
-  # one.
-  # Mbps x ms in bytes: peak * 1e6 / 8 * rtt / 1000 reduces exactly to
-  # peak * 125 * rtt, which avoids an intermediate integer division.
-  bdp=$(( peak * 125 * rtt ))
+  # Doubled: with tcp_adv_win_scale=1 the kernel reserves half the receive
+  # buffer for overhead, so a ceiling equal to the BDP delivers half of one.
   buf=$(( bdp * 2 ))
   (( buf < BUF_MIN_BYTES )) && buf="$BUF_MIN_BYTES"
   (( buf > BUF_ABS_MAX_BYTES )) && buf="$BUF_ABS_MAX_BYTES"
@@ -1241,6 +1262,7 @@ derive_tuning() {
     buf=$(( ram / 16 ))
     (( buf < BUF_MIN_BYTES )) && buf="$BUF_MIN_BYTES"
   fi
+  rmem_default=131072
   avail="$(available_cc)"
   case " $avail " in
     *" bbr3 "*) cc=bbr3 ;;
@@ -1249,22 +1271,72 @@ derive_tuning() {
     *) cc=cubic ;;
   esac
   qdisc=fq
-  printf 'net.core.default_qdisc\t%s\t%s\n' "$qdisc" \
+  # Column 4 is the direction in which a difference is worth acting on.
+  #   exact  the value itself is the point
+  #   raise  only ever increase it. A ceiling that is larger than needed costs
+  #          almost nothing because autotuning stops well below it, while one
+  #          that is too small is a cap nobody can diagnose. That is tcpfit's
+  #          asymmetry argument, and it forbids shrinking just as much as it
+  #          forbids underestimating.
+  #   lower  only ever decrease it. An operator who already tightened a knob
+  #          must not have it quietly loosened.
+  printf 'net.core.default_qdisc\t%s\t%s\texact\n' "$qdisc" \
     '发送侧 pacing。混合客户端下降低重传的最大单一杠杆：没有 pacing 时一个突发按线速打出去，会直接冲垮最慢那条末端链路的缓冲'
-  printf 'net.ipv4.tcp_congestion_control\t%s\t%s\n' "$cc" \
+  printf 'net.ipv4.tcp_congestion_control\t%s\t%s\texact\n' "$cc" \
     '爬升快且不会因随机丢包塌陷——丢包型算法每丢一次砍一次窗，无线链路上永远起不来'
-  printf 'net.core.rmem_max\t%s\t%s\n' "$buf" \
-    "接收缓冲上限，按覆盖 RTT ${rtt}ms × 峰值 ${peak}Mbps 的 BDP 两倍算"
-  printf 'net.core.wmem_max\t%s\t%s\n' "$buf" '发送缓冲上限，同上'
-  printf 'net.ipv4.tcp_rmem\t4096 131072 %s\t%s\n' "$buf" \
-    '上限给足，autotuning 会让近端连接自己停在低处；给小了才是查不出来的硬天花板'
-  printf 'net.ipv4.tcp_wmem\t4096 16384 %s\t%s\n' "$buf" '同上'
-  printf 'net.ipv4.tcp_slow_start_after_idle\t0\t%s\n' \
+  printf 'net.core.rmem_max\t%s\t%s\traise\n' "$buf" \
+    '接收缓冲上限。上限只是上限，autotuning 会让近端连接自己停在低处；给小了才是查不出来的硬天花板'
+  printf 'net.core.wmem_max\t%s\t%s\traise\n' "$buf" '发送缓冲上限，同上'
+  printf 'net.ipv4.tcp_rmem\t4096 %s %s\t%s\traise\n' "$rmem_default" "$buf" \
+    '第三个数是上限（同上）；中间那个是初始接收窗口，抬高它让发送方在等窗口更新前多发一些——这一项影响的是爬升速度，不是天花板'
+  printf 'net.ipv4.tcp_wmem\t4096 16384 %s\t%s\traise\n' "$buf" '发送侧上限，同上'
+  printf 'net.ipv4.tcp_slow_start_after_idle\t0\t%s\texact\n' \
     '流媒体分块之间会短暂空闲，默认行为是把 cwnd 打回初始值再慢启动一次——这正是「看着看着掉速」的机制'
-  printf 'net.ipv4.tcp_notsent_lowat\t131072\t%s\n' \
-    '限制本机 socket 里堆积的未发送数据，降低本地排队延迟；不影响吞吐'
-  printf 'net.ipv4.tcp_mtu_probing\t1\t%s\n' \
+  printf 'net.ipv4.tcp_notsent_lowat\t131072\t%s\tlower\n' \
+    '限制本机 socket 里堆积的未发送数据，降低本地排队延迟；已经调得更紧就保持不动'
+  printf 'net.ipv4.tcp_mtu_probing\t1\t%s\texact\n' \
     '路径上有人钳制 MSS 时（scan 会提示）让内核自己探到能用的大小，而不是一直重传大包'
+}
+
+# The value actually safe to write, given the direction this key may move in.
+# Multi-value keys (tcp_rmem, tcp_wmem) merge field by field: their fields are
+# min/default/max and do not share a direction in practice. tcp_rmem wants its
+# middle field raised for a faster ramp while its ceiling is already higher
+# than we would ask for, and writing the whole tuple naively would raise one
+# and shrink the other in the same call.
+safe_target() {
+  local now="${1:-}" want="${2:-}" dir="${3:-exact}"
+  if [[ -z "$now" || "$dir" == exact ]]; then printf '%s\n' "$want"; return 0; fi
+  awk -v a="$now" -v b="$want" -v d="$dir" 'BEGIN {
+    na = split(a, x, " "); nb = split(b, y, " ")
+    if (na != nb) { print b; exit }
+    out = ""
+    for (i = 1; i <= nb; i++) {
+      v = (d == "raise") ? (y[i] + 0 > x[i] + 0 ? y[i] : x[i]) \
+                         : (y[i] + 0 < x[i] + 0 ? y[i] : x[i])
+      out = (out == "") ? v : out " " v
+    }
+    print out }'
+}
+
+# Changing anything is worth doing only when the safe target differs from what
+# is live.
+needs_change() {
+  local now="${1:-}" want="${2:-}" dir="${3:-exact}"
+  [[ -n "$now" ]] || return 0            # unset always needs setting
+  [[ "$(safe_target "$now" "$want" "$dir")" != "$now" ]]
+}
+
+# When a key is left alone, say which way the live value already went.
+already_ok_note() {
+  case "${1:-}" in
+    raise) printf '当前值已经不低于目标，不动（上限只升不降）
+' ;;
+    lower) printf '当前值已经比目标更紧，不动（这一项只降不升）
+' ;;
+    *)     printf '已经是目标值
+' ;;
+  esac
 }
 
 # What the machine currently has, for the same keys.
@@ -1299,22 +1371,26 @@ cmd_tune() {
   has sysctl || die "缺少 sysctl"
 
   panel_title 'routetune 全局调优'
-  local env rtt peak nprefix
-  env="$(observed_envelope)"
-  IFS=$'\t' read -r rtt peak nprefix <<< "$env"
+  local obs_bdp rtt peak pfx nprefix sz_bdp sz_src
+  IFS=$'\t' read -r obs_bdp rtt peak pfx nprefix <<< "$(observed_envelope)"
+  IFS=$'\t' read -r sz_bdp sz_src <<< "$(sizing_bdp "$force_rtt" "$force_peak")"
   if (( nprefix == 0 )); then
     warn "画像库是空的，下面的尺寸完全来自保守默认值，不是你机器上的实测"
     printf '  %b先跑 %s watch --minutes 30，让尺寸按你真实的客户端分布来算。%b\n\n' \
       "$DIM" "$PROGRAM" "$RESET"
   else
-    printf '  %b依据 %s 个前缀的实测：最远客户端典型 RTT95 %s ms，观测到的最高单流 %s Mbps%b\n' \
-      "$DIM" "$nprefix" "$rtt" "$peak" "$RESET"
-    [[ -z "$force_rtt" ]] && (( rtt < COVER_RTT_FLOOR_MS )) && \
-      printf '  %b实测 %s ms 低于 %s ms 下限，按下限取——没观测到的客户端可能更远，估低是硬天花板%b\n' \
-        "$DIM" "$rtt" "$COVER_RTT_FLOOR_MS" "$RESET"
-    [[ -z "$force_peak" ]] && (( peak < PEAK_MBPS_FLOOR )) && \
-      printf '  %b实测峰值 %s Mbps 低于 %s Mbps 下限，按下限取——观测期没跑满不等于跑不快，按空闲样本定尺寸正是那种查不出来的限速%b\n' \
-        "$DIM" "$peak" "$PEAK_MBPS_FLOOR" "$RESET"
+    printf '  %b依据 %s 个前缀的实测。BDP 最大的是 %s：它自己的 %s ms × %s Mbps = %s MB%b\n' \
+      "$DIM" "$nprefix" "${pfx:-未知}" "$rtt" "$peak" \
+      "$(awk -v b="$obs_bdp" 'BEGIN {printf "%.2f", b / 1048576}')" "$RESET"
+    printf '  %bRTT 和速率必须取自同一个前缀——最慢的链路正是最远的那条，把两个轴各自的最大值相乘，得到的是一个不存在的工作点%b\n' \
+      "$DIM" "$RESET"
+    local sz_mb; sz_mb="$(awk -v b="$sz_bdp" 'BEGIN {printf "%.2f", b / 1048576}')"
+    case "$sz_src" in
+      headroom) printf '  %b实测 BDP 不到未观测客户端的兜底值（%s ms × %s Mbps = %s MB），按兜底算%b\n' \
+        "$DIM" "$COVER_RTT_FLOOR_MS" "$PEAK_MBPS_FLOOR" "$sz_mb" "$RESET" ;;
+      forced)   printf '  %b你指定了覆盖范围（BDP %s MB），实测值不参与%b\n' "$DIM" "$sz_mb" "$RESET" ;;
+      *)        printf '  %b尺寸来自实测的 %s MB，不是兜底值%b\n' "$DIM" "$sz_mb" "$RESET" ;;
+    esac
   fi
   if netshape_present; then
     warn "检测到 netshape：它和 routetune 都会写全局 sysctl 和根队列，同一台机器只能留一个"
@@ -1322,28 +1398,35 @@ cmd_tune() {
   fi
   printf '\n'
 
-  local derived cur k v why now changed=0
+  local derived cur k v why dir now changed=0
   derived="$(derive_tuning "$force_rtt" "$force_peak")"
   cur="$(printf '%s\n' "$derived" | current_sysctl)"
   printf '  %b参数                                  当前值 → 目标值%b\n' "$BOLD" "$RESET"
   rule_light
-  while IFS=$'\t' read -r k v why; do
+  while IFS=$'\t' read -r k v why dir; do
     [[ -n "$k" ]] || continue
     now="$(awk -F'\t' -v key="$k" '$1 == key {print $2; exit}' <<< "$cur")"
-    if [[ "$now" == "$v" ]]; then
-      printf '  %b%-36s %s（已经是目标值）%b\n' "$DIM" "$k" "$v" "$RESET"
-    else
+    if needs_change "$now" "$v" "$dir"; then
       changed=$((changed + 1))
       printf '  %b%-36s%b %b%s%b → %b%s%b\n' "$BOLD" "$k" "$RESET" \
-        "$DIM" "${now:-未设置}" "$RESET" "$GREEN" "$v" "$RESET"
+        "$DIM" "${now:-未设置}" "$RESET" "$GREEN" "$(safe_target "$now" "$v" "$dir")" "$RESET"
       printf '    %b%s%b\n' "$DIM" "$why" "$RESET"
+    else
+      printf '  %b%-36s %-24s %s%b\n' "$DIM" "$k" "$now" "$(already_ok_note "$dir")" "$RESET"
     fi
   done <<< "$derived"
   rule_light
 
+  if (( changed == 0 )); then
+    log "现有配置已经覆盖你实测的客户端分布，不需要 routetune 接管"
+    printf '  %b这台机器上没有可加的东西。routetune 在这里的价值是 scan / watch / profiles%b\n' "$DIM" "$RESET"
+    printf '  %b——客户端分布是 netshape 看不到、而它能看到的部分。%b\n' "$DIM" "$RESET"
+    return 0
+  fi
+
   if (( apply == 0 )); then
     printf '  %b这是预演，什么都没有改。%b\n' "$BOLD" "$RESET"
-    printf '  %b%s 项与目标不同。确认无误后加 --yes 才会真的写入。%b\n' "$DIM" "$changed" "$RESET"
+    printf '  %b%s 项值得改。确认无误后加 --yes 才会真的写入。%b\n' "$DIM" "$changed" "$RESET"
     printf '  %b写入前会先快照当前值，%s revert 可以完整还原。%b\n' "$DIM" "$PROGRAM" "$RESET"
     return 0
   fi
@@ -1360,8 +1443,11 @@ cmd_tune() {
     info "已存在快照，保留最初那份（revert 要还原到 routetune 介入之前）"
   fi
   local failed=0
-  while IFS=$'\t' read -r k v _; do
+  while IFS=$'\t' read -r k v _ dir; do
     [[ -n "$k" ]] || continue
+    now="$(awk -F'\t' -v key="$k" '$1 == key {print $2; exit}' <<< "$cur")"
+    needs_change "$now" "$v" "$dir" || continue
+    v="$(safe_target "$now" "$v" "$dir")"
     if sysctl -qw "$k=$v" 2>/dev/null; then
       printf '  %b[OK]%b %s = %s\n' "$GREEN" "$RESET" "$k" "$v"
     else
@@ -1433,14 +1519,15 @@ cmd_status() {
   fi
   printf '\n  %b当前值与目标值的差异%b\n' "$BOLD" "$RESET"
   rule_light
-  while IFS=$'\t' read -r k v _; do
+  while IFS=$'\t' read -r k v _ dir; do
     [[ -n "$k" ]] || continue
     now="$(awk -F'\t' -v key="$k" '$1 == key {print $2; exit}' <<< "$cur")"
-    if [[ "$now" == "$v" ]]; then
-      printf '  %b✓ %-36s %s%b\n' "$GREEN" "$k" "$v" "$RESET"
-    else
+    if needs_change "$now" "$v" "$dir"; then
       drift=$((drift + 1))
-      printf '  %b✗ %-36s%b %s（目标 %s）\n' "$YELLOW" "$k" "$RESET" "${now:-未设置}" "$v"
+      printf '  %b✗ %-36s%b %s（目标 %s）\n' "$YELLOW" "$k" "$RESET" "${now:-未设置}" \
+        "$(safe_target "$now" "$v" "$dir")"
+    else
+      printf '  %b✓ %-36s %s%b\n' "$GREEN" "$k" "${now:-$v}" "$RESET"
     fi
   done <<< "$derived"
   rule_light

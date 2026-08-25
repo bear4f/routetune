@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.2"
+VERSION="0.3.3"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -253,6 +253,18 @@ target_qdisc() {
   printf 'cake bandwidth %skbit dual-dsthost ecn besteffort rtt %sms\n' \
     "$(shaped_kbit "$rate")" "$rtt"
 }
+
+# The script runs under IFS=$'\n\t'. Every place that hands a multi-word spec
+# to `tc` or `ip` therefore CANNOT rely on unquoted word splitting: the whole
+# spec arrives as a single argument and the command fails. Splitting has to be
+# asked for explicitly, so it goes through one helper rather than being
+# rediscovered at each call site.
+split_words() {
+  local IFS=' '
+  # shellcheck disable=SC2206 # splitting on spaces is the entire purpose
+  SPLIT_WORDS=( $1 )
+}
+declare -a SPLIT_WORDS=()
 
 current_default_route() { ip route show default 2>/dev/null | sed -n '1p'; }
 
@@ -612,11 +624,14 @@ apply_link() {
     tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' > "$QDISC_SNAP" || true
     chmod 0600 "$QDISC_SNAP" 2>/dev/null || true
   fi
-  # shellcheck disable=SC2086 # the qdisc spec is a deliberate word list
-  if tc qdisc replace dev "$IFACE" root $want_q 2>/dev/null; then
+  split_words "$want_q"
+  if tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>/dev/null; then
     log "根队列已设为：$want_q"
   else
-    warn "无法设置根队列。没有 pacing 的话，突发会按线速打出去——这是重传的主要来源"
+    warn "无法设置根队列：tc qdisc replace dev $IFACE root $want_q"
+    printf '  %b手动跑一次上面这条看内核报什么。没有 pacing 的话，突发会按线速打出去%b\n' \
+      "$DIM" "$RESET"
+    printf '  %b——这是重传的主要来源，也是整套配置里最重要的一项。%b\n' "$DIM" "$RESET"
     return 0
   fi
   cur_r="$(current_default_route)"
@@ -627,8 +642,8 @@ apply_link() {
   want_r="$(route_with_initcwnd "$cur_r" "$INITCWND")"
   [[ "$cur_r" != "$want_r" ]] || return 0
   [[ -e "$ROUTE_SNAP" ]] || { printf '%s\n' "$cur_r" > "$ROUTE_SNAP"; chmod 0600 "$ROUTE_SNAP"; }
-  # shellcheck disable=SC2086 # route spec is a deliberate word list
-  if ip route replace $want_r 2>/dev/null; then
+  split_words "$want_r"
+  if ip route replace "${SPLIT_WORDS[@]}" 2>/dev/null; then
     log "默认路由首窗已设为 initcwnd $INITCWND"
   else
     warn "无法修改默认路由，首窗保持内核默认"
@@ -748,8 +763,8 @@ cmd_revert() {
   fi
   if [[ -r "$ROUTE_SNAP" ]]; then
     r="$(sed -n '1p' "$ROUTE_SNAP")"
-    # shellcheck disable=SC2086 # route spec is a deliberate word list
-    if [[ -n "$r" ]] && ip route replace $r 2>/dev/null; then
+    split_words "$r"
+    if [[ -n "$r" ]] && ip route replace "${SPLIT_WORDS[@]}" 2>/dev/null; then
       log "默认路由已还原"
     else
       warn "无法还原默认路由，手动检查 ip route show default"

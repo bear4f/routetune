@@ -367,4 +367,30 @@ pass 'no-shape mode never warns about shaping CPU'
 SHAPE=1
 unset -f cpu_count
 
+
+# ── 0.3.3 多词参数必须真的分词 ─────────────────────────────────────────────
+# The script runs under IFS=$'\n\t'. Unquoted expansion therefore does NOT
+# split on spaces, so `tc ... root $want_q` handed the entire eight-word CAKE
+# spec to tc as ONE argument and the qdisc silently never applied — every run
+# on the live node was sysctl-only while the panel reported drift.
+SHAPE=1; SHAPE_PCT=95; IFACE=eth0
+split_words "$(target_qdisc 500 250)"
+assert_eq '8' "${#SPLIT_WORDS[@]}" 'the CAKE spec splits into its individual arguments'
+assert_eq 'cake' "${SPLIT_WORDS[0]}" 'the first argument is the qdisc name, not the whole spec'
+assert_eq '250ms' "${SPLIT_WORDS[7]}" 'the last argument survives the split'
+split_words 'default via 10.0.0.1 dev eth0 onlink initcwnd 20'
+assert_eq '8' "${#SPLIT_WORDS[@]}" 'a route spec splits into its individual arguments'
+
+# End to end: the words must reach the command, not just the helper.
+argc_file="$(mktemp)"
+tc() { printf '%s\n' "$#" > "$argc_file"; return 0; }
+ip() { printf 'default via 10.0.0.1 dev eth0\n'; }
+has() { [[ "$1" == tc || "$1" == ip ]]; }
+QDISC_SNAP="$(mktemp -d)/qdisc"; ROUTE_SNAP="$(mktemp -d)/route"
+apply_link 500 250 >/dev/null 2>&1 || true
+# qdisc replace dev eth0 root + 8 spec words = 13
+assert_eq '13' "$(cat "$argc_file")" 'tc receives the qdisc spec as separate arguments'
+rm -f "$argc_file"
+unset -f tc ip has
+
 printf '%s\n' 'All tcpwide self-tests passed.'

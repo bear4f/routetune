@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.5"
+VERSION="0.3.6"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -275,7 +275,12 @@ target_sysctl() {
 target_qdisc() {
   local rate="${1:-0}" rtt="${2:-0}"
   (( SHAPE == 1 )) || { printf 'fq\n'; return 0; }
-  printf 'cake bandwidth %skbit dual-dsthost ecn besteffort rtt %sms\n' \
+  # No `ecn` keyword: mainline sch_cake already marks ECN-capable packets
+  # instead of dropping them, so there is nothing to switch on, and the option
+  # does not exist in current iproute2 — the live node rejected the whole spec
+  # over it with "What is \"ecn\"?". It was moot here anyway, since tcp_ecn is
+  # set to 0 for the cross-border blackhole reason.
+  printf 'cake bandwidth %skbit dual-dsthost besteffort rtt %sms\n' \
     "$(shaped_kbit "$rate")" "$rtt"
 }
 

@@ -101,6 +101,11 @@ pass 'every key carries a value, a direction and a rationale'
 
 # ── 队列 ───────────────────────────────────────────────────────────────────
 q="$(target_qdisc 500 250)"
+# Current iproute2 has no `ecn` keyword for cake — the live node rejected the
+# entire spec with: What is "ecn"? Mainline sch_cake marks ECN-capable packets
+# by default, so there was never anything to switch on.
+[[ "$q" != *" ecn"* ]] || fail 'cake takes no ecn keyword in current iproute2'
+pass 'the cake spec carries no keyword current iproute2 would reject'
 [[ "$q" == *"dual-dsthost"* ]] || fail 'host fairness is the whole point of shaping'
 pass 'the qdisc asks for per-host fairness, not per-flow'
 [[ "$q" == *"bandwidth 475000kbit"* ]] || fail 'the shaper must sit under the line rate'
@@ -375,9 +380,9 @@ unset -f cpu_count
 # on the live node was sysctl-only while the panel reported drift.
 SHAPE=1; SHAPE_PCT=95; IFACE=eth0
 split_words "$(target_qdisc 500 250)"
-assert_eq '8' "${#SPLIT_WORDS[@]}" 'the CAKE spec splits into its individual arguments'
+assert_eq '7' "${#SPLIT_WORDS[@]}" 'the CAKE spec splits into its individual arguments'
 assert_eq 'cake' "${SPLIT_WORDS[0]}" 'the first argument is the qdisc name, not the whole spec'
-assert_eq '250ms' "${SPLIT_WORDS[7]}" 'the last argument survives the split'
+assert_eq '250ms' "${SPLIT_WORDS[6]}" 'the last argument survives the split'
 split_words 'default via 10.0.0.1 dev eth0 onlink initcwnd 20'
 assert_eq '8' "${#SPLIT_WORDS[@]}" 'a route spec splits into its individual arguments'
 
@@ -388,8 +393,8 @@ ip() { printf 'default via 10.0.0.1 dev eth0\n'; }
 has() { [[ "$1" == tc || "$1" == ip ]]; }
 QDISC_SNAP="$(mktemp -d)/qdisc"; ROUTE_SNAP="$(mktemp -d)/route"
 apply_link 500 250 >/dev/null 2>&1 || true
-# qdisc replace dev eth0 root + 8 spec words = 13
-assert_eq '13' "$(cat "$argc_file")" 'tc receives the qdisc spec as separate arguments'
+# qdisc replace dev eth0 root + 7 spec words = 12
+assert_eq '12' "$(cat "$argc_file")" 'tc receives the qdisc spec as separate arguments'
 rm -f "$argc_file"
 unset -f tc ip has
 
@@ -425,13 +430,13 @@ unset -f has sysctl suggest_cover_rtt total_ram_bytes
 has() { [[ "$1" == tc ]]; }
 tc() { local IFS=' '; case "$*" in *dual-dsthost*) return 1 ;; *) return 0 ;; esac; }
 assert_eq 'cake bandwidth 490000kbit dual-dsthost' \
-  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms')" \
+  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost besteffort rtt 250ms')" \
   'the probe names the option that starts failing'
 # A value-taking option is only testable once its value is in, or the probe
 # would blame "bandwidth" for an incomplete pair.
 tc() { local IFS=' '; case "$*" in *"rtt 250ms"*) return 1 ;; *) return 0 ;; esac; }
-assert_eq 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms' \
-  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost ecn besteffort rtt 250ms')" \
+assert_eq 'cake bandwidth 490000kbit dual-dsthost besteffort rtt 250ms' \
+  "$(probe_cake_options 'cake bandwidth 490000kbit dual-dsthost besteffort rtt 250ms')" \
   'an option that takes a value is tested with its value attached'
 # Nothing to report when every option is accepted.
 tc() { return 0; }

@@ -27,7 +27,7 @@ jobs:
         run: bash -n routetune.sh tests/self-test.sh
 
       - name: ShellCheck
-        run: shellcheck routetune.sh tests/self-test.sh
+        run: shellcheck -x -P SCRIPTDIR routetune.sh tests/self-test.sh
 
       - name: 自测
         run: bash tests/self-test.sh

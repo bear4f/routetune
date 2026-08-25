@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317 # mock functions are invoked indirectly by sourced helpers
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -114,9 +115,11 @@ assert_eq '35.0' "$(dsack_ratio)" 'DSACK evidence ratio is reported'
 nstat() { printf 'TcpRetransSegs 1000 0.0\nTcpExtTCPDSACKRecv 5 0.0\n'; }
 assert_eq '0.5' "$(dsack_ratio)" 'a low DSACK evidence ratio reads low'
 nstat() { printf 'TcpRetransSegs 0 0.0\nTcpExtTCPDSACKRecv 0 0.0\n'; }
-dsack_ratio >/dev/null 2>&1 && fail 'no retransmissions means no ratio' || pass 'no retransmissions yields no ratio'
+if dsack_ratio >/dev/null 2>&1; then fail 'no retransmissions means no ratio';
+else pass 'no retransmissions yields no ratio'; fi
 has() { return 1; }
-dsack_ratio >/dev/null 2>&1 && fail 'no nstat means no ratio' || pass 'missing nstat yields no ratio'
+if dsack_ratio >/dev/null 2>&1; then fail 'no nstat means no ratio';
+else pass 'missing nstat yields no ratio'; fi
 
 # ── 继承自 peertune 的解析层（真机验证过，锁住不许回退）─────────────────────
 has() { command -v "$1" >/dev/null 2>&1; }
@@ -164,10 +167,16 @@ assert_eq 'sudo ip -4 route del 203.0.113.0/24 table main' \
 routes="$(route_commands 2001:db8:0:1::/64 'initcwnd 32')"
 assert_eq 'sudo ip -6 route add 2001:db8:0:1::/64 dev ens3 src 2001:db8::10 table main initcwnd 32' \
   "$(printf '%s\n' "$routes" | sed -n '1p')" 'gateway-less IPv6 is supported'
-route_commands 198.51.100.0/24 'initcwnd 32' >/dev/null 2>&1 && fail 'ECMP must be rejected' || \
+if route_commands 198.51.100.0/24 'initcwnd 32' >/dev/null 2>&1; then
+  fail 'ECMP must be rejected'
+else
   assert_eq '2' "$?" 'ECMP is rejected instead of pinning one nexthop'
-route_commands 192.0.2.0/24 'initcwnd 32' >/dev/null 2>&1 && fail 'existing exact route must be rejected' || \
+fi
+if route_commands 192.0.2.0/24 'initcwnd 32' >/dev/null 2>&1; then
+  fail 'existing exact route must be rejected'
+else
   assert_eq '3' "$?" 'existing exact routes are never overwritten'
+fi
 unset -f ip
 
 # ── BBR 版本判定 ───────────────────────────────────────────────────────────

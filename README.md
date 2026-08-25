@@ -109,7 +109,7 @@ routetune 不复制 tcpfit 的全局调优模型，但采用了两个测量原�
 ```bash
 bash -n routetune.sh tests/self-test.sh
 bash tests/self-test.sh
-shellcheck routetune.sh tests/self-test.sh
+shellcheck -x -P SCRIPTDIR routetune.sh tests/self-test.sh
 ```
 
 测试覆盖真机 4G/policer 分类、时变无丢包链路、窗口增量、加权重传、IPv4-mapped 与 IPv6 `/64`、空闲连接闸门、路由上下文复制、ECMP/已有路由拒绝，以及 BBR/DSACK 解释。

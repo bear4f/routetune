@@ -74,6 +74,7 @@ GROUP_BY=net
 #   key  peer  cc  rtt  rttvar  minrtt  retrans  data_segs_out  mbps  cwnd
 # `ss` prints a socket line followed by an indented info line, and drops the
 # State column when a state filter is used, so both layouts are handled.
+# shellcheck disable=SC2016 # awk program; shell expansion is intentionally disabled
 SS_PARSE_AWK='
 function tomb(v,   n) {
   n = v + 0
@@ -153,6 +154,7 @@ ss_parse() { awk -v listen="${1:- }" "$SS_PARSE_AWK"; }
 # Aggregates the sample rows into one line per peer. Retransmissions are a
 # delta between the first and last sighting of each connection, not a lifetime
 # average: a connection that had a bad minute an hour ago is not having one now.
+# shellcheck disable=SC2016 # awk program; shell expansion is intentionally disabled
 AGGREGATE_AWK='
 function sortarr(a, n,   i, j, t) {
   for (i = 2; i <= n; i++) { t = a[i]; j = i - 1
@@ -450,6 +452,7 @@ class_policy() {
 
 # Running totals per prefix, so a profile is what a peer looks like over
 # hours rather than what it looked like during one 30-second window.
+# shellcheck disable=SC2016 # awk program; shell expansion is intentionally disabled
 PROFILE_MERGE_AWK='
 BEGIN { FS = OFS = "\t" }
 # Existing database first, then the new observations.
@@ -529,8 +532,8 @@ cmd_scan() {
       *) die "未知参数：$1" ;;
     esac
   done
-  is_uint "$samples" && (( samples >= 2 && samples <= 60 )) || die "--samples 需为 2-60"
-  is_uint "$interval" && (( interval >= 1 && interval <= 60 )) || die "--interval 需为 1-60"
+  if ! is_uint "$samples" || (( samples < 2 || samples > 60 )); then die "--samples 需为 2-60"; fi
+  if ! is_uint "$interval" || (( interval < 1 || interval > 60 )); then die "--interval 需为 1-60"; fi
   [[ "$group" =~ ^(ip|net)$ ]] || die "--group 只能是 ip 或 net"
   has ss || die "缺少 ss；请安装 iproute2"
 
@@ -544,9 +547,9 @@ cmd_scan() {
 
   printf '\n  %b前缀                      连接 RTT50 RTT95  最低  抖动  膨胀  尾涨  重传%%  画像%b\n' "$BOLD" "$RESET"
   rule_light
-  local prefix conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir tail retrs
+  local prefix conns cc p50 p95 minrtt jit bloat rpct segs dir tail
   local spread class hidden=0 shown=0
-  while IFS=$'\t' read -r prefix conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir tail retrs; do
+  while IFS=$'\t' read -r prefix conns cc p50 p95 minrtt jit bloat rpct _ _ segs dir tail _; do
     if [[ "$dir" == out ]] && (( show_all == 0 )); then hidden=$((hidden + 1)); continue; fi
     shown=$((shown + 1))
     spread="$(row_spread "$p95" "$p50")"
@@ -579,9 +582,9 @@ cmd_watch() {
       *) die "未知参数：$1" ;;
     esac
   done
-  is_uint "$minutes" && (( minutes >= 1 && minutes <= 1440 )) || die "--minutes 需为 1-1440"
-  is_uint "$samples" && (( samples >= 2 && samples <= 60 )) || die "--samples 需为 2-60"
-  is_uint "$interval" && (( interval >= 1 && interval <= 60 )) || die "--interval 需为 1-60"
+  if ! is_uint "$minutes" || (( minutes < 1 || minutes > 1440 )); then die "--minutes 需为 1-1440"; fi
+  if ! is_uint "$samples" || (( samples < 2 || samples > 60 )); then die "--samples 需为 2-60"; fi
+  if ! is_uint "$interval" || (( interval < 1 || interval > 60 )); then die "--interval 需为 1-60"; fi
   [[ "$group" =~ ^(ip|net)$ ]] || die "--group 只能是 ip 或 net"
   has ss || die "缺少 ss；请安装 iproute2"
   local round_s=$((samples * interval)) rounds agg n=0 kept=0
@@ -612,6 +615,7 @@ cmd_watch() {
 # ── 画像与建议 ─────────────────────────────────────────────────────────────
 
 # Collapses the running totals back into per-prefix averages plus the class.
+# shellcheck disable=SC2016 # awk program; shell expansion is intentionally disabled
 PROFILE_VIEW_AWK='
 BEGIN { FS = OFS = "\t" }
 NR == 1 || $1 == "prefix" || $1 == "" { next }
@@ -701,7 +705,7 @@ cmd_recommend() {
       *) die "未知参数：$1" ;;
     esac
   done
-  is_uint "$min_obs" && (( min_obs >= 1 )) || die "--min-obs 需为正整数"
+  if ! is_uint "$min_obs" || (( min_obs < 1 )); then die "--min-obs 需为正整数"; fi
   rows="$(profile_rows)" || die "还没有画像，先跑：$PROGRAM watch --minutes 30"
   has ip || die "缺少 ip；请安装 iproute2"
 
@@ -711,9 +715,9 @@ cmd_recommend() {
   printf '  %b若已存在精确路由或检测到多路径，routetune 会拒绝生成命令，避免覆盖现网语义。%b\n' "$DIM" "$RESET"
   printf '  %b重启后失效（阶段一不做持久化），先手动跑一条看效果再说。%b\n\n' "$DIM" "$RESET"
 
-  local prefix obs p50 p95 mn jit bl tl rt sg mb cn sp class opts reason commands rc
+  local prefix obs p50 p95 mn jit bl tl rt sg sp class opts reason commands rc
   local emitted=0 few_obs=0 not_actionable=0 route_skipped=0
-  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg mb cn sp; do
+  while IFS=$'\t' read -r prefix obs p50 p95 mn jit bl tl rt sg _ _ sp; do
     if (( obs < min_obs )); then few_obs=$((few_obs + 1)); continue; fi
     class="$(classify_peer "$p50" "$jit" "$bl" "$tl" "$rt" "$sp" "$sg")"
     case "$class" in local|idle) not_actionable=$((not_actionable + 1)); continue ;; esac
@@ -822,7 +826,7 @@ cmd_doctor() {
 }
 
 cmd_reset() {
-  need_root "$@"
+  need_root reset
   [[ -e "$PROFILE_DB" ]] || { info "画像库本来就是空的"; return 0; }
   rm -f "$PROFILE_DB"
   log "已清空画像库"

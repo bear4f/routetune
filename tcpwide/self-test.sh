@@ -684,6 +684,28 @@ out="$(explain_cover_rtt 1000 2>&1)"
 [[ "$out" == *"单流因此封顶在约"* ]] || fail 'and the single-flow rate it leaves'
 [[ "$out" == *"二选一"* ]] || fail 'and that it is a trade, not a misconfiguration'
 pass 'a memory shortfall is stated with its cost rather than applied silently'
+# The figure is only as honest as the RTT it was computed at, and filling in a
+# worst case far above the real client population invents a shortfall that
+# exists on no path the machine serves. That is precisely how this box got
+# declared a 545 Mbps box while clearing a gigabit at 150ms, so the caveat
+# travels with the number.
+[[ "$out" == *"先确认"* ]] || fail 'a shortfall must name the RTT assumption it rests on'
+pass 'the shortfall states which coverage RTT produced it'
+# Being clamped is not being short. At 176ms the trimmed ceiling still supports
+# 1033 Mbps on a 1000 Mbps port: announcing a shortage there tells the operator
+# their machine cannot do what it plainly does.
+COVER_RTT_MS=176
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" != *"本该要"* ]] || fail 'a clamp that still clears the port is not a shortfall'
+pass 'a trimmed ceiling that still clears the port raises no shortfall'
+COVER_RTT_MS=250
+# The wizard's table and buffer_ceiling must agree about what is clamped. The
+# table computed its clamp once, up front, from RAM alone -- correct until the
+# budget started following the need, and silently wrong afterwards.
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" == *"43.3 MB/socket"* ]] || fail 'the wizard table must show the need-driven ceiling'
+[[ "$out" != *"32.5 MB/socket"* ]] || fail 'the wizard table must not use the pre-0.9.1 clamp'
+pass 'the wizard table agrees with buffer_ceiling about the ceiling'
 # A machine with room says nothing of the sort.
 total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }
 out="$(explain_cover_rtt 100 2>&1)"
@@ -707,3 +729,69 @@ unset -f has sysctl suggest_cover_rtt total_ram_bytes
 COVER_RTT_MS=250
 
 printf '%s\n' 'All tcpwide self-tests passed.'
+
+
+# ── 0.10.0 单流跑不满时，先问「哪一个才是真的天花板」 ──────────────────────
+# Three backends at 135/146/184 ms all topped out near 600 Mbps while the
+# configured window supported 1011/935/742. The buffer had headroom on every
+# one of them, so no amount of buffer tuning could have helped -- and the tool
+# said nothing that would have revealed that. Both probes below exist so the
+# next such measurement is read correctly the first time.
+
+# A ceiling that is not being reached is not the constraint.
+live_value() { printf '34123264\n'; }   # the 32.5 MB ceiling 0.9.0 applied
+IFS=$'\t' read -r sup _ pct <<< "$(window_headroom 146 639.7)"
+assert_eq '935' "$sup" 'the live ceiling supports 935 Mbps at 146 ms'
+(( pct < 75 )) || fail 'a flow at 68% of what the window allows is not window-limited'
+pass 'headroom against the live ceiling is reported, not assumed away'
+# And when a flow really is pinned to the window, it must not be waved off.
+IFS=$'\t' read -r sup _ pct <<< "$(window_headroom 146 920)"
+(( pct >= 75 )) || fail 'a flow at 98% of the window must read as window-limited'
+pass 'a genuinely window-limited flow still reads as one'
+unset -f live_value
+
+# A single flow through a userspace proxy runs on essentially one core, so the
+# aggregate figure hides the ceiling: the busiest core is the one that answers.
+# cpuN: user nice system idle iowait irq softirq steal
+stat_a=$'cpu0 100 0 100 1000 0 0 0 0\ncpu1 100 0 100 1000 0 0 0 0'
+stat_b=$'cpu0 200 0 200 1000 0 0 0 0\ncpu1 100 0 100 1200 0 0 0 0'
+IFS=$'\t' read -r bmax bavg bcores bsteal <<< "$(
+  printf '%s\n%s\n' "$stat_a" "$stat_b" | awk '
+    { busy = 0; tot = 0
+      for (i = 2; i <= NF; i++) { tot += $i; if (i != 5 && i != 6) busy += $i }
+      st = (NF >= 9) ? $9 : 0
+      if ($1 in seen) { d = tot - t[$1]
+        if (d > 0) { p = (busy - u[$1]) * 100 / d; sp = (st - v[$1]) * 100 / d
+          sum += p; n++; if (p > max) max = p; if (sp > maxst) maxst = sp } }
+      else { seen[$1] = 1; t[$1] = tot; u[$1] = busy; v[$1] = st } }
+    END { printf "%.0f\t%.0f\t%d\t%.0f", max, sum / n, n, maxst }')"
+assert_eq '100' "$bmax"   'cpu0 went from idle to fully busy'
+assert_eq '50'  "$bavg"   'the average hides it at 50%'
+assert_eq '2'   "$bcores" 'both cores are counted'
+assert_eq '0'   "$bsteal" 'no steal in this sample'
+# The whole point: the aggregate would have said the box was half idle.
+(( bmax >= 85 && bavg < 70 )) || fail 'this sample must trip the single-core warning'
+pass 'a pinned core is visible even when the average says half idle'
+
+# `mq` is one child qdisc per hardware TX queue, each with its own lock.
+# Replacing the root with a single fq funnels every queue through one lock --
+# invisible on a single-flow test, and the wrong trade for aggregate throughput.
+IFACE=eth0
+tc() {
+  [[ "$1" == qdisc && "$2" == show ]] || return 1
+  printf 'qdisc mq 8001: root\nqdisc fq 0: parent 8001:1 limit 10000p\nqdisc fq 0: parent 8001:2 limit 10000p\n'
+}
+assert_eq '8001:' "$(mq_root_handle)" 'the mq root handle is parsed for use as a leaf parent'
+assert_eq '2' "$(mq_leaves_with fq)" 'leaves carrying the pacer are counted'
+if mq_leaves_with cake >/dev/null 2>&1; then fail 'a kind no leaf carries must not match'; fi
+pass 'a qdisc kind absent from the leaves does not match'
+# And that layout is the intended one, so the panel must not nag about drift.
+SHAPE=0; EGRESS_MBPS=1000; COVER_RTT_MS=250
+if qdisc_drift >/dev/null 2>&1; then fail 'mq carrying fq leaves is the intended layout, not drift'; fi
+pass 'mq with fq leaves does not read as drift'
+# Shaping is the one case that still has to take the root: CAKE can only shape
+# what it can all see. An mq root there is real drift.
+SHAPE=1
+assert_eq 'mq' "$(qdisc_drift)" 'under shaping an mq root really is drift'
+SHAPE=0
+unset -f tc

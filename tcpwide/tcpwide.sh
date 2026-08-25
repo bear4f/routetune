@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.9.1"
+VERSION="0.10.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -638,11 +638,28 @@ report_link() {
 # reality is the normal state of a box that rebooted or that another tool
 # touched, and a panel that cannot see the difference will confidently report a
 # configuration that is not running.
+# Counts leaves of the mq root that carry the given qdisc kind.
+mq_leaves_with() {
+  local kind="${1:-}" handle
+  handle="$(mq_root_handle)"
+  [[ -n "$handle" ]] || return 1
+  tc qdisc show dev "$IFACE" 2>/dev/null |
+    awk -v k="$kind" -v h="$handle" \
+      '$1 == "qdisc" && $2 == k && $4 == "parent" && index($5, h) == 1 {n++}
+       END {if (n > 0) print n; else exit 1}'
+}
+
 qdisc_drift() {
   local want live
   want="$(target_qdisc "${EGRESS_MBPS:-200}" "$COVER_RTT_MS" | awk '{print $1}')"
   live="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | awk '{print $2}')"
   [[ -n "$live" ]] || return 1
+  # An mq root carrying the pacer on its leaves is the intended layout, not
+  # drift. Reporting it as drift would send the operator to press "apply" over
+  # and over on a configuration that is already correct.
+  if [[ "$live" == mq ]] && (( SHAPE == 0 )) && mq_leaves_with "$want" >/dev/null; then
+    return 1
+  fi
   [[ "$live" != "$want" ]] || return 1
   printf '%s\n' "$live"
 }
@@ -664,6 +681,61 @@ retrans_rate() {
   a=$(( rb - ra )); b=$(( sb - sa ))
   (( b > 0 )) || return 1
   awk -v r="$a" -v s="$b" 'BEGIN {printf "%.4f\n", r * 100 / s}'
+}
+
+# A single flow through a userspace proxy is handled by essentially one core:
+# one reader, one crypto path, one writer. So a box can be half idle in
+# aggregate and still be at its per-flow ceiling, and the aggregate figure that
+# `top` shows first is the one that hides it. Only the busiest core answers the
+# question.
+#
+# steal is reported separately because on a small VPS it is a common and
+# completely external cap: time the hypervisor gave to somebody else is
+# throughput this machine cannot buy back with any sysctl.
+#
+# Prints "busiest<TAB>average<TAB>cores<TAB>steal".
+busiest_core_pct() {
+  local secs="${1:-5}" a b
+  [[ -r /proc/stat ]] || return 1
+  a="$(awk '/^cpu[0-9]+ /' /proc/stat)" || return 1
+  [[ -n "$a" ]] || return 1
+  sleep "$secs"
+  b="$(awk '/^cpu[0-9]+ /' /proc/stat)" || return 1
+  printf '%s\n%s\n' "$a" "$b" | awk '
+    { busy = 0; tot = 0
+      # $5 idle, $6 iowait: neither is work this machine is doing.
+      for (i = 2; i <= NF; i++) { tot += $i; if (i != 5 && i != 6) busy += $i }
+      st = (NF >= 9) ? $9 : 0
+      if ($1 in seen) {
+        d = tot - t[$1]
+        if (d > 0) {
+          p = (busy - u[$1]) * 100 / d
+          sp = (st - v[$1]) * 100 / d
+          sum += p; n++
+          if (p > max) max = p
+          if (sp > maxst) maxst = sp
+        }
+      } else { seen[$1] = 1; t[$1] = tot; u[$1] = busy; v[$1] = st } }
+    END { if (n < 1) exit 1; printf "%.0f\t%.0f\t%d\t%.0f", max, sum / n, n, maxst }'
+}
+
+# Encoded because live data caught this reasoning error: a ceiling that is not
+# being reached is not the constraint. Three backends at 135/146/184 ms all
+# topped out near 600 Mbps while the configured window supported 1011/935/742 —
+# the buffer had headroom everywhere and raising it could not have helped.
+#
+# Prints "supported<TAB>observed<TAB>usedpct" for the live receive ceiling at
+# the given RTT.
+window_headroom() {
+  local rtt="${1:-0}" obs="${2:-0}" rmem
+  rmem="$(live_value net.core.rmem_max)"
+  is_uint "${rmem:-}" && (( rmem > 0 )) || return 1
+  awk -v r="$rmem" -v rtt="$rtt" -v obs="$obs" 'BEGIN {
+    if (rtt <= 0 || obs <= 0) exit 1
+    # tcp_adv_win_scale=1: the application gets half the buffer as window.
+    sup = (r / 2) * 8 / (rtt / 1000) / 1000000
+    if (sup <= 0) exit 1
+    printf "%.0f\t%.1f\t%.0f", sup, obs, obs * 100 / sup }'
 }
 
 # The kernel sizes tcp_mem from RAM, and it is a global page budget shared by
@@ -783,12 +855,78 @@ apply_sysctl() {
   (( n > 0 )) || info "所有 sysctl 都已经是目标值或更好，没有写入任何一项"
 }
 
+# `mq` is what the driver puts on a multiqueue NIC: one child qdisc per hardware
+# TX queue, each with its own lock, so cores do not serialise against each other
+# on transmit. Replacing the root with a single `fq` throws that away and funnels
+# every queue through one lock — invisible on a single-flow test, and exactly the
+# wrong trade on a small box trying to push aggregate throughput.
+#
+# So when the root is `mq` and we are only pacing, keep `mq` and put the pacer on
+# each leaf. Shaping is the one case that still has to take the root: CAKE can
+# only shape what it can all see, and that serialisation is the price of an AQM.
+mq_root_handle() {
+  tc qdisc show dev "$IFACE" 2>/dev/null |
+    awk '$1 == "qdisc" && $2 == "mq" && $4 == "root" {print $3; exit}'
+}
+
+tx_queue_count() {
+  local n=0 q
+  for q in /sys/class/net/"$IFACE"/queues/tx-*; do
+    [[ -d "$q" ]] && n=$(( n + 1 ))
+  done
+  printf '%s\n' "$n"
+}
+
+# Prints the number of leaves that took the spec. Fails if there is no mq root,
+# only one queue (nothing to preserve), or no leaf accepted it.
+apply_fq_leaves() {
+  local spec="$1" handle n i ok=0
+  handle="$(mq_root_handle)"
+  [[ -n "$handle" ]] || return 1
+  n="$(tx_queue_count)"
+  is_uint "$n" && (( n > 1 )) || return 1
+  split_words "$spec"
+  for (( i = 1; i <= n; i++ )); do
+    tc qdisc replace dev "$IFACE" parent "${handle}${i}" "${SPLIT_WORDS[@]}" 2>/dev/null \
+      && ok=$(( ok + 1 ))
+  done
+  (( ok > 0 )) || return 1
+  printf '%s\n' "$ok"
+}
+
+# The default route half of apply_link, split out so both the mq-leaf path and
+# the root path run exactly the same code rather than two copies that drift.
+apply_route() {
+  local cur_r want_r
+  cur_r="$(current_default_route)"
+  if ! route_is_simple "$cur_r"; then
+    warn "默认路由是多路径或不止一条，跳过首窗设置（错改默认路由会断连）"
+    return 0
+  fi
+  want_r="$(route_with_initcwnd "$cur_r" "$INITCWND")"
+  [[ "$cur_r" != "$want_r" ]] || return 0
+  [[ -e "$ROUTE_SNAP" ]] || { printf '%s\n' "$cur_r" > "$ROUTE_SNAP"; chmod 0600 "$ROUTE_SNAP"; }
+  split_words "$want_r"
+  if ip route replace "${SPLIT_WORDS[@]}" 2>/dev/null; then
+    log "默认路由首窗已设为 initcwnd $INITCWND"
+  else
+    warn "无法修改默认路由，首窗保持内核默认"
+  fi
+}
+
 apply_link() {
-  local rate="$1" rtt="$2" want_q cur_r want_r
+  local rate="$1" rtt="$2" want_q leaves
   want_q="$(target_qdisc "$rate" "$rtt")"
   if [[ ! -e "$QDISC_SNAP" ]]; then
     tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' > "$QDISC_SNAP" || true
     chmod 0600 "$QDISC_SNAP" 2>/dev/null || true
+  fi
+  if (( SHAPE == 0 )) && leaves="$(apply_fq_leaves "$want_q")"; then
+    log "根队列保持 mq，${leaves} 个发送队列各挂一份：$want_q"
+    printf '  %b每个硬件发送队列一个 pacer，各自一把锁——换成单个根 fq 会把它们串成一条。%b\n' \
+      "$DIM" "$RESET"
+    apply_route
+    return 0
   fi
   split_words "$want_q"
   local tc_err bad
@@ -810,20 +948,7 @@ apply_link() {
     fi
     return 0
   fi
-  cur_r="$(current_default_route)"
-  if ! route_is_simple "$cur_r"; then
-    warn "默认路由是多路径或不止一条，跳过首窗设置（错改默认路由会断连）"
-    return 0
-  fi
-  want_r="$(route_with_initcwnd "$cur_r" "$INITCWND")"
-  [[ "$cur_r" != "$want_r" ]] || return 0
-  [[ -e "$ROUTE_SNAP" ]] || { printf '%s\n' "$cur_r" > "$ROUTE_SNAP"; chmod 0600 "$ROUTE_SNAP"; }
-  split_words "$want_r"
-  if ip route replace "${SPLIT_WORDS[@]}" 2>/dev/null; then
-    log "默认路由首窗已设为 initcwnd $INITCWND"
-  else
-    warn "无法修改默认路由，首窗保持内核默认"
-  fi
+  apply_route
 }
 
 write_persistence() {
@@ -1000,24 +1125,32 @@ explain_cover_rtt() {
     printf '
   %b填大一点不是没有代价——它决定几条连接能同时吃满上限：%b
 ' "$DIM" "$RESET"
-    local r ram clamp knee
+    local r ram clamp knee rneed
     ram="$(total_ram_bytes)"
-    clamp="$(socket_budget_cap "$ram")"
+    # The clamp is not a constant: since 0.9.1 the global budget grows with the
+    # need, so it has to be evaluated at each RTT rather than once up front.
+    # Computing it once was how this table came to disagree with buffer_ceiling.
     for r in 100 250 400; do
       buf="$(buffer_ceiling "$rate" "$r")"
+      rneed=$(( $(bdp_bytes "$rate" "$r") * 2 + BUF_SLACK ))
+      clamp="$(socket_budget_cap "$ram" "$rneed")"
       printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%s%b
 '         "$DIM" "$r" "$(mb "$buf")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" \
-        "$( (( ram > 0 && buf >= clamp )) && printf '  <- 已被内存夹住' )" "$RESET"
+        "$( (( ram > 0 && rneed > clamp )) && printf '  <- 已被内存夹住' )" "$RESET"
     done
+    # Past this point the budget has grown as far as it will go (RAM/3), so the
+    # per-socket cap stops moving. Ask for it by naming a need nothing can
+    # satisfy, so the number comes from the same function that sizes buffers.
+    clamp="$(socket_budget_cap "$ram" "$ram")"
     # Two identical rows in that table read as "it makes no difference", when
     # what they actually mean is that the RAM clamp is already binding. Say so
     # rather than leaving the operator to notice the numbers repeat.
     if (( ram > 0 && rate > 0 )); then
       knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
       if (( knee >= 10 && knee <= 2000 )); then
-        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB%b\n' \
+        printf '\n  %b这台机器 %s MB 内存，单 socket 上限最多长到 %s MB%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
-        printf '  %b（全局 TCP 预算的 1/4，留出至少 4 条大流同时到顶的余地）。%b\n' "$DIM" "$RESET"
+        printf '  %b（全局 TCP 预算的 1/4；预算本身会跟着需求从内存的 1/4 长到 1/3）。%b\n' "$DIM" "$RESET"
         printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' "$DIM" "$knee" "$RESET"
         # The honest version of "capped": say what the link would need, what
         # memory allows, and what single-flow rate that leaves. On a small box
@@ -1025,15 +1158,28 @@ explain_cover_rtt() {
         # silently capping is how that becomes a mystery instead of a choice.
         local need cap_rate
         need=$(( $(bdp_bytes "$rate" "$COVER_RTT_MS") * 2 + BUF_SLACK ))
-        if (( need > clamp )); then
-          cap_rate="$(awk -v c="$clamp" -v r="$COVER_RTT_MS" \
-            'BEGIN {printf "%.0f", c / 2 * 8 / (r / 1000) / 1e6}')"
+        cap_rate="$(awk -v c="$clamp" -v r="$COVER_RTT_MS" \
+          'BEGIN {printf "%.0f", c / 2 * 8 / (r / 1000) / 1e6}')"
+        # Being clamped is not the same as being short. The ceiling carries a
+        # 2xBDP + 2MiB margin, so it can be trimmed and still support more than
+        # the port sells — announcing a shortfall there tells the operator their
+        # machine cannot do something it comfortably can. Only a real gap talks.
+        if (( need > clamp )) && (( cap_rate < rate * 85 / 100 )); then
           printf '\n  %b[!] %s Mbps × %s ms 本该要 %s MB 的上限，内存只给得起 %s MB。%b\n' \
             "$YELLOW" "$rate" "$COVER_RTT_MS" "$(mb "$need")" "$(mb "$clamp")" "$RESET"
           printf '  %b单流因此封顶在约 %s Mbps。内存不够是物理事实，不是配置错误——%b\n' \
             "$DIM" "$cap_rate" "$RESET"
           printf '  %b这台机器上「单流跑满 %s Mbps」和「多条大流并发」二选一。%b\n' \
             "$DIM" "$rate" "$RESET"
+          # This number is only as honest as the RTT it was computed at. Filling
+          # in a worst case far above the real client population manufactures a
+          # shortfall that does not exist on any path the machine actually
+          # serves — which is exactly how a box that clears a gigabit at 150ms
+          # got declared a 545 Mbps box at 250ms.
+          printf '  %b注意这个数是按你填的 %s ms 算的。覆盖 RTT 填得比真实客户端高，%b\n' \
+            "$YELLOW" "$COVER_RTT_MS" "$RESET"
+          printf '  %b就会凭空造出一个任何真实路径上都不存在的短缺——先确认 %s ms 是真的。%b\n' \
+            "$DIM" "$COVER_RTT_MS" "$RESET"
         fi
       fi
     fi
@@ -1317,12 +1463,44 @@ panel_diagnose() {
   else
     printf '  实时重传率:        无法采样（缺少 nstat 或窗口内没有流量）\n'
   fi
+  local bc bmax bavg bcores bsteal
+  printf '  %b正在采样 5 秒的每核占用…%b\n' "$DIM" "$RESET"
+  if bc="$(busiest_core_pct 5)"; then
+    IFS=$'\t' read -r bmax bavg bcores bsteal <<< "$bc"
+    printf '  CPU（5 秒窗口）:   最忙的核 %s%%｜%s 核平均 %s%%｜steal 峰值 %s%%\n' \
+      "$bmax" "$bcores" "$bavg" "$bsteal"
+    if (( bmax >= 85 )) && (( bavg < 70 )); then
+      warn "有单核接近打满而平均只有 ${bavg}% —— 单条连接在用户态代理里基本只用得到一个核"
+      printf '    %b这个天花板和 RTT 无关，所以调缓冲、调窗口都不会让它变快。%b\n' "$DIM" "$RESET"
+      printf '    %b验证：多线程测速。多线程能上去 = 每流受 CPU 限，服务端配置没问题。%b\n' "$DIM" "$RESET"
+    elif (( bmax >= 85 )); then
+      warn "所有核都接近打满 —— 这台机器的转发能力本身就到顶了"
+    fi
+    if (( bsteal >= 10 )); then
+      warn "steal ${bsteal}% —— 宿主机超售，这部分算力买不回来，调什么都没用"
+    fi
+  else
+    printf '  CPU（5 秒窗口）:   无法采样\n'
+  fi
   local win peer wrtt wbytes wceil wobs
   if win="$(peer_window_ceiling)"; then
     IFS=$'\t' read -r peer wrtt wbytes wceil wobs <<< "$win"
     printf '\n  %b最快的那条连接：%s%b\n' "$BOLD" "$peer" "$RESET"
     printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \
       "$wrtt" "$(mb "$wbytes")" "$wobs"
+    local hd hsup hpct
+    if hd="$(window_headroom "$wrtt" "$wobs")"; then
+      IFS=$'\t' read -r hsup _ hpct <<< "$hd"
+      printf '    %b本机缓冲在这条 %s ms 上支持 %s Mbps，实测只用到 %s%%%b\n' \
+        "$BOLD" "$wrtt" "$hsup" "$hpct" "$RESET"
+      if (( hpct < 75 )); then
+        printf '    %b→ 缓冲还有余量，它不是瓶颈。再往大调不会变快，先看上面的 CPU。%b\n' \
+          "$YELLOW" "$RESET"
+      else
+        printf '    %b→ 已经贴着缓冲上限跑，加大覆盖 RTT 或缓冲上限有望继续涨。%b\n' \
+          "$DIM" "$RESET"
+      fi
+    fi
     printf '    %b对端窗口决定的单流上限：%s Mbps%b\n' "$BOLD" "$wceil" "$RESET"
     printf '    %b单流不会超过「对端愿意收多少 ÷ 往返时间」。但对端窗口是自动伸缩的：%b\n' \
       "$DIM" "$RESET"
@@ -1333,6 +1511,9 @@ panel_diagnose() {
     printf '    %b真正判定看多线程：多线程到线速而单线程到不了，才是对端窗口的锅。%b\n' \
       "$DIM" "$RESET"
   fi
+  printf '\n  %b跨后端判据（拿几个 RTT 差得远的后端各测一次）：%b\n' "$BOLD" "$RESET"
+  printf '    %b受窗口限 → 速率 ∝ 1/RTT，RTT 大的明显慢。%b\n' "$DIM" "$RESET"
+  printf '    %b受 CPU 限 → 各后端峰值几乎一样，跟 RTT 没关系。%b\n' "$DIM" "$RESET"
   printf '\n  根队列:            %s\n' \
     "$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //')"
   if drift="$(qdisc_drift)"; then

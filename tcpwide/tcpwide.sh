@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.10.0"
+VERSION="0.11.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -107,6 +107,21 @@ ASSUME_YES=0
 # mechanism predicts and matches the usual server guidance of 128KB, so it is
 # the default rather than a claim. Set it to 0 to keep the system value.
 NOTSENT_LOWAT=131072
+
+# Which layout the pacer takes when not shaping.
+#
+# `root`      one `fq` on the interface root. One write, one failure mode, and
+#             every packet is paced. This is the layout that was measured.
+# `mq-leaves` keep the driver's `mq` root and hang an `fq` on each leaf, so the
+#             hardware TX queues keep their own locks. Better in theory for
+#             aggregate throughput, and N separate writes instead of one: any
+#             leaf that misses falls back to the kernel default and is paced by
+#             nothing at all.
+#
+# 0.10.0 shipped `mq-leaves` as the default on reasoning alone, and three
+# backends lost 42-47% together. Reasoning does not get to set defaults here;
+# measurement does. It stays available so it can be A/B'd, not deleted.
+QDISC_LAYOUT=root
 # 0 means "derive it". An explicit value in MB overrides the whole derivation.
 #
 # netshape's RAM ladder exists because oversized buffers let BBR hold a huge
@@ -323,6 +338,13 @@ target_sysctl() {
   cc="$(pick_cc "$(available_cc)")"
   printf 'net.ipv4.tcp_congestion_control\t%s\texact\t%s\n' "$cc" \
     '丢包型算法每丢一次砍一次窗，无线链路上永远起不来；BBR 不把随机丢包当拥塞信号'
+  # BBR needs a pacer. The root qdisc is set explicitly, but any queue the
+  # kernel creates on its own -- an mq leaf, a new interface, a queue count
+  # change -- takes this instead, and the stock value paces nothing. A queue
+  # without pacing sends cwnd-sized bursts at line rate for the next policer to
+  # drop, which is precisely the failure the mq layout could produce.
+  printf 'net.core.default_qdisc\tfq\texact\t%s\n' \
+    'BBR 必须配 pacing；内核自己新建的队列走这个默认值，装好的默认值不做 pacing'
   printf 'net.core.rmem_max\t%s\traise\t%s\n' "$buf" \
     "接收缓冲上限，按覆盖 RTT ${rtt}ms × ${rate}Mbps 的 BDP 两倍算"
   printf 'net.core.wmem_max\t%s\traise\t%s\n' "$buf" '发送缓冲上限，同上'
@@ -488,6 +510,7 @@ load_config() {
       NOTSENT_LOWAT) is_uint "$value" && (( value <= 16777216 )) && NOTSENT_LOWAT="$value" ;;
       BUF_MB)       is_uint "$value" && (( value <= 512 )) && BUF_MB="$value" ;;
       PROFILE)      [[ "$value" =~ ^(stable|balanced|speed|noshape|custom)$ ]] && PROFILE="$value" ;;
+      QDISC_LAYOUT) [[ "$value" =~ ^(root|mq-leaves)$ ]] && QDISC_LAYOUT="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
@@ -513,6 +536,7 @@ save_config() {
     printf 'NOTSENT_LOWAT=%s\n' "$NOTSENT_LOWAT"
     printf 'BUF_MB=%s\n'        "$BUF_MB"
     printf 'PROFILE=%s\n'      "$PROFILE"
+    printf 'QDISC_LAYOUT=%s\n' "$QDISC_LAYOUT"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
@@ -638,15 +662,23 @@ report_link() {
 # reality is the normal state of a box that rebooted or that another tool
 # touched, and a panel that cannot see the difference will confidently report a
 # configuration that is not running.
-# Counts leaves of the mq root that carry the given qdisc kind.
+# Counts leaves of the mq root carrying the given kind, and succeeds only when
+# EVERY transmit queue has one. Accepting any non-zero count let a machine with
+# one paced queue out of four report itself as consistent -- the same partial
+# state apply_fq_leaves used to create, made invisible to the drift check that
+# should have caught it.
 mq_leaves_with() {
-  local kind="${1:-}" handle
+  local kind="${1:-}" handle n want
   handle="$(mq_root_handle)"
   [[ -n "$handle" ]] || return 1
-  tc qdisc show dev "$IFACE" 2>/dev/null |
+  want="$(tx_queue_count)"
+  is_uint "$want" && (( want > 0 )) || return 1
+  n="$(tc qdisc show dev "$IFACE" 2>/dev/null |
     awk -v k="$kind" -v h="$handle" \
       '$1 == "qdisc" && $2 == k && $4 == "parent" && index($5, h) == 1 {n++}
-       END {if (n > 0) print n; else exit 1}'
+       END {print n + 0}')"
+  is_uint "$n" && (( n == want )) || return 1
+  printf '%s\n' "$n"
 }
 
 qdisc_drift() {
@@ -869,29 +901,73 @@ mq_root_handle() {
     awk '$1 == "qdisc" && $2 == "mq" && $4 == "root" {print $3; exit}'
 }
 
+# An unmatched glob leaves the literal pattern in $q, so the -d test fails. As
+# the last command in the loop body that made the whole function return non-zero
+# under errexit -- masked today only because every caller happens to run it in
+# an `if` condition. A dud mine is still a mine.
 tx_queue_count() {
   local n=0 q
   for q in /sys/class/net/"$IFACE"/queues/tx-*; do
-    [[ -d "$q" ]] && n=$(( n + 1 ))
+    if [[ -d "$q" ]]; then n=$(( n + 1 )); fi
   done
   printf '%s\n' "$n"
 }
 
+# All or nothing. A leaf that does not take the spec keeps whatever the kernel
+# put there -- `fq_codel` or `pfifo_fast`, neither of which paces anything -- and
+# BBR on an unpaced queue sends cwnd-sized bursts at line rate for a downstream
+# policer to drop. Half a machine paced is worse than none of it paced, because
+# it is intermittent and looks like the network.
+#
+# The previous version accepted `ok > 0` and printed "done". Any leaf that fails
+# now rolls back the ones already written and reports failure, so the caller
+# falls back to the single root fq that cannot be partially applied.
+#
 # Prints the number of leaves that took the spec. Fails if there is no mq root,
-# only one queue (nothing to preserve), or no leaf accepted it.
+# only one queue (nothing to preserve), or any leaf refused it.
 apply_fq_leaves() {
-  local spec="$1" handle n i ok=0
+  local spec="$1" handle n i j ok=0
   handle="$(mq_root_handle)"
   [[ -n "$handle" ]] || return 1
   n="$(tx_queue_count)"
   is_uint "$n" && (( n > 1 )) || return 1
   split_words "$spec"
   for (( i = 1; i <= n; i++ )); do
-    tc qdisc replace dev "$IFACE" parent "${handle}${i}" "${SPLIT_WORDS[@]}" 2>/dev/null \
-      && ok=$(( ok + 1 ))
+    if tc qdisc replace dev "$IFACE" parent "${handle}${i}" "${SPLIT_WORDS[@]}" 2>/dev/null; then
+      ok=$(( ok + 1 ))
+    else
+      # Undo the partial state before handing back to the root path.
+      for (( j = 1; j <= ok; j++ )); do
+        tc qdisc del dev "$IFACE" parent "${handle}${j}" 2>/dev/null || true
+      done
+      return 1
+    fi
   done
-  (( ok > 0 )) || return 1
+  (( ok == n )) || return 1
   printf '%s\n' "$ok"
+}
+
+# What is ACTUALLY on the interface after writing, read back from the kernel.
+#
+# Every "已设为" line before this was printed off `tc`'s exit code, which says a
+# command was accepted, not that the interface ended up in the intended shape.
+# That is the same class of bug as the panel printing a target value as though
+# it were live, and it cost a whole round of analysis built on a number that had
+# never applied. So the tool states the live layout, and if it disagrees with
+# what was asked for it says so instead of claiming success.
+live_qdisc_layout() {
+  local root leaves handle
+  root="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //')"
+  [[ -n "$root" ]] || return 1
+  handle="$(mq_root_handle)"
+  if [[ -n "$handle" ]]; then
+    leaves="$(tc qdisc show dev "$IFACE" 2>/dev/null |
+      awk -v h="$handle" '$1 == "qdisc" && $4 == "parent" && index($5, h) == 1 {
+        print $2 }' | sort | uniq -c | awk '{printf "%s×%s ", $1, $2}')"
+    printf 'mq root ← %s\n' "${leaves:-（没有叶子）}"
+    return 0
+  fi
+  printf '%s\n' "$root"
 }
 
 # The default route half of apply_link, split out so both the mq-leaf path and
@@ -914,6 +990,44 @@ apply_route() {
   fi
 }
 
+# One line that identifies exactly which configuration is running, built from
+# LIVE values rather than intended ones.
+#
+# Working out which build produced a given speedtest took a `git diff` between
+# two released versions, because a screenshot of a result carries nothing about
+# the configuration that produced it. Pasted next to a measurement, this line
+# makes attribution a lookup instead of an argument.
+config_fingerprint() {
+  local cc buf layout cwnd
+  cc="$(live_value net.ipv4.tcp_congestion_control)"
+  buf="$(live_value net.core.rmem_max)"
+  layout="$(live_qdisc_layout 2>/dev/null || printf '?')"
+  cwnd="$(current_default_route | grep -o 'initcwnd [0-9]*' | awk '{print $2}')"
+  printf '%s %s ｜ %s ｜ rmem %s MB ｜ %s ｜ initcwnd %s ｜ cover %s ms\n' \
+    "$PROGRAM" "$VERSION" "${cc:-?}" "$(mb "${buf:-0}")" "$layout" \
+    "${cwnd:-内核默认}" "$COVER_RTT_MS"
+}
+
+# Print the live layout beside what was asked for, and flag any disagreement.
+report_live_qdisc() {
+  local want="${1:-}" live
+  live="$(live_qdisc_layout)" || { warn "无法回读队列，手动检查 tc qdisc show dev $IFACE"; return 0; }
+  printf '  %b实际生效：%s%b\n' "$DIM" "$live" "$RESET"
+  # Only the kind is compared: tc prints its own defaults (limit, flow_limit,
+  # quantum) that were never asked for, so a full string match would cry wolf
+  # on every correct application.
+  local want_kind live_kind
+  want_kind="$(awk '{print $1}' <<< "$want")"
+  live_kind="$(awk '{print $1}' <<< "$live")"
+  if [[ "$live_kind" == mq ]]; then
+    if mq_leaves_with "$want_kind" >/dev/null; then return 0; fi
+    warn "mq 的叶子没有全部挂上 $want_kind —— 没挂上的那些队列完全没有 pacing"
+    return 0
+  fi
+  [[ "$live_kind" == "$want_kind" ]] && return 0
+  warn "回读到的是 $live_kind，不是 $want_kind —— 写入被接受了但没有生效"
+}
+
 apply_link() {
   local rate="$1" rtt="$2" want_q leaves
   want_q="$(target_qdisc "$rate" "$rtt")"
@@ -921,10 +1035,12 @@ apply_link() {
     tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' > "$QDISC_SNAP" || true
     chmod 0600 "$QDISC_SNAP" 2>/dev/null || true
   fi
-  if (( SHAPE == 0 )) && leaves="$(apply_fq_leaves "$want_q")"; then
+  if (( SHAPE == 0 )) && [[ "$QDISC_LAYOUT" == mq-leaves ]] \
+     && leaves="$(apply_fq_leaves "$want_q")"; then
     log "根队列保持 mq，${leaves} 个发送队列各挂一份：$want_q"
     printf '  %b每个硬件发送队列一个 pacer，各自一把锁——换成单个根 fq 会把它们串成一条。%b\n' \
       "$DIM" "$RESET"
+    report_live_qdisc "$want_q"
     apply_route
     return 0
   fi
@@ -932,6 +1048,7 @@ apply_link() {
   local tc_err bad
   if tc_err="$(tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>&1)"; then
     log "根队列已设为：$want_q"
+    report_live_qdisc "$want_q"
   else
     warn "无法设置根队列：tc qdisc replace dev $IFACE root $want_q"
     [[ -z "$tc_err" ]] || printf '  %btc 报错：%s%b\n' "$DIM" "$tc_err" "$RESET"
@@ -1006,6 +1123,7 @@ cmd_apply() {
   apply_link "$rate" "$rtt"
   (( PERSIST == 1 )) && write_persistence "$rate" "$rtt"
   printf '\n'
+  printf '  %b指纹:%b %s\n' "$BOLD" "$RESET" "$(config_fingerprint)"
   log "完成。$PROGRAM status 看状态，$PROGRAM revert 完整还原"
   (( PERSIST == 0 )) && printf '  %b没有持久化：重启后 sysctl 和根队列都会回到原样。要持久化加 --persist%b\n' \
     "$DIM" "$RESET"
@@ -1024,6 +1142,8 @@ cmd_status() {
   fi
   printf '  持久化:            %s\n' \
     "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '是' || printf '否（重启后失效）' )"
+  printf '  %b指纹:%b              %s\n' "$BOLD" "$RESET" "$(config_fingerprint)"
+  printf '  %b测速截图旁边贴这一行，就不用再靠版本号猜测的是哪份配置。%b\n' "$DIM" "$RESET"
   printf '\n'
   render_plan "$rate" "$rtt"
   report_link "$rate" "$rtt"
@@ -1340,6 +1460,7 @@ render_panel() {
   # exactly how an analysis ends up resting on a number that never applied.
   local live_buf; live_buf="$(live_value net.core.rmem_max)"
   title 'tcpwide 调优面板'
+  printf '  %b%s%b\n\n' "$DIM" "$(config_fingerprint)" "$RESET"
   if (( SHAPE == 1 )); then
     printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
       "${EGRESS_MBPS:-未设置}" "$DIM" "$SHAPE_PCT" \
@@ -1422,6 +1543,10 @@ render_panel() {
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
+  printf '    %bl)%b 队列布局%b（当前：%s%s）%b\n' "$BOLD" "$RESET" "$DIM" \
+    "$QDISC_LAYOUT" \
+    "$( [[ "$QDISC_LAYOUT" == root ]] && printf '，有实测支撑' || printf '，未经实测' )" \
+    "$RESET"
   printf '    %ba)%b 重新应用（重启后或队列被覆盖时用）\n' "$BOLD" "$RESET"
   printf '    %bp)%b 持久化开关%b（当前：%s）%b\n' "$BOLD" "$RESET" "$DIM" \
     "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '开' || printf '关' )" "$RESET"
@@ -1531,6 +1656,20 @@ panel_diagnose() {
   render_plan "${EGRESS_MBPS:-200}" "$COVER_RTT_MS"
 }
 
+# The layout is a knob rather than a decision so it can be A/B'd on the machine
+# that actually cares. Flipping it re-applies, so an A/B/A run is three presses.
+panel_toggle_layout() {
+  if [[ "$QDISC_LAYOUT" == root ]]; then
+    QDISC_LAYOUT=mq-leaves
+    warn "切到 mq 挂叶子。这是没有实测支撑的那个布局——0.10.0 把它设成默认时三个后端齐掉 44%"
+  else
+    QDISC_LAYOUT=root
+    log "切回根 fq（有实测支撑的布局）"
+  fi
+  save_config
+  cmd_apply
+}
+
 panel_toggle_persist() {
   if [[ -e "$PERSIST_SYSCTL" ]]; then
     rm -f "$PERSIST_SYSCTL"
@@ -1606,6 +1745,7 @@ menu() {
         ;;
       8) run_action panel_diagnose ;;
       9) run_action cmd_plan ;;
+      l|L) run_action panel_toggle_layout ;;
       a|A) run_action panel_reapply ;;
       p|P) run_action panel_toggle_persist ;;
       r|R) run_action cmd_revert ;;

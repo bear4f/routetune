@@ -436,13 +436,17 @@ assert_eq '8' "${#SPLIT_WORDS[@]}" 'a route spec splits into its individual argu
 
 # End to end: the words must reach the command, not just the helper.
 argc_file="$(mktemp)"
-tc() { printf '%s\n' "$#" > "$argc_file"; return 0; }
+# Every call is recorded, not just the last: apply_link also reads the layout
+# back after writing it, and a mock that keeps only the final call would report
+# the read rather than the write.
+tc() { printf '%s\n' "$#" >> "$argc_file"; return 0; }
 ip() { printf 'default via 10.0.0.1 dev eth0\n'; }
 has() { [[ "$1" == tc || "$1" == ip ]]; }
 QDISC_SNAP="$(mktemp -d)/qdisc"; ROUTE_SNAP="$(mktemp -d)/route"
 apply_link 500 250 >/dev/null 2>&1 || true
 # qdisc replace dev eth0 root + 7 spec words = 12
-assert_eq '12' "$(cat "$argc_file")" 'tc receives the qdisc spec as separate arguments'
+grep -qx '12' "$argc_file" || fail 'tc receives the qdisc spec as separate arguments'
+pass 'tc receives the qdisc spec as separate arguments'
 rm -f "$argc_file"
 unset -f tc ip has
 
@@ -776,7 +780,15 @@ pass 'a pinned core is visible even when the average says half idle'
 # `mq` is one child qdisc per hardware TX queue, each with its own lock.
 # Replacing the root with a single fq funnels every queue through one lock --
 # invisible on a single-flow test, and the wrong trade for aggregate throughput.
+# An unmatched glob leaves the literal pattern in the loop variable, and the
+# failing -d test as the last command in the body made the function return
+# non-zero under errexit.
+IFACE='definitely-not-an-interface'
+assert_eq '0' "$(tx_queue_count)" 'a missing interface counts zero queues rather than erroring'
 IFACE=eth0
+
+IFACE=eth0
+tx_queue_count() { printf '2\n'; }
 tc() {
   [[ "$1" == qdisc && "$2" == show ]] || return 1
   printf 'qdisc mq 8001: root\nqdisc fq 0: parent 8001:1 limit 10000p\nqdisc fq 0: parent 8001:2 limit 10000p\n'
@@ -786,7 +798,7 @@ assert_eq '2' "$(mq_leaves_with fq)" 'leaves carrying the pacer are counted'
 if mq_leaves_with cake >/dev/null 2>&1; then fail 'a kind no leaf carries must not match'; fi
 pass 'a qdisc kind absent from the leaves does not match'
 # And that layout is the intended one, so the panel must not nag about drift.
-SHAPE=0; EGRESS_MBPS=1000; COVER_RTT_MS=250
+SHAPE=0; EGRESS_MBPS=1000; COVER_RTT_MS=250; QDISC_LAYOUT=mq-leaves
 if qdisc_drift >/dev/null 2>&1; then fail 'mq carrying fq leaves is the intended layout, not drift'; fi
 pass 'mq with fq leaves does not read as drift'
 # Shaping is the one case that still has to take the root: CAKE can only shape
@@ -794,4 +806,96 @@ pass 'mq with fq leaves does not read as drift'
 SHAPE=1
 assert_eq 'mq' "$(qdisc_drift)" 'under shaping an mq root really is drift'
 SHAPE=0
+
+# ── 0.11.0 半套 pacing 比没有 pacing 更糟 ──────────────────────────────────
+# A leaf without fq is paced by nothing, and BBR on an unpaced queue sends
+# cwnd-sized bursts at line rate for the next policer to drop. Accepting any
+# non-zero leaf count reported such a machine as consistent, hiding exactly the
+# state apply_fq_leaves used to be able to create.
+tc() {
+  [[ "$1" == qdisc && "$2" == show ]] || return 1
+  printf 'qdisc mq 8001: root\nqdisc fq 0: parent 8001:1 limit 10000p\nqdisc fq_codel 0: parent 8001:2 limit 10240p\n'
+}
+if mq_leaves_with fq >/dev/null 2>&1; then fail 'one paced leaf out of two is not a paced machine'; fi
+pass 'a partially paced mq root does not count as carrying the pacer'
+QDISC_LAYOUT=mq-leaves
+assert_eq 'mq' "$(qdisc_drift)" 'a half-paced mq root reads as drift'
 unset -f tc
+
+# All or nothing: a leaf that refuses the spec rolls back the ones already
+# written, so the caller falls back to the single root fq that cannot be
+# partially applied. The old code took ok>0 and printed "done".
+IFACE=eth0
+tx_queue_count() { printf '4\n'; }
+mq_root_handle() { printf '8001:\n'; }
+tc_log="$(mktemp)"
+# "$*" joins on the FIRST character of IFS, and the script runs under
+# IFS=$'\n\t' -- a mock that matches on spaces silently matches nothing. This
+# trap has now bitten this codebase four times, so the mock pins IFS itself.
+tc() {
+  local IFS=' '
+  printf '%s\n' "$*" >> "$tc_log"
+  # The third leaf refuses, as a queue count mismatch would make it.
+  # qdisc replace dev eth0 parent 8001:N ... -> the handle is the sixth word.
+  [[ "$1" == qdisc && "$2" == replace && "$6" == '8001:3' ]] && return 1
+  return 0
+}
+if apply_fq_leaves 'fq maxrate 980mbit' >/dev/null 2>&1; then
+  fail 'a refused leaf must fail the whole application'
+fi
+pass 'one refused leaf fails the whole mq application'
+assert_eq '2' "$(grep -c 'qdisc del dev eth0 parent' "$tc_log")" \
+  'the two leaves already written are rolled back'
+rm -f "$tc_log"
+# unset -f cannot restore a shadowed definition, so only the mock that later
+# blocks redefine is dropped here.
+unset -f tc
+
+# The default layout is the measured one. 0.10.0 shipped mq-leaves as the
+# default on reasoning alone and three backends lost 42-47% together, so an mq
+# root must still get a single root fq unless the layout is explicitly chosen.
+IFACE=eth0
+QDISC_LAYOUT=root; SHAPE=0
+root_log="$(mktemp)"
+tc() {
+  local IFS=' '
+  if [[ "$1" == qdisc && "$2" == show ]]; then printf 'qdisc mq 8001: root\n'; return 0; fi
+  printf '%s\n' "$*" >> "$root_log"; return 0
+}
+ip() { printf 'default via 10.0.0.1 dev eth0\n'; }
+has() { [[ "$1" == tc || "$1" == ip ]]; }
+QDISC_SNAP="$(mktemp -d)/qdisc"; ROUTE_SNAP="$(mktemp -d)/route"
+apply_link 1000 250 >/dev/null 2>&1 || true
+grep -q 'qdisc replace dev eth0 root fq' "$root_log" \
+  || fail 'the default layout must take the root even when mq is there'
+if grep -q 'parent 8001:' "$root_log"; then fail 'the default layout must not touch mq leaves'; fi
+pass 'the default layout is root fq even on an mq-rooted interface'
+rm -f "$root_log"
+unset -f tc ip has
+
+# A screenshot of a speedtest carries nothing about the configuration that
+# produced it, which is why attributing a 44% regression needed a git diff
+# between two releases. The fingerprint makes that a lookup.
+live_value() { case "$1" in
+  net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
+  net.core.rmem_max) printf '45438293\n' ;;
+esac; }
+live_qdisc_layout() { printf 'fq maxrate 980mbit\n'; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
+COVER_RTT_MS=176
+fp="$(config_fingerprint)"
+for want in "$VERSION" bbr 43.3 'fq maxrate 980mbit' 'initcwnd 20' '176 ms'; do
+  [[ "$fp" == *"$want"* ]] || fail "the fingerprint must carry $want"
+done
+pass 'the fingerprint identifies version, cc, buffer, layout, initcwnd and coverage'
+unset -f live_value live_qdisc_layout current_default_route
+
+# BBR without a pacer bursts at line rate. The root qdisc is set explicitly, but
+# any queue the kernel makes on its own takes default_qdisc, and the stock value
+# paces nothing.
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+tgt="$(target_sysctl 500 250)"
+assert_eq 'fq' "$(awk -F'\t' '$1 == "net.core.default_qdisc" {print $2}' <<< "$tgt")" \
+  'queues the kernel creates itself must pace by default'
+QDISC_LAYOUT=root

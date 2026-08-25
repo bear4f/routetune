@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.8.1"
+VERSION="0.9.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -65,6 +65,9 @@ need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行：sudo $P
 # so the floor is deliberately generous. Intercontinental paths run 150-280ms;
 # a mobile client on a moving vehicle is worse still.
 COVER_RTT_MS=250
+# Below this, a "farthest client" measurement is describing the datacentre, not
+# the client population, and must not be turned into a coverage figure.
+LOCAL_RTT_SAMPLE_MS=20
 # Shaping below the provider's own limit is the point: their policer drops
 # bursts, a local AQM queues and marks them. Giving up a slice of peak buys
 # that, and buys the fairness that only exists when the queue is ours.
@@ -235,31 +238,32 @@ target_tcp_mem() {
     printf "%d %d %d", low, pres, max }'
 }
 
-# netshape's field-proven ladder. Its reason is the mirror image of tcpfit's
-# asymmetry argument rather than a contradiction of it.
+# How much one socket may take of the global TCP budget. The budget itself is a
+# quarter of RAM (see target_tcp_mem), so this works out to RAM/16 and leaves
+# room for four large flows before the kernel starts shrinking everyone.
 #
-# tcpfit tunes CLEAN links, where a ceiling that is too small is a silent cap
-# and one that is too large costs only a little overshoot. netshape tunes
-# POLICED cross-border links, and its comment is blunt: oversized buffers let
-# BBR hold a huge cwnd and retransmissions explode. Both are right in their own
-# domain, and a cross-border relay is squarely netshape's.
+# This replaces netshape's RAM ladder, which was adopted in 0.5.0 and has to be
+# withdrawn on the evidence.
 #
-# The arithmetic on the live 958 MB box makes it concrete. A 30 MB send buffer
-# lets BBR put 1472 Mbps in flight on a 171ms path — 2.9x a 500 Mbps line. BBRv1
-# does not back off on loss, so it keeps pushing that overshoot into whatever
-# drops it. This ladder holds the same box to 16 MB, or 1.6x.
-netshape_memory_cap() {
-  local mb="${1:-1024}"
-  if   (( mb < 512 ));  then printf '%s\n' $((8   * 1024 * 1024))
-  elif (( mb < 1024 )); then printf '%s\n' $((16  * 1024 * 1024))
-  elif (( mb < 2048 )); then printf '%s\n' $((32  * 1024 * 1024))
-  elif (( mb < 4096 )); then printf '%s\n' $((64  * 1024 * 1024))
-  else                       printf '%s\n' $((128 * 1024 * 1024))
-  fi
+# The ladder derives a ceiling from memory alone and knows nothing about the
+# port. On a 520 MB box with a 1 Gbps port it returns 16 MB, which advertises an
+# 8 MB window and caps a single flow at 450 Mbps on a 149ms path — it configures
+# a gigabit machine as though it were a 500 Mbps one. Measured there: 349 Mbps
+# peak against a gigabit port.
+#
+# And the ladder was never shown to help. It was adopted because netshape
+# outperformed tcpwide, but on that machine the ladder never applied at all —
+# `raise` refuses to lower, and the box was already above it. The gain was
+# fq maxrate. Meanwhile the thing the ladder guards against, BBR holding a huge
+# cwnd, is now bounded by per-flow pacing rather than by the window.
+socket_budget_cap() {
+  local ram="${1:-0}"
+  (( ram > 0 )) || { printf '0\n'; return 0; }
+  printf '%s\n' $(( ram / 16 ))
 }
 
 buffer_ceiling() {
-  local rate="${1:-0}" rtt="${2:-0}" ram buf cap ladder
+  local rate="${1:-0}" rtt="${2:-0}" ram buf cap
   # An explicit figure skips both the derivation and the ladder: the point of
   # the override is to test the ladder, so the ladder must not clamp it back.
   if is_uint "$BUF_MB" && (( BUF_MB > 0 )); then
@@ -274,9 +278,7 @@ buffer_ceiling() {
   # against RAM directly, as this used to, let a single connection monopolise
   # the budget on a small box.
   if (( ram > 0 )); then
-    cap=$(( ram / 32 ))
-    ladder="$(netshape_memory_cap $(( ram / 1048576 )))"
-    (( ladder < cap )) && cap="$ladder"
+    cap="$(socket_budget_cap "$ram")"
     (( buf > cap )) && buf="$cap"
   fi
   (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
@@ -944,13 +946,22 @@ explain_cover_rtt() {
 ' "$DIM" "$RESET"
   if row="$(suggest_cover_rtt)"; then
     IFS=$'	' read -r sug max n <<< "$row"
-    printf '
-  %b实测：当前 %s 个活跃客户端里，最远的 RTT 是 %s ms%b
-'       "$GREEN" "$n" "$max" "$RESET"
-    printf '  %b建议填 %s（实测 ×1.2 后向上取整，给移动客户端留波动余量）%b
-'       "$GREEN" "$sug" "$RESET"
-    printf '  %b注意这是一次瞬时采样。如果刚好抓到某个客户端的尖峰，这个数会偏高。%b
-'       "$DIM" "$RESET"
+    printf '\n  %b实测：当前 %s 个活跃客户端里，最远的 RTT 是 %s ms%b\n' \
+      "$GREEN" "$n" "$max" "$RESET"
+    # Everything currently connected being nearby does not mean the population
+    # is. Suggesting 50ms because the only live sockets are same-datacentre is
+    # how a relay ends up capped for every real client it has.
+    if awk -v m="$max" -v f="$LOCAL_RTT_SAMPLE_MS" 'BEGIN {exit !(m < f)}'; then
+      printf '  %b[!] 全部都在 %s ms 以内 —— 这一刻连上的都是同机房或本地连接，%b\n' \
+        "$YELLOW" "$LOCAL_RTT_SAMPLE_MS" "$RESET"
+      printf '  %b不能代表你真实的客户端分布。按经验填：同区域 100，跨洋 250-300。%b\n' \
+        "$DIM" "$RESET"
+    else
+      printf '  %b建议填 %s（实测 ×1.2 后向上取整，给移动客户端留波动余量）%b\n' \
+        "$GREEN" "$sug" "$RESET"
+      printf '  %b注意这是一次瞬时采样。如果刚好抓到某个客户端的尖峰，这个数会偏高。%b\n' \
+        "$DIM" "$RESET"
+    fi
   else
     printf '
   %b当前没有活跃的入站连接，量不到。用 routetune scan 在有流量时看一次，%b
@@ -966,11 +977,7 @@ explain_cover_rtt() {
 ' "$DIM" "$RESET"
     local r ram clamp knee
     ram="$(total_ram_bytes)"
-    # Whichever of the two caps actually binds, so the marker and the knee
-    # below describe the rule the operator is really up against.
-    clamp=$(( ram / 32 ))
-    local ladder; ladder="$(netshape_memory_cap $(( ram / 1048576 )))"
-    (( ladder < clamp )) && clamp="$ladder"
+    clamp="$(socket_budget_cap "$ram")"
     for r in 100 250 400; do
       buf="$(buffer_ceiling "$rate" "$r")"
       printf '    %b%-4s ms → 上限 %5s MB/socket，约 %s 条满上限就触发全局 tcp_mem 压力%s%b
@@ -983,16 +990,26 @@ explain_cover_rtt() {
     if (( ram > 0 && rate > 0 )); then
       knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
       if (( knee >= 10 && knee <= 2000 )); then
-        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB。%b\n' \
+        printf '\n  %b这台机器 %s MB 内存，单 socket 上限被夹在 %s MB%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
-        if (( clamp == $(netshape_memory_cap $(( ram / 1048576 ))) )); then
-          printf '  %b这是 netshape 实战得出的档位：跨境线路上被限速时，缓冲给太大会让 BBR%b\n' \
-            "$DIM" "$RESET"
-          printf '  %b攒起巨大的 cwnd，超发的部分被丢掉，重传就爆了。%b\n' "$DIM" "$RESET"
-        else
-          printf '  %b（全局 TCP 预算的 1/8，保证至少 8 条大流能同时到顶）%b\n' "$DIM" "$RESET"
-        fi
+        printf '  %b（全局 TCP 预算的 1/4，留出至少 4 条大流同时到顶的余地）。%b\n' "$DIM" "$RESET"
         printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' "$DIM" "$knee" "$RESET"
+        # The honest version of "capped": say what the link would need, what
+        # memory allows, and what single-flow rate that leaves. On a small box
+        # with a fast port these genuinely cannot both be satisfied, and
+        # silently capping is how that becomes a mystery instead of a choice.
+        local need cap_rate
+        need=$(( $(bdp_bytes "$rate" "$COVER_RTT_MS") * 2 + BUF_SLACK ))
+        if (( need > clamp )); then
+          cap_rate="$(awk -v c="$clamp" -v r="$COVER_RTT_MS" \
+            'BEGIN {printf "%.0f", c / 2 * 8 / (r / 1000) / 1e6}')"
+          printf '\n  %b[!] %s Mbps × %s ms 本该要 %s MB 的上限，内存只给得起 %s MB。%b\n' \
+            "$YELLOW" "$rate" "$COVER_RTT_MS" "$(mb "$need")" "$(mb "$clamp")" "$RESET"
+          printf '  %b单流因此封顶在约 %s Mbps。内存不够是物理事实，不是配置错误——%b\n' \
+            "$DIM" "$cap_rate" "$RESET"
+          printf '  %b这台机器上「单流跑满 %s Mbps」和「多条大流并发」二选一。%b\n' \
+            "$DIM" "$rate" "$RESET"
+        fi
       fi
     fi
   fi

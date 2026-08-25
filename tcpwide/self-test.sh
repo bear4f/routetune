@@ -37,24 +37,25 @@ assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope stil
 # quarter of RAM, which puts the per-socket clamp at RAM/32. Clamping against
 # RAM directly let one connection monopolise the budget on a small box.
 total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
-assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 2000 1000)" \
-  'the field-proven ladder caps a small box below the budget rule'
+assert_eq "$((512 * 1024 * 1024 / 16))" "$(buffer_ceiling 2000 1000)" \
+  'one socket is held to a quarter of the global TCP budget'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 
-# tcpfit tunes clean links, where too small is a silent cap and too large costs
-# only overshoot. netshape tunes policed cross-border links, where oversized
-# buffers let BBR hold a huge cwnd and retransmissions explode. Both are right
-# in their own domain; a cross-border relay is netshape's, so the ladder wins
-# wherever it is stricter.
-assert_eq "$((16 * 1024 * 1024))" "$(netshape_memory_cap 958)" \
-  'a sub-1GB box is held to 16 MB'
-assert_eq "$((32 * 1024 * 1024))" "$(netshape_memory_cap 1900)" 'a 2GB-class box gets 32 MB'
-assert_eq "$((128 * 1024 * 1024))" "$(netshape_memory_cap 16000)" 'a large box gets the top rung'
-# The live 958 MB box: 30 MB let BBR put 2.9x a 500 Mbps line in flight at
-# 171ms; 16 MB holds it to 1.6x.
-total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
-assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
-  'the live box is held to the ladder rather than to RAM/32'
+# netshape's RAM ladder was adopted in 0.5.0 and is withdrawn here. It derives a
+# ceiling from memory alone and knows nothing about the port: on a 520 MB box
+# with a gigabit port it returns 16 MB, advertising an 8 MB window and capping a
+# single flow at 450 Mbps on a 149ms path. Measured there: 349 Mbps peak.
+#
+# It also never had supporting evidence. It was adopted because netshape
+# outperformed tcpwide, but on that machine `raise` refused to lower and the
+# ladder never applied at all — the gain was fq maxrate. And what it guarded
+# against, BBR holding a huge cwnd, is now bounded by per-flow pacing.
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+buf="$(buffer_ceiling 1000 250)"
+assert_eq "$((520 * 1024 * 1024 / 16))" "$buf" \
+  'a small box with a fast port is sized by budget, not by a RAM ladder'
+(( buf > 16 * 1024 * 1024 )) || fail 'the budget cap must beat the ladder it replaced here'
+pass 'the gigabit box gets more than the ladder would have allowed'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 assert_eq '475000' "$(shaped_kbit 500)" 'shaping leaves the configured headroom under the line rate'
 
@@ -368,12 +369,14 @@ assert_eq "$((958 * 1024 * 1024 / 4096 / 4))" "$tm_max" \
 [[ "$tm_low" -lt "$tm_pres" && "$tm_pres" -lt "$tm_max" ]] \
   || fail 'the three tcp_mem thresholds must be ordered'
 pass 'the tcp_mem thresholds are ordered low < pressure < max'
-# A per-socket ceiling above an eighth of the budget means fewer than eight
-# large flows fit, which is the case the clamp exists to prevent.
+# One socket takes at most a quarter of the budget, so four large flows still
+# fit before the kernel starts shrinking everyone. Four rather than eight
+# because on a small box with a fast port, eight would cap a single flow well
+# under the port — and tcp_mem itself is the backstop that prevents an OOM.
 buf="$(buffer_ceiling 500 250)"
-(( buf * 8 <= tm_max * 4096 )) \
-  || fail 'the ceiling must leave room for eight flows inside the global budget'
-pass 'eight flows at the ceiling fit inside the global budget'
+(( buf * 4 <= tm_max * 4096 )) \
+  || fail 'the ceiling must leave room for four flows inside the global budget'
+pass 'four flows at the ceiling fit inside the global budget'
 
 # ── 0.3.0 整形的 CPU 代价 ──────────────────────────────────────────────────
 # CAKE funnels the whole egress through one qdisc and does per-packet work. On a
@@ -426,24 +429,27 @@ unset -f tc ip has
 # On a 958 MB box at 500 Mbps the RAM/32 clamp binds at 234ms, so the cost table
 # printed identical ceilings for 250 and 400 and read as "it makes no
 # difference" — when it actually means the clamp is already binding.
-total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
-assert_eq "$(buffer_ceiling 500 250)" "$(buffer_ceiling 500 400)" \
+# The 520 MB box with a gigabit port: 1000 Mbps needs 61.6 MB at 250ms and
+# 97 MB at 400ms, and the budget allows 32.5 MB, so both clamp to the same
+# figure and a wider coverage RTT buys nothing.
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+assert_eq "$(buffer_ceiling 1000 250)" "$(buffer_ceiling 1000 400)" \
   'past the clamp a wider coverage RTT buys nothing'
 has() { [[ "$1" == sysctl ]]; }
-sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '15328\t30656\t61312\n'; }
-suggest_cover_rtt() { printf '250\t169\t14\n'; }
-out="$(explain_cover_rtt 500 2>&1)"
+sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '8330\t16661\t33323\n'; }
+suggest_cover_rtt() { printf '250\t177\t9\n'; }
+out="$(explain_cover_rtt 1000 2>&1)"
 [[ "$out" == *"已被内存夹住"* ]] || fail 'a clamped row must be marked as clamped'
 pass 'a clamped row in the cost table is marked'
-[[ "$out" == *"超过 117 ms 不会再增加缓冲"* ]] \
+[[ "$out" == *"不会再增加缓冲"* ]] \
   || fail 'the point where the clamp starts binding must be named'
-[[ "$out" == *"重传就爆了"* ]] \
-  || fail 'when the field ladder binds it must say why, not cite the budget rule'
-pass 'the binding rule explains itself rather than citing the wrong one'
+[[ "$out" == *"全局 TCP 预算的 1/4"* ]] \
+  || fail 'the binding rule must name itself'
+pass 'the binding rule explains which rule it is'
 pass 'the coverage RTT past which nothing changes is stated outright'
 # A box with room to spare must not claim a clamp it is nowhere near.
 total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }
-out="$(explain_cover_rtt 500 2>&1)"
+out="$(explain_cover_rtt 100 2>&1)"
 [[ "$out" != *"已被内存夹住"* ]] || fail 'an unclamped box must not be told it is clamped'
 pass 'a box with memory to spare reports no clamp'
 unset -f has sysctl suggest_cover_rtt total_ram_bytes
@@ -537,10 +543,11 @@ unset -f ss has
 # peak there. Overriding it is how that gets tested one variable at a time.
 total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
 BUF_MB=0
-assert_eq "$((16 * 1024 * 1024))" "$(buffer_ceiling 500 250)" 'auto still follows the ladder'
+assert_eq "$((500 * 125 * 250 * 2 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+  'auto derives from the envelope when the budget has room'
 BUF_MB=32
 # The override must skip the ladder, or testing the ladder would be impossible.
-assert_eq "$((32 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+assert_eq "$((32 * 1024 * 1024))" "$(buffer_ceiling 1000 400)" \
   'an explicit ceiling is not clamped back by the rule it exists to test'
 assert_eq "$((32 * 1024 * 1024))" "$(buffer_ceiling 10 10)" \
   'an explicit ceiling ignores the derivation entirely'
@@ -639,5 +646,42 @@ out="$( ( need_root() { :; }; cmd_install ) < /dev/null 2>&1 )" || true
 [[ "$out" != *"bash <(curl"* ]] || fail 'must not suggest a form sudo breaks'
 pass 'a non-interactive install demands its parameters and names the wizard form'
 EGRESS_MBPS=500
+
+
+# ── 0.9.0 内存不够时要明说，不能默默封顶 ───────────────────────────────────
+# 520 MB with a gigabit port cannot satisfy both a full-rate single flow at
+# 250ms (61.6 MB of ceiling) and room for concurrent flows. Capping silently is
+# how that becomes a mystery instead of a choice the operator made.
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+has() { [[ "$1" == sysctl ]]; }
+sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '8330\t16661\t33323\n'; }
+suggest_cover_rtt() { printf '250\t177\t9\n'; }
+COVER_RTT_MS=250
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" == *"本该要"* ]] || fail 'a shortfall must name the ceiling the link needed'
+[[ "$out" == *"单流因此封顶在约"* ]] || fail 'and the single-flow rate it leaves'
+[[ "$out" == *"二选一"* ]] || fail 'and that it is a trade, not a misconfiguration'
+pass 'a memory shortfall is stated with its cost rather than applied silently'
+# A machine with room says nothing of the sort.
+total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }
+out="$(explain_cover_rtt 100 2>&1)"
+[[ "$out" != *"本该要"* ]] || fail 'a box with room must not claim a shortfall'
+pass 'a box with room reports no shortfall'
+
+# ── 0.9.0 同机房采样不能当成覆盖 RTT ───────────────────────────────────────
+# On the gigabit box every live socket was same-datacentre, so the measurement
+# was 1 ms and the suggestion 50 — which would cap every real client it has.
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+suggest_cover_rtt() { printf '50\t1\t8\n'; }
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" == *"都在 20 ms 以内"* ]] || fail 'an all-local sample must be called out'
+[[ "$out" != *"建议填 50"* ]] || fail 'and must not be turned into a suggestion'
+pass 'an all-same-datacentre sample is refused as a coverage figure'
+suggest_cover_rtt() { printf '250\t177\t9\n'; }
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" == *"建议填 250"* ]] || fail 'a genuine remote sample still yields a suggestion'
+pass 'a real remote sample still produces a suggestion'
+unset -f has sysctl suggest_cover_rtt total_ram_bytes
+COVER_RTT_MS=250
 
 printf '%s\n' 'All tcpwide self-tests passed.'

@@ -446,4 +446,22 @@ fi
 pass 'a fully accepted spec reports nothing'
 unset -f tc has
 
+
+# ── 0.3.7 BBR 版本判定 ─────────────────────────────────────────────────────
+# BBRv3 has never been in mainline, so a stock kernel offering only "bbr" is
+# offering v1. But XanMod ships v3 under that same name, replacing the mainline
+# one, so the algorithm name alone cannot tell them apart and check would have
+# told a XanMod user they were on v1.
+assert_eq v1 "$(bbr_variant 'reno cubic bbr' '6.1.0-50-amd64')" \
+  'a stock Debian kernel offering only bbr is offering v1'
+assert_eq nonstock "$(bbr_variant 'reno cubic bbr' '6.6.7-x64v3-xanmod1')" \
+  'an out-of-tree kernel is not claimed to be v1 just because the name is bbr'
+assert_eq v3 "$(bbr_variant 'reno cubic bbr bbr3' '6.1.0-50-amd64')" \
+  'an explicit bbr3 wins over the kernel-provenance guess'
+assert_eq v2 "$(bbr_variant 'reno cubic bbr bbr2' '6.1.0-50-amd64')" 'bbr2 is recognised'
+assert_eq none "$(bbr_variant 'reno cubic' '6.1.0-50-amd64')" 'a kernel without BBR says so'
+[[ "$(bbr_variant_note v1)" == *"最大值滤波"* ]] \
+  || fail 'the v1 note must explain the stale bandwidth estimate'
+pass 'each variant carries an explanation of what it means'
+
 printf '%s\n' 'All tcpwide self-tests passed.'

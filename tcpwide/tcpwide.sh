@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.6"
+VERSION="0.3.7"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -130,6 +130,36 @@ pick_cc() {
     *" bbr "*)  printf 'bbr\n';  return 0 ;;
   esac
   printf 'cubic\n'
+}
+
+# BBRv3 has never been in mainline, so a stock kernel offering only "bbr" is
+# offering v1. But XanMod ships v3 UNDER THE NAME bbr, replacing the mainline
+# one — so the algorithm name alone cannot tell them apart, and no amount of
+# poking at modinfo helps either: the module carries no version field. The
+# kernel's provenance is the only available answer.
+bbr_variant() {
+  local avail=" ${1:-} " release="${2:-}"
+  [[ -n "$release" ]] || release="$(uname -r 2>/dev/null || printf '')"
+  case "$avail" in
+    *" bbr3 "*) printf 'v3\n'; return 0 ;;
+    *" bbr2 "*) printf 'v2\n'; return 0 ;;
+    *" bbr "*)  ;;
+    *) printf 'none\n'; return 0 ;;
+  esac
+  case "$release" in
+    *xanmod*|*XanMod*|*XANMOD*) printf 'nonstock\n' ;;
+    *) printf 'v1\n' ;;
+  esac
+}
+
+bbr_variant_note() {
+  case "${1:-}" in
+    v3) printf '%s\n' '显式的 bbr3 —— 会响应丢包和 ECN，ProbeRTT 也温和得多' ;;
+    v2) printf '%s\n' '显式的 bbr2' ;;
+    v1) printf '%s\n' 'BBRv1（主线内核只有 v1）—— 带宽估计是约 10 个 RTT 的最大值滤波，链路变差后会抱着旧估值继续超发' ;;
+    nonstock) printf '%s\n' '非主线内核，算法名仍是 bbr —— XanMod 就是把 v3 装成这个名字，光看名字分不出版本，查该内核的构建说明' ;;
+    *) printf '%s\n' '内核没有提供 BBR' ;;
+  esac
 }
 
 have_cake() {
@@ -577,11 +607,11 @@ cmd_check() {
   avail="$(available_cc)"; cc="$(pick_cc "$avail")"
   printf '  内核:              %s\n' "$(uname -r 2>/dev/null || printf 未知)"
   printf '  可用拥塞控制:      %s\n' "${avail:-未知}"
-  printf '  将会选用:          %s' "$cc"
+  printf '  将会选用:          %s\n' "$cc"
   case "$cc" in
-    bbr)   printf '  %b（主线只有 v1；容量剧变后估值滞后，对移动链路不利）%b\n' "$DIM" "$RESET" ;;
-    cubic) printf '  %b（内核没有 BBR。cubic 每丢一次砍一次窗，无线链路上会一直起不来）%b\n' "$YELLOW" "$RESET" ;;
-    *)     printf '\n' ;;
+    cubic) printf '  %b内核没有 BBR。cubic 每丢一次砍一次窗，无线链路上会一直起不来%b\n' \
+             "$YELLOW" "$RESET" ;;
+    *)     printf '  版本判定:          %s\n' "$(bbr_variant_note "$(bbr_variant "$avail")")" ;;
   esac
   resolve_iface
   printf '  出口网卡:          %s\n' "$IFACE"

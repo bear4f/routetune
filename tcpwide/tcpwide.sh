@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -85,6 +85,16 @@ IFACE=""
 SHAPE=1
 PERSIST=0
 ASSUME_YES=0
+# 0 means "leave whatever is there alone".
+#
+# This was briefly forced to 131072 on the theory that 16KB is only 0.33ms of
+# data at 400 Mbps and a userspace proxy cannot refill that fast. The mechanism
+# is real, but an A/B on the live node could not measure it: two runs of the
+# SAME config 14 minutes apart differed by 22% at the peak, which is larger
+# than the difference being tested. netshape picks 16384 deliberately for this
+# workload, so overriding it on an untested theory is not a defensible default.
+# It stays adjustable, and says so, rather than being decided here.
+NOTSENT_LOWAT=0
 
 total_ram_bytes() {
   local kb
@@ -206,13 +216,12 @@ target_sysctl() {
     printf 'net.ipv4.tcp_mem\t%s\traise\t%s\n' "$tcpmem" \
       '全局 TCP 页预算（所有 socket 共享）。rmem_max 只是天花板，这个才是内核硬拦的总量——它太小的话，上限调多大都没用，几条大流一上来就触发压力被缩回去'
   fi
-  # Sized for a userspace proxy, not for a seek-latency-sensitive origin. At
-  # 400 Mbps a 16KB allowance is 0.33ms of data: the process has to finish a
-  # whole wake/read/decrypt/write cycle inside that or the pipe runs dry. This
-  # used to be lower-only, which preserved exactly that 16KB on a box where the
-  # symptom was a single flow oscillating well under line rate.
-  printf 'net.ipv4.tcp_notsent_lowat\t131072\texact\t%s\n' \
-    '本机 socket 里允许堆多少未发送数据。给得太紧会让代理进程变成瓶颈——400Mbps 下 16KB 只够 0.33ms，进程稍慢一下管道就空了。要极致低延迟可以手动调小，代价是吞吐'
+  # Only emitted when the operator has chosen a value. See NOTSENT_LOWAT above
+  # for why this is not decided here.
+  if is_uint "$NOTSENT_LOWAT" && (( NOTSENT_LOWAT > 0 )); then
+    printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
+      '你手动指定的未发送数据上限。小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。这一项没有可靠的实测依据，两个方向都合理，所以由你定'
+  fi
   printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' \
     "$( (( $(total_ram_bytes) < 1024 * 1024 * 1024 )) && printf 4096 || printf 16384 )" \
     '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
@@ -300,6 +309,7 @@ load_config() {
       SHAPE_PCT)    is_uint "$value" && (( value >= 50 && value <= 100 )) && SHAPE_PCT="$value" ;;
       SHAPE)        [[ "$value" =~ ^[01]$ ]] && SHAPE="$value" ;;
       PERSIST)      [[ "$value" =~ ^[01]$ ]] && PERSIST="$value" ;;
+      NOTSENT_LOWAT) is_uint "$value" && (( value <= 16777216 )) && NOTSENT_LOWAT="$value" ;;
       PROFILE)      [[ "$value" =~ ^(stable|balanced|speed|noshape|custom)$ ]] && PROFILE="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
@@ -323,6 +333,7 @@ save_config() {
     printf 'SHAPE_PCT=%s\n'    "$SHAPE_PCT"
     printf 'SHAPE=%s\n'        "$SHAPE"
     printf 'PERSIST=%s\n'      "$PERSIST"
+    printf 'NOTSENT_LOWAT=%s\n' "$NOTSENT_LOWAT"
     printf 'PROFILE=%s\n'      "$PROFILE"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
@@ -948,6 +959,9 @@ render_panel() {
     "$BOLD" "$RESET" "$DIM" "${EGRESS_MBPS:-未设置}" "$RESET" \
     "$BOLD" "$RESET" "$DIM" "$COVER_RTT_MS" "$RESET" \
     "$BOLD" "$RESET" "$DIM" "$INITCWND" "$RESET"
+  printf '    %bn)%b 未发送数据上限 notsent_lowat%b（当前 %s，没有可靠依据，留给你 A/B）%b\n' \
+    "$BOLD" "$RESET" "$DIM" \
+    "$( (( NOTSENT_LOWAT > 0 )) && printf '%s' "$NOTSENT_LOWAT" || printf '不改' )" "$RESET"
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
@@ -1034,7 +1048,7 @@ menu() {
   while true; do
     load_config
     render_panel
-    if ! read -r -p '  请选择 [0-9 / a / p / r]: ' answer; then printf '\n'; return 0; fi
+    if ! read -r -p '  请选择 [0-9 / a / n / p / r]: ' answer; then printf '\n'; return 0; fi
     case "$answer" in
       1) run_action panel_set_profile stable ;;
       2) run_action panel_set_profile balanced ;;
@@ -1054,6 +1068,14 @@ menu() {
       7)
         if value="$(prompt_uint '默认路由首窗 initcwnd（内核默认 10，q 返回）' "$INITCWND" 1 64)"; then
           INITCWND="$value"; PROFILE=custom; save_config; run_action cmd_apply
+        else info "已取消"; continue; fi
+        ;;
+      n|N)
+        printf '  %b小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。%b\n' "$DIM" "$RESET"
+        printf '  %b实测分辨不出差别（同配置两次跑分峰值就差 22%%），所以默认不动它。填 0 = 保持系统现值。%b\n' \
+          "$DIM" "$RESET"
+        if value="$(prompt_uint 'notsent_lowat 字节（0=不改，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
+          NOTSENT_LOWAT="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi
         ;;
       8) run_action panel_diagnose ;;

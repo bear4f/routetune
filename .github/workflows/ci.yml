@@ -24,10 +24,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Bash 语法
-        run: bash -n routetune.sh tests/self-test.sh
+        run: bash -n routetune.sh tests/self-test.sh tcpwide/tcpwide.sh tcpwide/self-test.sh
 
       - name: ShellCheck
-        run: shellcheck -x -P SCRIPTDIR routetune.sh tests/self-test.sh
+        run: shellcheck -x -P SCRIPTDIR routetune.sh tests/self-test.sh tcpwide/tcpwide.sh tcpwide/self-test.sh
 
-      - name: 自测
+      - name: routetune 自测
         run: bash tests/self-test.sh
+
+      - name: tcpwide 自测
+        run: bash tcpwide/self-test.sh

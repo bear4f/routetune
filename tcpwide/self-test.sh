@@ -798,17 +798,25 @@ printf '%s\n' 'All tcpwide self-tests passed.'
 # said nothing that would have revealed that. Both probes below exist so the
 # next such measurement is read correctly the first time.
 
-# A ceiling that is not being reached is not the constraint.
-live_value() { printf '34123264\n'; }   # the 32.5 MB ceiling 0.9.0 applied
-IFS=$'\t' read -r sup _ pct <<< "$(window_headroom 146 639.7)"
-assert_eq '935' "$sup" 'the live ceiling supports 935 Mbps at 146 ms'
-(( pct < 75 )) || fail 'a flow at 68% of what the window allows is not window-limited'
-pass 'headroom against the live ceiling is reported, not assumed away'
-# And when a flow really is pinned to the window, it must not be waved off.
-IFS=$'\t' read -r sup _ pct <<< "$(window_headroom 146 920)"
-(( pct >= 75 )) || fail 'a flow at 98% of the window must read as window-limited'
-pass 'a genuinely window-limited flow still reads as one'
-unset -f live_value
+# window_headroom is gone. It measured a connection against net.core.rmem_max
+# regardless of which way the data was moving, and the live samples were
+# senders -- so it reported "the buffer here supports 2560 Mbps, only 37% used"
+# about the receive buffer of a socket that was transmitting. That is the same
+# category error window_ratio was fixed for one release earlier; this copy was
+# missed. render_send_sample and render_recv_sample replace it and compare like
+# with like.
+grep -q 'window_headroom' "$ROOT/tcpwide.sh" \
+  && fail 'window_headroom measured senders against the receive buffer'
+grep -q '本机缓冲在这条' "$ROOT/tcpwide.sh" \
+  && fail 'its output line must be gone with it'
+pass 'the receive-buffer yardstick is no longer applied to senders'
+# It also carried advice ruled out several rounds ago, and hedged on the peer
+# window while the block directly below it concluded -- two verdicts on one
+# screen.
+grep -q '先看上面的 CPU' "$ROOT/tcpwide.sh" && fail 'stale CPU advice must not ship'
+grep -q '这是一条要排除的可能，不是结论' "$ROOT/tcpwide.sh" \
+  && fail 'the hedge contradicted the conclusion printed below it'
+pass 'the diagnosis gives one verdict per direction, not two that disagree'
 
 # A single flow through a userspace proxy runs on essentially one core, so the
 # aggregate figure hides the ceiling: the busiest core is the one that answers.
@@ -1613,3 +1621,50 @@ BUF_DEFAULT=1048576
 # setting whose own author measured it as noise is cargo cult.
 grep -q 'netdev_budget' "$ROOT/tcpwide.sh" && fail 'netdev_budget is noise by its own measurement'
 pass 'a setting its own author measured as noise is not copied'
+
+
+# ── 0.21.0 已排队 ≠ 待发，以及峰值不是平均 ─────────────────────────────────
+# skmem's w<N> is wmem_queued and INCLUDES bytes already sent awaiting
+# acknowledgement. Printed as "待发队列 16.9 MB" it looked like a 17 MB backlog
+# when in-flight was 16.2 MB and only 0.7 MB had yet to leave.
+restore_lib
+IFACE=eth0
+has() { [[ "$1" == ss ]]; }
+RMEM=90995370; live_value() { printf '%s\n' "$RMEM"; }
+EGRESS_MBPS=2000; SHAPE_PCT=98
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41234 36.151.164.132:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb90995370,f0,w17720934,o0,bl0,d0) rtt:142.2/4 snd_wnd:16777216 bytes_sent:9000000000 bytes_received:120000 delivery_rate 958.3Mbps\n'
+}
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"含在途"* ]] || fail 'the queued figure must say it includes bytes in flight'
+[[ "$out" != *"待发队列"* ]] || fail 'the misleading label must be gone'
+[[ "$out" != *"应用喂得比网络快"* ]] \
+  || fail '16.9 MB queued against 16.2 MB in flight is not an application backlog'
+pass 'queued-including-in-flight is labelled as such and raises no false backlog'
+# A genuine backlog still has to be caught: queued far above what is in flight.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41234 1.2.3.4:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb41943040,f0,w41943040,o0,bl0,d0) rtt:150/4 snd_wnd:5242880 bytes_sent:9000000000 bytes_received:120000 delivery_rate 280.0Mbps\n'
+}
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"应用喂得比网络快"* ]] \
+  || fail 'a queue far above in-flight is a real application backlog'
+pass 'a real send backlog is still caught, measured on what has not left yet'
+
+# The number a short speedtest reports is an average that includes the ramp. On
+# these paths it sat at 70-72% of the peak across five unrelated nodes, and
+# reading it as steady-state throughput is what made a tuned box look untuned.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41234 36.151.164.132:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb90995370,f0,w13946880,o0,bl0,d0) rtt:142.2/4 snd_wnd:16777216 bytes_sent:9000000000 bytes_received:120000 delivery_rate 958.3Mbps\n'
+}
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"瞬时峰值"* ]] || fail 'a sample at the peer window must say it is a peak'
+[[ "$out" == *"爬升期"* ]] || fail 'and explain why a short test averages below it'
+[[ "$out" == *"长连接"* ]] || fail 'and what a sustained transfer actually gets'
+pass 'hitting the peer window explains the gap to the reported average'
+unset -f ss has live_value

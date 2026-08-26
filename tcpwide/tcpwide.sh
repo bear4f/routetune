@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.20.0"
+VERSION="0.21.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -887,24 +887,6 @@ busiest_core_pct() {
     END { if (n < 1) exit 1; printf "%.0f\t%.0f\t%d\t%.0f", max, sum / n, n, maxst }'
 }
 
-# Encoded because live data caught this reasoning error: a ceiling that is not
-# being reached is not the constraint. Three backends at 135/146/184 ms all
-# topped out near 600 Mbps while the configured window supported 1011/935/742 —
-# the buffer had headroom everywhere and raising it could not have helped.
-#
-# Prints "supported<TAB>observed<TAB>usedpct" for the live receive ceiling at
-# the given RTT.
-window_headroom() {
-  local rtt="${1:-0}" obs="${2:-0}" rmem
-  rmem="$(live_value net.core.rmem_max)"
-  is_uint "${rmem:-}" && (( rmem > 0 )) || return 1
-  awk -v r="$rmem" -v rtt="$rtt" -v obs="$obs" 'BEGIN {
-    if (rtt <= 0 || obs <= 0) exit 1
-    # tcp_adv_win_scale=1: the application gets half the buffer as window.
-    sup = (r / 2) * 8 / (rtt / 1000) / 1000000
-    if (sup <= 0) exit 1
-    printf "%.0f\t%.1f\t%.0f", sup, obs, obs * 100 / sup }'
-}
 
 # The kernel sizes tcp_mem from RAM, and it is a global page budget shared by
 # every socket. A per-socket ceiling above a meaningful fraction of it means the
@@ -1442,8 +1424,13 @@ render_window_ratio() {
 render_send_sample() {
   local id="$1" dir="$2" rtt="$3" rate="$4" inflight="$5" sndbuf="$6" sendq="$7" wnd="$8"
   printf '\n  %b发送方向%b  %s（%s）｜RTT %s ms｜%s Mbps\n' "$BOLD" "$RESET" "$id" "$dir" "$rtt" "$rate"
-  printf '    发送缓冲 %s MB｜待发队列 %s MB｜对端通告窗口 %s MB\n' \
-    "$(mb "$sndbuf")" "$(mb "$sendq")" "$(mb "$wnd")"
+  # skmem's w<N> is wmem_queued, which INCLUDES bytes already sent and awaiting
+  # acknowledgement. Printing it as "待发" made 16.9 MB look like a 17 MB
+  # backlog when in-flight was 16.2 MB and only 0.7 MB had yet to leave.
+  local unsent
+  unsent=$(( sendq > inflight ? sendq - inflight : 0 ))
+  printf '    发送缓冲 %s MB｜已排队 %s MB（含在途）｜其中未发出 %s MB｜对端通告窗口 %s MB\n' \
+    "$(mb "$sndbuf")" "$(mb "$sendq")" "$(mb "$unsent")" "$(mb "$wnd")"
   local ceil mbdiff
   ceil="$(awk -v w="$wnd" -v r="$rtt" 'BEGIN {printf "%.1f", w * 8 / (r * 1000)}')"
   printf '    对端窗口决定的上限 %s Mbps，在途 %s MB\n' "$ceil" "$(mb "$inflight")"
@@ -1459,6 +1446,16 @@ render_send_sample() {
       printf '    %b  自动伸缩的窗口不会落在 2 的整数次幂上，这是对端配置的 rmem_max。%b\n' \
         "$DIM" "$RESET"
       printf '    %b  这是外部天花板，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
+      # The number a short speedtest reports is an average that includes the
+      # ramp, and on these paths that is systematically ~30% below the peak.
+      # Reading it as steady-state throughput is what makes a tuned box look
+      # untuned.
+      printf '    %b  注意这是瞬时峰值，已经顶满。9 秒的测速前 1.5-2 秒都在爬升%b\n' \
+        "$DIM" "$RESET"
+      printf '    %b  （150ms 上从 initcwnd 20 爬到 16 MB 在途要 ~9 个 RTT），%b\n' "$DIM" "$RESET"
+      printf '    %b  所以它报的平均值会比峰值低 ~30%%——那不是没调好，是短测量含爬升期。%b\n' \
+        "$DIM" "$RESET"
+      printf '    %b  长连接（看视频、下大文件）爬完之后就在峰值这一档。%b\n' "$DIM" "$RESET"
       return 0
     fi
   fi
@@ -1475,8 +1472,8 @@ render_send_sample() {
       return 0
     fi
   fi
-  if awk -v q="$sendq" -v b="$sndbuf" 'BEGIN {exit !(b > 0 && q * 100 / b >= 50)}'; then
-    warn "待发队列占了发送缓冲的一半以上 —— 是应用喂得比网络快，不是网络慢"
+  if awk -v q="$unsent" -v b="$sndbuf" 'BEGIN {exit !(b > 0 && q * 100 / b >= 50)}'; then
+    warn "未发出的部分占了发送缓冲的一半以上 —— 是应用喂得比网络快，不是网络慢"
     return 0
   fi
   printf '    %b→ 既没贴对端窗口，也没贴自己的 pacer，看路径或对端处理能力。%b\n' "$DIM" "$RESET"
@@ -2333,40 +2330,6 @@ panel_diagnose() {
     fi
   else
     printf '  CPU（5 秒窗口）:   无法采样\n'
-  fi
-  local win peer wrtt wbytes wceil wobs
-  if ! win="$(peer_window_ceiling)"; then
-    printf '\n  %b没有 %s ms 以外的活跃入站连接可看。%b\n' "$DIM" "$LOCAL_RTT_SAMPLE_MS" "$RESET"
-    printf '  %b同机房和本地连接不是你的客户端，拿它们算单流上限只会得到无意义的大数。%b\n' \
-      "$DIM" "$RESET"
-  fi
-  if [[ -n "${win:-}" ]]; then
-    IFS=$'\t' read -r peer wrtt wbytes wceil wobs wdir <<< "$win"
-    printf '\n  %b最快的那条连接：%s（%s）%b\n' "$BOLD" "$peer" "$wdir" "$RESET"
-    printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \
-      "$wrtt" "$(mb "$wbytes")" "$wobs"
-    local hd hsup hpct
-    if hd="$(window_headroom "$wrtt" "$wobs")"; then
-      IFS=$'\t' read -r hsup _ hpct <<< "$hd"
-      printf '    %b本机缓冲在这条 %s ms 上支持 %s Mbps，实测只用到 %s%%%b\n' \
-        "$BOLD" "$wrtt" "$hsup" "$hpct" "$RESET"
-      if (( hpct < 75 )); then
-        printf '    %b→ 缓冲还有余量，它不是瓶颈。再往大调不会变快，先看上面的 CPU。%b\n' \
-          "$YELLOW" "$RESET"
-      else
-        printf '    %b→ 已经贴着缓冲上限跑，加大覆盖 RTT 或缓冲上限有望继续涨。%b\n' \
-          "$DIM" "$RESET"
-      fi
-    fi
-    printf '    %b对端窗口决定的单流上限：%s Mbps%b\n' "$BOLD" "$wceil" "$RESET"
-    printf '    %b单流不会超过「对端愿意收多少 ÷ 往返时间」。但对端窗口是自动伸缩的：%b\n' \
-      "$DIM" "$RESET"
-    printf '    %b我们推得多快它就长到多大，所以这两个数吻合既可能是对端封顶，也可能只是%b\n' \
-      "$DIM" "$RESET"
-    printf '    %b它跟着我们的发送量长到那儿。这是一条要排除的可能，不是结论——%b\n' \
-      "$DIM" "$RESET"
-    printf '    %b真正判定看多线程：多线程到线速而单线程到不了，才是对端窗口的锅。%b\n' \
-      "$DIM" "$RESET"
   fi
   printf '\n  %b跨后端判据（拿几个 RTT 差得远的后端各测一次）：%b\n' "$BOLD" "$RESET"
   printf '    %b受窗口限 → 速率 ∝ 1/RTT，RTT 大的明显慢。%b\n' "$DIM" "$RESET"

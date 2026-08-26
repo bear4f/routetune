@@ -1251,3 +1251,35 @@ out="$(render_window_report 2>&1)"
 pass 'a backend pressed against the window is reported as buffer-limited'
 rm -rf "$STATE_DIR"
 unset -f live_value canonical_qdisc current_default_route
+
+
+# ── 0.15.1 notsent_lowat 的争议已被实测裁决 ────────────────────────────────
+# netshape sets tcp_notsent_lowat to 16384 above 120ms RTT; tcpwide kept
+# 131072. Measured head to head on 岳阳 at ~200ms, 55 seconds apart:
+#   131072  201ms  avg 458.46  max 568.42
+#   16384   198ms  avg 282.13  max 341.16   -40% peak, -38% average
+# And the 131072 arm reproduced: 580.54 at 09:12 and 568.42 at 09:25, 2.1%
+# apart across 13 minutes, with 16384 sitting 40% below both. Two A readings
+# around one B is an A/B/A in everything but name.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+NOTSENT_LOWAT=131072
+why="$(target_sysctl 1000 200 | awk -F'\t' '$1 == "net.ipv4.tcp_notsent_lowat" {print $4}')"
+[[ "$why" == *"568"* && "$why" == *"341"* ]] \
+  || fail 'the rationale must carry the measurement that settled it'
+[[ "$why" != *"证据不算强"* ]] || fail 'the weak-evidence caveat is obsolete'
+pass 'the notsent_lowat rationale cites the measurement that settled it'
+# The surviving claim is directional, not final: bigger beat smaller by 40%, and
+# nothing above 131072 has been tried. Saying "settled" would stop the search at
+# a value that was only ever the larger of two.
+grep -q '262144 和 524288' "$ROOT/tcpwide.sh" \
+  || fail 'the panel must name the untried larger values as the next test'
+pass 'the next test is named rather than the question being closed'
+# Every place that called this unresolved has to stop saying so, or the tool
+# sends the operator to re-run a test that already has an answer.
+for stale in '没有可靠依据' '只能靠你这条路径裁决' '唯一还没测过的便宜项'; do
+  grep -q "$stale" "$ROOT/tcpwide.sh" && fail "stale claim still ships: $stale"
+done
+pass 'no surface still calls the notsent_lowat question open'
+NOTSENT_LOWAT=131072

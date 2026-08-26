@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.15.0"
+VERSION="0.15.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -431,7 +431,7 @@ target_sysctl() {
   # for why this is not decided here.
   if is_uint "$NOTSENT_LOWAT" && (( NOTSENT_LOWAT > 0 )); then
     printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
-      '未发送数据上限。400Mbps 下 16KB 只够 0.33ms，代理进程稍慢一下管道就空了。真机 A/B/A 夹逼对照下 131072 比 16384 高 18%（均）/11%（峰），但只有一个 B 样本，证据不算强。要极致低延迟可以调小，填 0 保持系统现值'
+      '未发送数据上限。400Mbps 下 16KB 只够 0.33ms，代理进程稍慢一下管道就空了。岳阳 201ms 上直接对照：131072 峰值 568，16384 只有 341，低 40%；而 131072 这一档 13 分钟内两次测得 580/568，稳定可复现。netshape 在高 RTT 上用 16384，在这条路径上被证伪。要极致低延迟可以调小，填 0 保持系统现值'
   fi
   printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' "$(netdev_backlog)" \
     '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
@@ -1277,8 +1277,8 @@ render_window_report() {
     printf '  %b→ 最高才用到 %s%%，本机缓冲不是瓶颈。%b\n' "$GREEN" "$peak" "$RESET"
     printf '  %b  加大 rmem_max、换内存更大的机器，对这台都不会有任何作用。%b\n' "$DIM" "$RESET"
     printf '  %b  剩下的杠杆，按性价比：%b\n' "$BOLD" "$RESET"
-    printf '  %b   1. notsent_lowat（面板 n）—— 唯一还没测过的便宜项。netshape 在%b\n' "$DIM" "$RESET"
-    printf '  %b      RTT≥120ms 时用 16384，和本机的 131072 直接对立，一测便知。%b\n' "$DIM" "$RESET"
+    printf '  %b   1. 把 notsent_lowat 往【更大】试（面板 n，262144 / 524288）——%b\n' "$DIM" "$RESET"
+    printf '  %b      131072 已经实测胜过 16384 四成，方向明确是越大越好，但上界没找到。%b\n' "$DIM" "$RESET"
     printf '  %b   2. BBRv3（面板 s → 4）—— v1 在高 RTT 且有丢包的路径上估值最吃亏。%b\n' "$DIM" "$RESET"
     printf '  %b   3. 换后端 —— 同一时刻不同后端差 20%%+ 且与 RTT 无关时，差的那块%b\n' "$DIM" "$RESET"
     printf '  %b      在对端或路径上，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
@@ -1931,7 +1931,7 @@ render_panel() {
     "$BOLD" "$RESET" "$DIM" "${EGRESS_MBPS:-未设置}" "$RESET" \
     "$BOLD" "$RESET" "$DIM" "$COVER_RTT_MS" "$RESET" \
     "$BOLD" "$RESET" "$DIM" "$INITCWND" "$RESET"
-  printf '    %bn)%b 未发送数据上限 notsent_lowat%b（当前 %s，没有可靠依据，留给你 A/B）%b\n' \
+  printf '    %bn)%b 未发送数据上限 notsent_lowat%b（当前 %s，实测胜 16384 四成；更大的还没试）%b\n' \
     "$BOLD" "$RESET" "$DIM" \
     "$( (( NOTSENT_LOWAT > 0 )) && printf '%s' "$NOTSENT_LOWAT" || printf '不改' )" "$RESET"
   printf '    %bb)%b 缓冲上限%b（当前 %s，接收窗口是它的一半，直接决定单流上限）%b\n' \
@@ -2086,9 +2086,11 @@ panel_single_flow() {
   printf '    %b1)%b tcp_notsent_lowat   当前 %s\n' "$BOLD" "$RESET" \
     "$(live_value net.ipv4.tcp_notsent_lowat)"
   printf '       %b558 Mbps 下 128KB 只有 1.8ms 的数据。单核机器上代理的调度抖动%b\n' "$DIM" "$RESET"
-  printf '       %b一旦超过这个数就会饿死网卡。131072 曾胜 16384（+18%%），再往上没测过。%b\n' "$DIM" "$RESET"
-  printf '       %b[!] netshape 在 RTT≥120ms 时反而用 16384，和这里的实测直接对立。%b\n' "$YELLOW" "$RESET"
-  printf '       %b这是下一个最该 A/B 的东西——两边都声称有依据，只能靠你这条路径裁决。%b\n' "$DIM" "$RESET"
+  printf '       %b一旦超过这个数就会饿死网卡。岳阳 201ms 直接对照：131072 峰值 568，%b\n' "$DIM" "$RESET"
+  printf '       %b16384 只有 341（低 40%%）。方向明确是越大越好，但上界还没找到——%b\n' "$DIM" "$RESET"
+  printf '       %b下一个该试的是 262144 和 524288。%b\n' "$DIM" "$RESET"
+  printf '       %bnetshape 在 RTT≥120ms 时反而用 16384。那条建议在这条路径上已被证伪：%b\n' "$DIM" "$RESET"
+  printf '       %b131072 这一档 13 分钟内两次测得 580/568，16384 比两次都低四成。%b\n' "$DIM" "$RESET"
   printf '    %b2)%b fq initial_quantum  当前 %s%b（0 = 用内核的 15140b）%b\n' "$BOLD" "$RESET" \
     "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
   printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \
@@ -2224,7 +2226,7 @@ menu() {
       n|N)
         printf '  %b小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。%b\n' "$DIM" "$RESET"
         printf '  %b真机 A/B/A 夹逼对照：131072 比 16384 高 18%%（均）/11%%（峰）。%b\n' "$DIM" "$RESET"
-        printf '  %b只有一个 B 样本，证据不算强。填 0 = 保持系统现值。%b\n' "$DIM" "$RESET"
+        printf '  %b131072 已实测胜 16384 四成，往下调只会更慢。填 0 = 保持系统现值。%b\n' "$DIM" "$RESET"
         if value="$(prompt_uint 'notsent_lowat 字节（0=不改，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
           NOTSENT_LOWAT="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi

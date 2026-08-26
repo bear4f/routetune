@@ -1377,7 +1377,7 @@ ss() {
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
   printf '\t skmem:(r512000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 delivery_rate 640.0Mbps\n'
 }
-IFS=$'\t' read -r wr_rb _ _ wr_fill wr_ratio _ _ _ <<< "$(window_ratio)"
+IFS=$'\t' read -r wr_rb _ _ wr_fill wr_ratio _ _ _ _ _ _ _ <<< "$(window_ratio)"
 assert_eq '45497685' "$wr_rb" 'the loaded connection is the one sampled'
 (( wr_fill >= 95 )) || fail "autotuning reached the ceiling, expected ~100%, got ${wr_fill}%"
 (( wr_ratio <= 35 )) || fail "the kernel handed out about a quarter, got ${wr_ratio}%"
@@ -1451,7 +1451,7 @@ ss() {
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
   printf '\t rtt:150/4 snd_wnd:8388608 delivery_rate 640.0Mbps\n'
 }
-IFS=$'\t' read -r pw_peer _ _ _ pw_obs <<< "$(peer_window_ceiling)"
+IFS=$'\t' read -r pw_peer _ _ _ pw_obs _ <<< "$(peer_window_ceiling)"
 assert_eq '1.2.3.4' "$pw_peer" 'the loaded connection is the reference'
 assert_eq '640.0' "$pw_obs" 'and its rate is what gets reported'
 pass 'a loaded connection is preferred over an idle one'
@@ -1461,3 +1461,89 @@ unset -f ss has
 # doubling rmem_max on that box moved nine backends by nothing.
 grep -q '这一条是真的' "$ROOT/tcpwide.sh" && fail 'the withdrawn memory advice must not still ship'
 pass 'the claim that more memory would help is gone'
+
+
+# ── 0.18.0 跑测速时那条连接是【出站】的 ────────────────────────────────────
+# Both samplers required the local port to be a listening port, i.e. inbound.
+# A speedtest dials OUT to each node, so its local port is ephemeral and the
+# whole connection was invisible -- leaving the SSH session as the only
+# candidate on the machine. Adding a throughput floor in 0.17.0 only turned a
+# false verdict into "cannot measure"; the direction filter was the fault.
+restore_lib
+IFACE=eth0
+has() { [[ "$1" == ss ]]; }
+live_value() { printf '90995370\n'; }
+# Exactly what a TcpQuality run looks like: idle inbound SSH, loaded outbound.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:22 119.237.129.39:51000\n'
+  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 snd_wnd:131072 delivery_rate 5.6Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:41234 106.75.1.1:443\n'
+  printf '\t skmem:(r98304,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 snd_wnd:8388608 delivery_rate 640.0Mbps\n'
+}
+IFS=$'\t' read -r wr_rb _ _ _ _ _ _ _ wr_peer wr_dir wr_rtt wr_rate <<< "$(window_ratio)"
+assert_eq '45497685' "$wr_rb" 'the outbound speedtest connection is the one sampled'
+assert_eq '106.75.1.1:443' "$wr_peer" 'and it is identified by peer'
+assert_eq '出站' "$wr_dir" 'and labelled as outbound'
+assert_eq '640.0' "$wr_rate" 'at the rate that made it the sample'
+[[ "$wr_rtt" == 150* ]] || fail "the sample RTT must be the loaded connection's, got $wr_rtt"
+pass 'a connection a speedtest actually creates is now visible to the diagnosis'
+# The sample line has to be printed, because two rounds of wrong verdicts came
+# partly from nobody being able to see what got sampled.
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"样本"* && "$out" == *"106.75.1.1:443"* && "$out" == *"出站"* ]] \
+  || fail 'the sample must be shown with peer and direction'
+pass 'the diagnosis shows which connection it sampled'
+# peer_window_ceiling had the same filter and needs the same release.
+IFS=$'\t' read -r pw_peer _ _ _ pw_obs pw_dir <<< "$(peer_window_ceiling)"
+assert_eq '106.75.1.1' "$pw_peer" 'the peer-window reference also sees outbound connections'
+assert_eq '出站' "$pw_dir" 'and reports the direction'
+assert_eq '640.0' "$pw_obs" 'at the loaded rate'
+pass 'the peer-window reference is no longer blind to outbound load'
+unset -f ss has live_value
+
+# observed_client_rtt must NOT follow: it sizes the coverage RTT from the client
+# population, and an outbound connection to a speedtest node is not a client.
+has() { [[ "$1" == ss ]]; }
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 119.237.129.39:51000\n'
+  printf '\t rtt:139.4/4 data_segs_out:900 delivery_rate 5.6Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:41234 106.75.1.1:443\n'
+  printf '\t rtt:250/4 data_segs_out:900000 delivery_rate 640.0Mbps\n'
+}
+IFS=$'\t' read -r oc_rtt oc_n <<< "$(observed_client_rtt)"
+assert_eq '139' "$oc_rtt" 'the client sample keeps only the inbound connection'
+assert_eq '1' "$oc_n" 'and counts only it'
+pass 'an outbound connection cannot inflate the client RTT distribution'
+unset -f ss has
+
+# ── 0.18.0 空字段会让 tab 读取整体错位 ─────────────────────────────────────
+# Tab is IFS whitespace, so a RUN of tabs collapses into one delimiter and every
+# field after an empty one shifts left. A record with no note handed the
+# timestamp to the note variable, which is where the panel's
+# "历史最好 580 Mbps (, 08-26 01:14)" came from.
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+live_value() { printf 'bbr\n'; }
+canonical_qdisc() { printf 'fq\n'; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0\n'; }
+printf '%s\t580\tfingerprint-here\t\t1\t0\n' "$(date +%s)" > "$MEASURE_LOG"
+IFS=$'\t' read -r bm_mbps bm_fp bm_note bm_when <<< "$(best_measurement)"
+assert_eq '580' "$bm_mbps" 'the rate reads back correctly'
+assert_eq 'fingerprint-here' "$bm_fp" 'and so does the fingerprint'
+assert_eq '-' "$bm_note" 'an absent note is a placeholder, not nothing'
+[[ "$bm_when" =~ ^[0-9]{2}-[0-9]{2}\  ]] \
+  || fail "the timestamp must survive an empty note, got [$bm_when]"
+pass 'an empty note no longer shifts the timestamp out of its field'
+# thread_split has the same exposure from either arm being absent.
+: > "$MEASURE_LOG"
+record_measurement 917.4 '只有多线程' 4 175
+IFS=$'\t' read -r ts_single ts_multi <<< "$(thread_split)"
+assert_eq '-' "$ts_single" 'a missing single-thread arm is a placeholder'
+assert_eq '917.4' "$ts_multi" 'and the multi-thread arm stays in its own field'
+if throughput_verdict 1000 >/dev/null 2>&1; then
+  fail 'one arm present is not a verdict'
+fi
+pass 'a placeholder arm is not mistaken for a reading'
+rm -rf "$STATE_DIR"
+unset -f live_value canonical_qdisc current_default_route

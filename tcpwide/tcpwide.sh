@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.17.0"
+VERSION="0.18.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1221,7 +1221,8 @@ thread_split() {
       t = (NF >= 5 && $5 + 0 > 0) ? $5 + 0 : 1
       if (t > 1) { if ($2 + 0 > m + 0) m = $2 }
       else       { if ($2 + 0 > s + 0) s = $2 } }
-    END { if (s == "" && m == "") exit 1; printf "%s\t%s", s, m }' "$MEASURE_LOG"
+    END { if (s == "" && m == "") exit 1
+      printf "%s\t%s", (s == "" ? "-" : s), (m == "" ? "-" : m) }' "$MEASURE_LOG"
 }
 
 # What the two readings mean together. Aggregate near the port rate says the
@@ -1232,6 +1233,7 @@ throughput_verdict() {
   local port="${1:-0}" row single multi
   row="$(thread_split)" || return 1
   IFS=$'\t' read -r single multi <<< "$row"
+  [[ "$single" != - && "$multi" != - ]] || return 1
   [[ -n "$single" && -n "$multi" ]] || return 1
   awk -v s="$single" -v m="$multi" -v p="$port" 'BEGIN {
     if (p <= 0) exit 1
@@ -1240,12 +1242,19 @@ throughput_verdict() {
 }
 
 # The fastest run on record. Prints "mbps<TAB>fingerprint<TAB>note<TAB>when".
+# Empty fields are emitted as "-", never as nothing.
+#
+# Tab counts as IFS whitespace, so `IFS=$'\t' read` collapses a RUN of tabs into
+# one delimiter and every field after an empty one shifts left. A record with no
+# note handed the timestamp to the note variable and left the timestamp empty,
+# which is where the panel's "历史最好 580 Mbps (, 08-26 01:14)" came from.
 best_measurement() {
   [[ -r "$MEASURE_LOG" ]] || return 1
   awk -F'\t' 'NF >= 3 && $2 + 0 > best + 0 { best = $2; line = $0 }
     END { if (line == "") exit 1
       split(line, f, "\t")
-      printf "%s\t%s\t%s\t%s", f[2], f[3], f[4], strftime("%m-%d %H:%M", f[1]) }' \
+      printf "%s\t%s\t%s\t%s", f[2], f[3], (f[4] == "" ? "-" : f[4]),
+             strftime("%m-%d %H:%M", f[1]) }' \
     "$MEASURE_LOG"
 }
 
@@ -1264,7 +1273,7 @@ cmd_record() {
   if row="$(best_measurement)"; then
     IFS=$'\t' read -r bm bf bn bw <<< "$row"
     printf '\n  %b历史最好：%s Mbps%b（%s%s）\n' "$BOLD" "$bm" "$RESET" "$bw" \
-      "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )"
+      "$( [[ -n "$bn" && "$bn" != - ]] && printf '，%s' "$bn" )"
     printf '  %b%s%b\n' "$DIM" "$bf" "$RESET"
   fi
   render_verdict "${EGRESS_MBPS:-0}"
@@ -1304,6 +1313,11 @@ window_ratio() {
       i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
       return (i > 0) ? substr(a, i + 1) : ""
     }
+    function ipof(a,   i) {
+      if (substr(a, 1, 1) == "[") { i = index(a, "]"); return (i > 2) ? substr(a, 2, i - 2) : a }
+      i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
+      return (i > 1) ? substr(a, 1, i - 1) : a
+    }
     function tomb(v,   n) {
       n = v + 0
       if (v ~ /Gbps/) return n * 1000
@@ -1313,7 +1327,7 @@ window_ratio() {
     }
     /^[ \t]/ {
       if (local == "") next
-      rtt = 0; rate = 0; rb = 0
+      rtt = 0; rate = 0; rb = 0; rq = 0; dr = 0
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^rtt:/) { t = substr($i, 5); q = index(t, "/")
           rtt = ((q > 0) ? substr(t, 1, q - 1) : t) + 0 }
@@ -1326,20 +1340,28 @@ window_ratio() {
           if (match($i, /d[0-9]+\)/)) dr = substr($i, RSTART + 1, RLENGTH - 2) + 0
         }
       }
-      if (rtt >= floor && rb > 0 && rate >= mbfloor && rate > best \
-          && index(listen, " " portof(local) " ") > 0) {
+      # Both directions. The receive-buffer question does not care who opened
+      # the connection: if we are receiving, rcvbuf and the unread queue mean
+      # something. Restricting this to inbound made every connection a
+      # speedtest actually creates invisible -- the box dials OUT to each node,
+      # so the local port is ephemeral -- and left the SSH session as the only
+      # candidate on the machine.
+      if (rtt >= floor && rb > 0 && rate >= mbfloor && rate > best) {
         best = rate; brtt = rtt; brb = rb; brq = rq; bdr = dr
+        bpeer = ipof(peer) ":" portof(peer)
+        bdir = (index(listen, " " portof(local) " ") > 0) ? "入站" : "出站"
       }
-      local = ""; next
+      local = ""; peer = ""; next
     }
-    { local = ""
-      if (NF >= 5 && $1 ~ /^[A-Z][A-Z0-9_-]*$/) local = $4
-      else if (NF >= 4) local = $3 }
+    { local = ""; peer = ""
+      if (NF >= 5 && $1 ~ /^[A-Z][A-Z0-9_-]*$/) { local = $4; peer = $5 }
+      else if (NF >= 4) { local = $3; peer = $4 } }
     END {
       if (best <= 0) exit 1
       inflight = best * 1000000 * (brtt / 1000) / 8
-      printf "%d\t%d\t%d\t%.0f\t%.0f\t%d\t%d\t%.0f", brb, rmem, inflight,
-             brb * 100 / rmem, inflight * 100 / brb, brq, bdr, brq * 100 / brb
+      printf "%d\t%d\t%d\t%.0f\t%.0f\t%d\t%d\t%.0f\t%s\t%s\t%.1f\t%.1f",
+             brb, rmem, inflight, brb * 100 / rmem, inflight * 100 / brb,
+             brq, bdr, brq * 100 / brb, bpeer, bdir, brtt, best
     }'
 }
 
@@ -1352,8 +1374,12 @@ render_window_ratio() {
     printf '  %b（空闲的 SSH 会话本身也是连接，但它的缓冲说明不了任何问题。）%b\n' "$DIM" "$RESET"
     return 0
   }
-  IFS=$'\t' read -r rb rmem inflight fill ratio rq drops qpct <<< "$row"
-  printf '\n  %b窗口比例实测（正在跑流量的那条连接）%b\n' "$BOLD" "$RESET"
+  IFS=$'\t' read -r rb rmem inflight fill ratio rq drops qpct peer dir srtt srate <<< "$row"
+  printf '\n  %b窗口比例实测%b\n' "$BOLD" "$RESET"
+  # Show what was sampled. Two rounds of confident wrong verdicts came partly
+  # from nobody being able to see that the sample was an idle SSH session.
+  printf '    %b样本：%s（%s）｜RTT %s ms｜%s Mbps%b\n' \
+    "$BOLD" "$peer" "$dir" "$srtt" "$srate" "$RESET"
   printf '    实际 rcvbuf %s MB ／ rmem_max %s MB = %s%%（autotuning 长到了多少）\n' \
     "$(mb "$rb")" "$(mb "$rmem")" "$fill"
   printf '    在途 %s MB ／ 实际 rcvbuf = %s%%（内核真正给出去的窗口比例）\n' \
@@ -1970,9 +1996,11 @@ peer_window_ceiling() {
       # A 0.6ms neighbour won the "fastest" contest and the panel then reported
       # that the buffer supports 303318 Mbps on it -- an arithmetically correct
       # number about a connection nobody is asking about.
-      if (rtt >= floor && wnd > 0 && rate >= mbfloor && rate > best \
-          && index(listen, " " portof(local) " ") > 0) {
+      # Also both directions: snd_wnd is what the peer lets us send, which
+      # matters on an outbound upload exactly as it does on a reply to a client.
+      if (rtt >= floor && wnd > 0 && rate >= mbfloor && rate > best) {
         best = rate; brtt = rtt; bwnd = wnd; bpeer = ipof(peer)
+        bdir = (index(listen, " " portof(local) " ") > 0) ? "入站" : "出站"
       }
       local = ""; peer = ""; next
     }
@@ -1981,7 +2009,8 @@ peer_window_ceiling() {
       else if (NF >= 4) { local = $3; peer = $4 } }
     END {
       if (best <= 0) exit 1
-      printf "%s\t%.1f\t%d\t%.1f\t%.1f\n", bpeer, brtt, bwnd, bwnd * 8 / (brtt * 1000), best
+      printf "%s\t%.1f\t%d\t%.1f\t%.1f\t%s\n", bpeer, brtt, bwnd,
+             bwnd * 8 / (brtt * 1000), best, bdir
     }'
 }
 
@@ -2198,8 +2227,8 @@ panel_diagnose() {
       "$DIM" "$RESET"
   fi
   if [[ -n "${win:-}" ]]; then
-    IFS=$'\t' read -r peer wrtt wbytes wceil wobs <<< "$win"
-    printf '\n  %b最快的那条连接：%s%b\n' "$BOLD" "$peer" "$RESET"
+    IFS=$'\t' read -r peer wrtt wbytes wceil wobs wdir <<< "$win"
+    printf '\n  %b最快的那条连接：%s（%s）%b\n' "$BOLD" "$peer" "$wdir" "$RESET"
     printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \
       "$wrtt" "$(mb "$wbytes")" "$wobs"
     local hd hsup hpct

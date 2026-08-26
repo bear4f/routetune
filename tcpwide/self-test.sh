@@ -402,14 +402,15 @@ SHAPE=1
 cpu_count() { printf '1\n'; }
 [[ -n "$(shaping_cpu_warning 1000)" ]] || fail 'one core shaping a gigabit must warn'
 pass 'shaping well past one core of headroom warns'
-if shaping_cpu_warning 500 >/dev/null 2>&1; then fail '500 Mbps on one core needs no warning'; fi
+if shaping_cpu_warning 200 >/dev/null 2>&1; then fail '200 Mbps on one core needs no warning'; fi
 pass 'a modest rate on one core does not warn'
-# The per-core figure was 400 Mbps, which warned on a 2-core gigabit box that
-# demonstrably shapes a gigabit. A warning that fires on a working configuration
-# teaches the operator to ignore warnings.
+# The threshold was raised 400 -> 600 because a 2-core 0.5 GB box can push
+# 2 Gbps. True, and about the PORT -- not about CAKE's per-packet cost. That
+# conflation removed the warning for exactly this combination, and the box then
+# ran `cake bandwidth 980Mbit` at 332 Mbps peak where `fq` gave it 629.
 cpu_count() { printf '2\n'; }
-if shaping_cpu_warning 1000 >/dev/null 2>&1; then fail 'two cores at a gigabit needs no warning'; fi
-pass 'two cores shaping a gigabit does not warn'
+[[ -n "$(shaping_cpu_warning 1000)" ]] || fail 'two cores cannot shape a gigabit and must say so'
+pass 'two cores shaping a gigabit warns, as the measurement demands'
 cpu_count() { printf '4\n'; }
 if shaping_cpu_warning 500 >/dev/null 2>&1; then fail 'four cores at 500 Mbps needs no warning'; fi
 pass 'enough cores means no shaping warning'
@@ -427,10 +428,22 @@ unset -f cpu_count
 # spec to tc as ONE argument and the qdisc silently never applied — every run
 # on the live node was sysctl-only while the panel reported drift.
 SHAPE=1; SHAPE_PCT=95; IFACE=eth0
+# Enough cores that CAKE fits, so this is the base spec without no-split-gso.
+cpu_count() { printf '8\n'; }
 split_words "$(target_qdisc 500 250)"
 assert_eq '7' "${#SPLIT_WORDS[@]}" 'the CAKE spec splits into its individual arguments'
 assert_eq 'cake' "${SPLIT_WORDS[0]}" 'the first argument is the qdisc name, not the whole spec'
 assert_eq '250ms' "${SPLIT_WORDS[6]}" 'the last argument survives the split'
+# split-gso is CAKE's dominant per-packet cost: one 64KB superpacket becomes ~44
+# MTU packets so each can be paced. A box that cannot shape its port gets it
+# turned off, which is the only way it keeps per-host fairness AND speed.
+cpu_count() { printf '2\n'; }
+split_words "$(target_qdisc 1000 250)"
+assert_eq '8' "${#SPLIT_WORDS[@]}" 'a CPU-tight box gets one extra CAKE option'
+assert_eq 'no-split-gso' "${SPLIT_WORDS[7]}" 'and that option is no-split-gso'
+cpu_count() { printf '8\n'; }
+split_words "$(target_qdisc 1000 250)"
+assert_eq '7' "${#SPLIT_WORDS[@]}" 'a box with cores to spare keeps precise pacing'
 split_words 'default via 10.0.0.1 dev eth0 onlink initcwnd 20'
 assert_eq '8' "${#SPLIT_WORDS[@]}" 'a route spec splits into its individual arguments'
 
@@ -899,3 +912,69 @@ tgt="$(target_sysctl 500 250)"
 assert_eq 'fq' "$(awk -F'\t' '$1 == "net.core.default_qdisc" {print $2}' <<< "$tgt")" \
   'queues the kernel creates itself must pace by default'
 QDISC_LAYOUT=root
+
+
+# ── 0.12.0 向导不能把 CPU 不够的机器推到 CAKE 上 ───────────────────────────
+# Same box, same backend, minutes apart: `fq maxrate 980mbit` peaked at 629
+# Mbps, `cake bandwidth 980Mbit` on the same two cores peaked at 332. The wizard
+# had been recommending a CAKE profile by default, and profile 3 was labelled
+# "速度优先" while being the slowest option on that machine.
+SHAPE=1
+cpu_count() { printf '2\n'; }
+cake_over_budget 1000 || fail 'two cores cannot shape a gigabit of CAKE'
+pass 'a 2-core box shaping a gigabit is over budget'
+cake_over_budget 500 && fail 'two cores can shape 500 Mbps'
+pass 'the same box shaping 500 Mbps is within budget'
+cpu_count() { printf '8\n'; }
+cake_over_budget 1000 && fail 'eight cores can shape a gigabit'
+pass 'a box with cores to spare is not over budget'
+# The budget question must not depend on whether shaping is currently on: the
+# wizard asks it before the operator has picked a profile.
+SHAPE=0
+cpu_count() { printf '2\n'; }
+cake_over_budget 1000 || fail 'the budget question is independent of the current profile'
+pass 'the CPU budget is answerable before a profile is chosen'
+SHAPE=1
+
+# A label that promises speed while delivering half of it is worse than no
+# label. Names describe shaping tightness; only measurement talks about speed.
+for pf in stable balanced speed noshape; do
+  apply_profile "$pf"
+  [[ "$(profile_label "$pf")" != *速度优先* ]] || fail "$pf still promises speed in its name"
+done
+pass 'no profile name promises speed any more'
+apply_profile speed
+assert_eq '98' "$SHAPE_PCT" 'the profile keys are unchanged, so existing configs still load'
+assert_eq 'speed' "$PROFILE" 'and the stored key stays speed for compatibility'
+
+# ── 0.12.0 测量记录 ────────────────────────────────────────────────────────
+# Eight rounds of "install, pick something, test, still slow" went by with
+# nobody able to say which configuration produced which number.
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+live_value() { case "$1" in
+  net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
+  net.core.rmem_max) printf '45438293\n' ;;
+esac; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
+live_qdisc_layout() { printf '%s\n' "${FAKE_Q:-fq maxrate 950mbit}"; }
+COVER_RTT_MS=176
+if best_measurement >/dev/null 2>&1; then fail 'an empty log has no best run'; fi
+pass 'an empty measurement log reports no best run'
+FAKE_Q='cake 950000kbit dual-dsthost' record_measurement 332.25 '上海 CAKE'
+FAKE_Q='fq maxrate 950mbit'           record_measurement 629.10 '上海 不整形'
+FAKE_Q='cake 950000kbit no-split-gso' record_measurement 540.00 '上海 CAKE+nogso'
+IFS=$'\t' read -r b_mbps b_fp b_note _ <<< "$(best_measurement)"
+assert_eq '629.10' "$b_mbps" 'the best run is the fastest one, not the newest'
+[[ "$b_fp" == *'fq maxrate 950mbit'* ]] || fail 'the best run carries the configuration that produced it'
+pass 'the best run carries its own configuration'
+assert_eq '上海 不整形' "$b_note" 'and the note that identifies the test'
+# A reading that is not a number must not silently land in the log.
+if record_measurement 'fast' 'nope' 2>/dev/null; then fail 'a non-numeric reading must be refused'; fi
+pass 'a non-numeric reading is refused rather than logged'
+assert_eq '3' "$(wc -l < "$MEASURE_LOG")" 'the refused reading did not reach the log'
+# A tab in the note would split the record into the wrong fields.
+FAKE_Q='fq maxrate 950mbit' record_measurement 100 "$(printf 'a\tb')"
+assert_eq '4' "$(awk -F'\t' 'NF == 4' "$MEASURE_LOG" | wc -l)" \
+  'a tab in the note cannot break the record into extra fields'
+rm -rf "$STATE_DIR"
+unset -f live_value current_default_route live_qdisc_layout

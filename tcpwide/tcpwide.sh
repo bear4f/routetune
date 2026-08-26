@@ -28,11 +28,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.11.0"
+VERSION="0.12.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
 QDISC_SNAP="$STATE_DIR/qdisc.snapshot"
+MEASURE_LOG="$STATE_DIR/measurements"
 ROUTE_SNAP="$STATE_DIR/route.snapshot"
 PERSIST_SYSCTL="/etc/sysctl.d/90-tcpwide.conf"
 PERSIST_UNIT="/etc/systemd/system/tcpwide-link.service"
@@ -407,8 +408,17 @@ target_qdisc() {
   # does not exist in current iproute2 — the live node rejected the whole spec
   # over it with "What is \"ecn\"?". It was moot here anyway, since tcp_ecn is
   # set to 0 for the cross-border blackhole reason.
-  printf 'cake bandwidth %skbit dual-dsthost besteffort rtt %sms\n' \
-    "$(shaped_kbit "$rate")" "$rtt"
+  # `split-gso` is CAKE's dominant per-packet cost: it breaks a 64KB GSO
+  # superpacket into ~44 MTU-sized packets so it can pace each one. Turning it
+  # off keeps the superpackets whole and drops the packet rate by more than an
+  # order of magnitude, at the price of coarser pacing. On a box whose cores
+  # cannot shape the port that is the difference between shaping being
+  # affordable and shaping costing half the throughput -- and it is the only way
+  # this machine gets per-host fairness AND speed.
+  local gso=''
+  if cake_over_budget "$rate"; then gso=' no-split-gso'; fi
+  printf 'cake bandwidth %skbit dual-dsthost besteffort rtt %sms%s\n' \
+    "$(shaped_kbit "$rate")" "$rtt" "$gso"
 }
 
 # The script runs under IFS=$'\n\t'. Every place that hands a multi-word spec
@@ -488,9 +498,12 @@ apply_profile() {
 
 profile_label() {
   case "${1:-}" in
-    stable)   printf '稳定优先\n' ;;
-    balanced) printf '均衡\n' ;;
-    speed)    printf '速度优先\n' ;;
+    stable)   printf '整形 90%%\n' ;;
+    balanced) printf '整形 95%%\n' ;;
+    # Was "速度优先". It is the slowest option on a CPU-limited box, and a
+    # label that promises speed while delivering half of it is worse than no
+    # label. Names describe the shaping tightness; only measurement talks speed.
+    speed)    printf '整形 98%%\n' ;;
     noshape)  printf '不整形\n' ;;
     *)        printf '自定义\n' ;;
   esac
@@ -788,13 +801,33 @@ mb() { awk -v b="${1:-0}" 'BEGIN {printf "%.1f", b / 1048576}'; }
 cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1; }
 
 # Software shaping is not free. CAKE runs the whole egress through one qdisc and
-# does per-packet work on it; on a single-core VPS at several hundred Mbps that
-# can cost more throughput than the policer it is replacing.
+# does per-packet work on it: deficit round robin, a per-packet hash for
+# dual-dsthost, and above all `split-gso`, which breaks a 64KB GSO superpacket
+# into ~44 MTU-sized packets so it can pace them precisely. On a small VPS that
+# costs more throughput than the policer it replaces.
 #
-# The threshold is deliberately not tight: a modern core handles several hundred
-# Mbps of CAKE comfortably, and warning too early tells an operator their
-# hardware cannot do something it plainly can.
-SHAPE_MBPS_PER_CORE=600
+# Anchored to a measurement rather than a guess. Same box, same backend, minutes
+# apart: `fq maxrate 980mbit` delivered 629 Mbps peak, `cake bandwidth 980Mbit`
+# on the same two cores delivered 332. So two cores cannot shape a gigabit, and
+# ~300 Mbps per core is what they actually managed.
+#
+# This was 400, and I raised it to 600 because the operator said a 2-core 0.5 GB
+# box can push 2 Gbps. That is true, and it is about the PORT -- not about
+# CAKE's per-packet cost. Raising a shaping-CPU threshold on a port-speed claim
+# conflated two different things, and it removed the warning that would have
+# caught exactly the configuration above: 2 x 400 = 800 warns on a gigabit,
+# 2 x 600 = 1200 does not.
+SHAPE_MBPS_PER_CORE=300
+
+# True when this machine cannot shape the rate it is being asked to shape.
+# Independent of SHAPE, because the wizard needs to know before the operator has
+# chosen a profile.
+cake_over_budget() {
+  local rate="${1:-0}" cores
+  cores="$(cpu_count)"
+  is_uint "$cores" && (( cores > 0 )) || cores=1
+  (( rate > cores * SHAPE_MBPS_PER_CORE ))
+}
 shaping_cpu_warning() {
   local rate="${1:-0}" cores
   (( SHAPE == 1 )) || return 1
@@ -1008,6 +1041,48 @@ config_fingerprint() {
     "${cwnd:-内核默认}" "$COVER_RTT_MS"
 }
 
+# Eight rounds of "install, pick something, run a speedtest, still slow" went by
+# without anyone being able to say which configuration produced which number.
+# The fingerprint made a configuration identifiable; this makes two of them
+# comparable. Without it every round starts from opinion.
+#
+# One record per line: unix time, Mbps, fingerprint, note.
+record_measurement() {
+  local mbps="${1:-}" note="${2:-}"
+  [[ "$mbps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" >> "$MEASURE_LOG"
+  chmod 0600 "$MEASURE_LOG" 2>/dev/null || true
+}
+
+# The fastest run on record. Prints "mbps<TAB>fingerprint<TAB>note<TAB>when".
+best_measurement() {
+  [[ -r "$MEASURE_LOG" ]] || return 1
+  awk -F'\t' 'NF >= 3 && $2 + 0 > best + 0 { best = $2; line = $0 }
+    END { if (line == "") exit 1
+      split(line, f, "\t")
+      printf "%s\t%s\t%s\t%s", f[2], f[3], f[4], strftime("%m-%d %H:%M", f[1]) }' \
+    "$MEASURE_LOG"
+}
+
+cmd_record() {
+  local mbps="${1:-}" note="${2:-}" row bm bf bn bw
+  [[ -n "$mbps" ]] || die "用法：$PROGRAM record <Mbps> [备注]    例：$PROGRAM record 629 上海电信"
+  resolve_iface
+  record_measurement "$mbps" "$note" || die "Mbps 需为数字，例：$PROGRAM record 629.1 上海电信"
+  title 'tcpwide 记录'
+  log "已记录 $mbps Mbps"
+  printf '  %b%s%b\n' "$DIM" "$(config_fingerprint)" "$RESET"
+  if row="$(best_measurement)"; then
+    IFS=$'\t' read -r bm bf bn bw <<< "$row"
+    printf '\n  %b历史最好：%s Mbps%b（%s%s）\n' "$BOLD" "$bm" "$RESET" "$bw" \
+      "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )"
+    printf '  %b%s%b\n' "$DIM" "$bf" "$RESET"
+  fi
+  printf '\n'
+}
+
 # Print the live layout beside what was asked for, and flag any disagreement.
 report_live_qdisc() {
   local want="${1:-}" live
@@ -1055,6 +1130,21 @@ apply_link() {
     if bad="$(probe_cake_options "$want_q")"; then
       printf '  %b逐项试出来，加到这里就被拒绝：%b%s%b\n' "$DIM" "$RESET" "$bad" "$RESET"
       printf '  %b最后那一项要么本机 tc 不认识，要么内核的 sch_cake 不支持。%b\n' "$DIM" "$RESET"
+    fi
+    # An older sch_cake without no-split-gso should lose that one option, not
+    # the whole AQM. Dropping all the way to fq throws away per-host fairness
+    # over a keyword -- the same over-reaction the `ecn` rejection caused.
+    if [[ "$want_q" == *" no-split-gso"* ]]; then
+      local without="${want_q% no-split-gso}"
+      split_words "$without"
+      if tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>/dev/null; then
+        warn "本机 sch_cake 不认识 no-split-gso，已去掉它：$without"
+        printf '  %b整形保住了，但每包成本回到高位——CPU 不够时优先考虑 4) 不整形。%b\n' \
+          "$DIM" "$RESET"
+        report_live_qdisc "$without"
+        apply_route
+        return 0
+      fi
     fi
     # Pacing is the single most important item in the whole set, so falling back
     # to fq is far better than leaving the interface on whatever it had.
@@ -1460,7 +1550,23 @@ render_panel() {
   # exactly how an analysis ends up resting on a number that never applied.
   local live_buf; live_buf="$(live_value net.core.rmem_max)"
   title 'tcpwide 调优面板'
-  printf '  %b%s%b\n\n' "$DIM" "$(config_fingerprint)" "$RESET"
+  local fp; fp="$(config_fingerprint)"
+  printf '  %b%s%b\n' "$DIM" "$fp" "$RESET"
+  # The best run on record, and whether it is the one currently loaded. Eight
+  # rounds of reconfiguration went by with no way to see this.
+  local brow bm bf bn bw
+  if brow="$(best_measurement)"; then
+    IFS=$'\t' read -r bm bf bn bw <<< "$brow"
+    if [[ "$bf" == "$fp" ]]; then
+      printf '  %b历史最好 %s Mbps%b（%s%s）—— 就是当前这份配置%b\n' \
+        "$GREEN" "$bm" "$DIM" "$bw" "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )" "$RESET"
+    else
+      printf '  %b历史最好 %s Mbps%b（%s%s），配置是：%b\n' \
+        "$YELLOW" "$bm" "$DIM" "$bw" "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )" "$RESET"
+      printf '  %b  %s%b\n' "$DIM" "$bf" "$RESET"
+    fi
+  fi
+  printf '\n'
   if (( SHAPE == 1 )); then
     printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
       "${EGRESS_MBPS:-未设置}" "$DIM" "$SHAPE_PCT" \
@@ -1520,13 +1626,13 @@ render_panel() {
   rule
   printf '  %b档位%b%b                                          ▸ 当前%b\n' \
     "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b1)%b 稳定优先   整形 90%%｜首窗 16%b  丢包敏感、跨境线路%b\n' \
+  printf '  %b%s%b %b1)%b 整形 90%%    首窗 16%b  丢包敏感、跨境线路%b\n' \
     "$GREEN" "$p1" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b2)%b 均衡       整形 95%%｜首窗 20%b  推荐%b\n' \
+  printf '  %b%s%b %b2)%b 整形 95%%    首窗 20%b  多设备共享，要按设备公平%b\n' \
     "$GREEN" "$p2" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b3)%b 速度优先   整形 98%%｜首窗 32%b  干净直连%b\n' \
+  printf '  %b%s%b %b3)%b 整形 98%%    首窗 32%b  几乎等于不整形，却付全额 CAKE 开销%b\n' \
     "$GREEN" "$p3" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b4)%b 不整形     只做 pacing%b  放弃按设备公平和 AQM%b\n' \
+  printf '  %b%s%b %b4)%b 不整形      首窗 20%b  只做 pacing；CPU 不够时这是最快的%b\n' \
     "$GREEN" "$p4" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '  %b设置%b\n' "$BOLD" "$RESET"
   printf '    %b5)%b 出口带宽%b（当前 %s Mbps）%b   %b6)%b 覆盖 RTT%b（当前 %s ms）%b   %b7)%b 首窗%b（当前 %s）%b\n' \
@@ -1543,6 +1649,8 @@ render_panel() {
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
+  printf '    %bm)%b 记一次实测%b（跑完测速把数字填进来，和配置绑在一起）%b\n' \
+    "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '    %bl)%b 队列布局%b（当前：%s%s）%b\n' "$BOLD" "$RESET" "$DIM" \
     "$QDISC_LAYOUT" \
     "$( [[ "$QDISC_LAYOUT" == root ]] && printf '，有实测支撑' || printf '，未经实测' )" \
@@ -1656,6 +1764,15 @@ panel_diagnose() {
   render_plan "${EGRESS_MBPS:-200}" "$COVER_RTT_MS"
 }
 
+panel_record() {
+  local mbps note
+  read -r -p '  刚测到多少 Mbps（峰值，q 返回）: ' mbps || return 0
+  [[ "$mbps" =~ ^[qQ]$ || -z "$mbps" ]] && { info "已取消"; return 0; }
+  read -r -p '  备注（后端名字之类，可留空）: ' note || note=''
+  record_measurement "$mbps" "$note" || { warn "需要一个数字，例：629.1"; return 0; }
+  log "已记录 $mbps Mbps，和当前配置绑在一起了"
+}
+
 # The layout is a knob rather than a decision so it can be A/B'd on the machine
 # that actually cares. Flipping it re-applies, so an A/B/A run is three presses.
 panel_toggle_layout() {
@@ -1745,6 +1862,7 @@ menu() {
         ;;
       8) run_action panel_diagnose ;;
       9) run_action cmd_plan ;;
+      m|M) run_action panel_record ;;
       l|L) run_action panel_toggle_layout ;;
       a|A) run_action panel_reapply ;;
       p|P) run_action panel_toggle_persist ;;
@@ -1805,15 +1923,30 @@ cmd_install() {
   fi
   COVER_RTT_MS="$value"
   if (( interactive == 1 )); then
+    # The default comes from the machine, not from a constant. Recommending a
+    # CAKE profile on a box whose cores cannot shape the port is how this one
+    # ended up on `cake bandwidth 980Mbit` at half the throughput `fq` gave it.
+    local dflt=2 tight=0
+    if cake_over_budget "$EGRESS_MBPS"; then dflt=4; tight=1; fi
     printf '\n  %b档位%b\n' "$BOLD" "$RESET"
-    printf '    1) 稳定优先   整形 90%%｜首窗 16   丢包敏感、跨境线路\n'
-    printf '    2) 均衡       整形 95%%｜首窗 20   推荐\n'
-    printf '    3) 速度优先   整形 98%%｜首窗 32   干净直连\n'
-    printf '    4) 不整形     只做 pacing，放弃按设备公平和 AQM\n'
-    read -r -p '  请选择 [2]: ' answer || answer=2
-    case "${answer:-2}" in
-      1) apply_profile stable ;; 3) apply_profile speed ;;
-      4) apply_profile noshape ;; *) apply_profile balanced ;;
+    printf '    1) 整形 90%%    首窗 16   丢包敏感、跨境线路\n'
+    printf '    2) 整形 95%%    首窗 20   多设备共享，要按设备公平\n'
+    printf '    3) 整形 98%%    首窗 32   几乎等于不整形，却付全额 CAKE 开销\n'
+    printf '    4) 不整形      首窗 20   只做 pacing；CPU 不够时这是最快的\n'
+    if (( tight == 1 )); then
+      printf '\n  %b[!] 这台机器 %s 核，整形 %s Mbps 超出 CAKE 的处理能力%b\n' \
+        "$YELLOW" "$(cpu_count)" "$EGRESS_MBPS" "$RESET"
+      printf '  %b实测同一台机器同一后端：fq 峰值 629 Mbps，CAKE 峰值 332 Mbps。%b\n' \
+        "$DIM" "$RESET"
+      printf '  %b所以默认给 4。真要按设备公平，选 2——会自动加 no-split-gso 降开销。%b\n' \
+        "$DIM" "$RESET"
+    fi
+    read -r -p "  请选择 [$dflt]: " answer || answer="$dflt"
+    case "${answer:-$dflt}" in
+      1) apply_profile stable ;; 2) apply_profile balanced ;;
+      3) apply_profile speed ;;  4) apply_profile noshape ;;
+      *) if (( dflt == 4 )); then apply_profile noshape
+         else apply_profile balanced; fi ;;
     esac
   fi
   save_config
@@ -1882,6 +2015,7 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   tcpwide apply --egress 500           应用（先快照，可完整还原）
   tcpwide apply --egress 500 --persist 应用并持久化（重启仍在）
   tcpwide status                       当前状态
+  tcpwide record <Mbps> [备注]         记下一次实测，和当前配置绑在一起
   tcpwide revert                       完整还原到 tcpwide 介入之前
 
 参数：
@@ -1904,6 +2038,7 @@ EOF
 
 main() {
   local cmd="${1:-}"
+  local POSITIONAL=()
   # No arguments on a terminal means the panel, the way `netshape` behaves.
   # Anywhere else (pipes, cron, CI) it must stay a predictable CLI.
   if [[ -z "$cmd" ]]; then
@@ -1928,7 +2063,10 @@ main() {
       --no-shape)  apply_profile noshape; shift ;;
       --persist)   PERSIST=1; shift ;;
       --yes)       ASSUME_YES=1; shift ;;
-      *) die "未知参数：$1" ;;
+      # `record` takes its reading and note as positional arguments. Everything
+      # else still refuses unknown words rather than silently ignoring a typo.
+      *) if [[ "$cmd" == record ]]; then POSITIONAL+=("$1"); shift
+         else die "未知参数：$1"; fi ;;
     esac
   done
   if ! is_uint "$COVER_RTT_MS" || (( COVER_RTT_MS < 10 || COVER_RTT_MS > 2000 )); then
@@ -1952,6 +2090,7 @@ main() {
     plan)   cmd_plan ;;
     apply)  cmd_apply ;;
     status) cmd_status ;;
+    record) cmd_record "${POSITIONAL[@]+"${POSITIONAL[@]}"}" ;;
     revert) cmd_revert ;;
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;

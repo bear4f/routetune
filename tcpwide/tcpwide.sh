@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.14.1"
+VERSION="0.15.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -128,6 +128,11 @@ QDISC_LAYOUT=root
 # otherwise, because a single-thread reading is the common case and the one
 # that keeps getting misread as a server problem.
 RECORD_THREADS=1
+
+# The RTT a `record` reading was taken at. 0 means not supplied, which costs the
+# reading its place in the window analysis -- rate alone cannot tell a distant
+# backend from a throttled one.
+RECORD_RTT=0
 
 # fq's queue limits. 0 means "leave the kernel's value alone"; anything else is
 # written into the qdisc spec.
@@ -1142,20 +1147,51 @@ config_fingerprint() {
 # The fingerprint made a configuration identifiable; this makes two of them
 # comparable. Without it every round starts from opinion.
 #
-# One record per line: unix time, Mbps, fingerprint, note, threads.
+# One record per line: unix time, Mbps, fingerprint, note, threads, rtt.
+#
+# The RTT is what makes a pile of readings analysable. Rate alone cannot say
+# whether a slow backend is slow because it is far away or because something is
+# capping it: only rate x RTT separates those, and that product is the bytes
+# actually in flight.
 #
 # The thread count is the field that turns a pile of numbers into a diagnosis.
 # A single flow through a userspace proxy carries per-connection overhead that
 # no sysctl removes, so single-thread and multi-thread readings answer two
 # different questions and must never be averaged together.
 record_measurement() {
-  local mbps="${1:-}" note="${2:-}" threads="${3:-1}"
+  local mbps="${1:-}" note="${2:-}" threads="${3:-1}" rtt="${4:-0}"
   [[ "$mbps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
   is_uint "$threads" && (( threads > 0 )) || threads=1
+  [[ "$rtt" =~ ^[0-9]+(\.[0-9]+)?$ ]] || rtt=0
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" "$threads" >> "$MEASURE_LOG"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" "$threads" "$rtt" \
+    >> "$MEASURE_LOG"
   chmod 0600 "$MEASURE_LOG" 2>/dev/null || true
+}
+
+# How much of the window this machine offers is actually being used.
+#
+# in-flight = rate x RTT. Compare it against the window we advertise
+# (rmem_max / 2 under tcp_adv_win_scale=1) and the answer to "is my buffer the
+# limit" stops being a guess. Well under it means raising the ceiling -- or
+# buying a machine with more memory -- changes nothing, which is the expensive
+# wrong move this is here to prevent.
+#
+# Prints one row per single-thread reading that carries an RTT:
+#   note<TAB>rtt<TAB>mbps<TAB>inflight_MB<TAB>pct_of_window
+window_utilisation() {
+  local rmem
+  [[ -r "$MEASURE_LOG" ]] || return 1
+  rmem="$(live_value net.core.rmem_max)"
+  is_uint "${rmem:-}" && (( rmem > 0 )) || return 1
+  awk -F'\t' -v wnd="$(( rmem / 2 ))" '
+    NF >= 6 && $6 + 0 > 0 && (($5 + 0) <= 1) {
+      inflight = $2 * 1000000 * ($6 / 1000) / 8
+      printf "%s\t%s\t%s\t%.2f\t%.0f\n", ($4 == "" ? "-" : $4), $6, $2,
+             inflight / 1048576, inflight * 100 / wnd
+      seen = 1 }
+    END { if (!seen) exit 1 }' "$MEASURE_LOG" | sort -t"$(printf '\t')" -k5 -nr
 }
 
 # The fastest single-thread and multi-thread runs on record, as
@@ -1199,8 +1235,11 @@ cmd_record() {
   local mbps="${1:-}" note="${2:-}" row bm bf bn bw
   [[ -n "$mbps" ]] || die "用法：$PROGRAM record <Mbps> [备注] [--threads N]    例：$PROGRAM record 629 上海电信"
   resolve_iface
-  record_measurement "$mbps" "$note" "$RECORD_THREADS" \
+  record_measurement "$mbps" "$note" "$RECORD_THREADS" "$RECORD_RTT" \
     || die "Mbps 需为数字，例：$PROGRAM record 629.1 上海电信"
+  if [[ "$RECORD_RTT" == 0 ]]; then
+    warn "没给 --rtt，这条进不了窗口分析。测速面板上那个「延迟RTT」就是它"
+  fi
   title 'tcpwide 记录'
   log "已记录 $mbps Mbps"
   printf '  %b%s%b\n' "$DIM" "$(config_fingerprint)" "$RESET"
@@ -1211,7 +1250,39 @@ cmd_record() {
     printf '  %b%s%b\n' "$DIM" "$bf" "$RESET"
   fi
   render_verdict "${EGRESS_MBPS:-0}"
+  render_window_report
   printf '\n'
+}
+
+# The per-backend window table and what it implies. This is the arithmetic that
+# has had to be done by hand every round: rate x RTT against the window we
+# advertise, which is the only thing separating "our buffer is the limit" from
+# "the buffer has headroom and the limit is somewhere else".
+render_window_report() {
+  local rows peak=0 note rtt mbps mbytes pct
+  rows="$(window_utilisation)" || return 0
+  printf '\n  %b各后端实际用掉了本机窗口的多少%b\n' "$BOLD" "$RESET"
+  printf '  %b后端            RTT      实测       在途    占本机窗口%b\n' "$DIM" "$RESET"
+  while IFS=$'\t' read -r note rtt mbps mbytes pct; do
+    [[ -n "$rtt" ]] || continue
+    printf '  %-14s %5sms %7s Mbps %6s MB %8s%%\n' "${note:0:14}" "$rtt" "$mbps" "$mbytes" "$pct"
+    (( pct > peak )) && peak="$pct"
+  done <<< "$rows"
+  printf '  %b本机可通告窗口 %s MB（rmem_max 的一半）%b\n\n' \
+    "$DIM" "$(mb "$(( $(live_value net.core.rmem_max) / 2 ))")" "$RESET"
+  if (( peak >= 85 )); then
+    printf '  %b→ 已经有后端贴着本机窗口跑，缓冲就是瓶颈。%b\n' "$YELLOW" "$RESET"
+    printf '  %b  把覆盖 RTT 填到实际最远客户端那个值，内存够的话上限会跟着涨。%b\n' "$DIM" "$RESET"
+  else
+    printf '  %b→ 最高才用到 %s%%，本机缓冲不是瓶颈。%b\n' "$GREEN" "$peak" "$RESET"
+    printf '  %b  加大 rmem_max、换内存更大的机器，对这台都不会有任何作用。%b\n' "$DIM" "$RESET"
+    printf '  %b  剩下的杠杆，按性价比：%b\n' "$BOLD" "$RESET"
+    printf '  %b   1. notsent_lowat（面板 n）—— 唯一还没测过的便宜项。netshape 在%b\n' "$DIM" "$RESET"
+    printf '  %b      RTT≥120ms 时用 16384，和本机的 131072 直接对立，一测便知。%b\n' "$DIM" "$RESET"
+    printf '  %b   2. BBRv3（面板 s → 4）—— v1 在高 RTT 且有丢包的路径上估值最吃亏。%b\n' "$DIM" "$RESET"
+    printf '  %b   3. 换后端 —— 同一时刻不同后端差 20%%+ 且与 RTT 无关时，差的那块%b\n' "$DIM" "$RESET"
+    printf '  %b      在对端或路径上，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
+  fi
 }
 
 # Says out loud what the single/multi pair means.
@@ -2076,13 +2147,17 @@ panel_record() {
   read -r -p '  刚测到多少 Mbps（峰值，q 返回）: ' mbps || return 0
   [[ "$mbps" =~ ^[qQ]$ || -z "$mbps" ]] && { info "已取消"; return 0; }
   read -r -p '  备注（后端名字之类，可留空）: ' note || note=''
-  local threads
+  local threads rtt
   read -r -p '  几个线程（默认 1）: ' threads || threads=1
   is_uint "${threads:-}" && (( threads > 0 )) || threads=1
-  record_measurement "$mbps" "$note" "$threads" \
+  read -r -p '  这次测速的 RTT（ms，测速面板上那个延迟；留空跳过）: ' rtt || rtt=0
+  [[ "${rtt:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || rtt=0
+  record_measurement "$mbps" "$note" "$threads" "$rtt" \
     || { warn "需要一个数字，例：629.1"; return 0; }
   log "已记录 $mbps Mbps（${threads} 线程），和当前配置绑在一起了"
+  [[ "$rtt" == 0 ]] && warn "没填 RTT，这条进不了窗口分析"
   render_verdict "${EGRESS_MBPS:-0}"
+  render_window_report
 }
 
 # The layout is a knob rather than a decision so it can be A/B'd on the machine
@@ -2328,7 +2403,7 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   tcpwide apply --egress 500           应用（先快照，可完整还原）
   tcpwide apply --egress 500 --persist 应用并持久化（重启仍在）
   tcpwide status                       当前状态
-  tcpwide record <Mbps> [备注] [--threads N]
+  tcpwide record <Mbps> [备注] [--threads N] [--rtt MS]
                                        记下一次实测，和当前配置绑在一起
                                        多线程结果一定要加 --threads，它和单线程
                                        回答的是两个不同的问题
@@ -2379,6 +2454,7 @@ main() {
       --no-shape)  apply_profile noshape; shift ;;
       --persist)   PERSIST=1; shift ;;
       --threads)   [[ $# -ge 2 ]] || die "--threads 缺少值"; RECORD_THREADS="$2"; shift 2 ;;
+      --rtt)       [[ $# -ge 2 ]] || die "--rtt 缺少值"; RECORD_RTT="$2"; shift 2 ;;
       --yes)       ASSUME_YES=1; shift ;;
       # `record` takes its reading and note as positional arguments. Everything
       # else still refuses unknown words rather than silently ignoring a typo.

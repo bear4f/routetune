@@ -1009,7 +1009,7 @@ pass 'a non-numeric reading is refused rather than logged'
 assert_eq '3' "$(wc -l < "$MEASURE_LOG")" 'the refused reading did not reach the log'
 # A tab in the note would split the record into the wrong fields.
 FAKE_Q='fq maxrate 950mbit' record_measurement 100 "$(printf 'a\tb')"
-assert_eq '4' "$(awk -F'\t' 'NF == 5' "$MEASURE_LOG" | wc -l)" \
+assert_eq '4' "$(awk -F'\t' 'NF == 6' "$MEASURE_LOG" | wc -l)" \
   'a tab in the note cannot break the record into extra fields'
 rm -rf "$STATE_DIR"
 unset -f live_value current_default_route canonical_qdisc
@@ -1194,3 +1194,60 @@ pass 'the retransmission advice branches on the running profile'
 grep -q '改缓冲或队列都不会动它' "$ROOT/tcpwide.sh" \
   && fail 'the withdrawn claim must not still ship'
 pass 'the claim that per-flow limits cannot be moved is gone'
+
+
+# ── 0.15.0 在途字节数才能分开「缓冲不够」和「别处的锅」 ────────────────────
+# Four real readings from one machine, same configuration, minutes apart:
+#   黄石 155ms 927.14 | 黄石 163ms 881.27 | 深圳 192ms 583.23 | 岳阳 202ms 580.54
+# The two 黄石 points imply 17.13 and 17.12 MB in flight -- 0.06% apart, rate
+# tracking 1/RTT exactly. The other two sit at 13.35 and 13.98. All four are
+# well under the 21.7 MB this machine advertises, which is what says a bigger
+# buffer, or a machine with more memory, would change nothing. That conclusion
+# had to be reached by hand every single round.
+restore_lib
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+live_value() { case "$1" in net.core.rmem_max) printf '45497685\n' ;; *) printf 'bbr\n' ;; esac; }
+canonical_qdisc() { printf 'fq limit 10240p flow_limit 2048p maxrate 980Mbit\n'; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
+COVER_RTT_MS=200
+if window_utilisation >/dev/null 2>&1; then fail 'an empty log has no window analysis'; fi
+pass 'an empty measurement log yields no window analysis'
+# A reading without an RTT cannot enter the analysis: rate alone cannot tell a
+# distant backend from a throttled one.
+record_measurement 900 '没填RTT' 1 0
+if window_utilisation >/dev/null 2>&1; then fail 'a reading with no RTT must not be analysed'; fi
+pass 'a reading without an RTT is left out rather than guessed at'
+record_measurement 927.14 '黄石' 1 155
+record_measurement 881.27 '黄石' 1 163
+record_measurement 583.23 '深圳' 1 192
+record_measurement 580.54 '岳阳' 1 202
+assert_eq '4' "$(window_utilisation | wc -l)" 'only the readings carrying an RTT are analysed'
+IFS=$'\t' read -r wu_note wu_rtt _ wu_mb wu_pct <<< "$(window_utilisation | sed -n 1p)"
+assert_eq '黄石' "$wu_note" 'the table leads with the backend using the most window'
+assert_eq '79' "$wu_pct" 'the fastest backend reaches 79% of the advertised window'
+# The two 黄石 points are the evidence for a fixed window: same in-flight bytes
+# at two different RTTs, so the rate difference is entirely the RTT.
+a="$(window_utilisation | awk -F'\t' '$2 == 155 {print $4}')"
+b="$(window_utilisation | awk -F'\t' '$2 == 163 {print $4}')"
+awk -v x="$a" -v y="$b" 'BEGIN {exit !(x > 0 && y > 0 && (x - y < 0.05) && (y - x < 0.05))}' \
+  || fail "the two 黄石 points must imply the same in-flight bytes, got $a and $b"
+pass 'two RTTs on one backend imply the same bytes in flight'
+# Multi-thread readings are excluded: their in-flight is spread over N flows, so
+# dividing by one window would overstate what a single flow reached.
+record_measurement 917.4 '多线程' 4 175
+assert_eq '4' "$(window_utilisation | wc -l)" 'a multi-thread reading stays out of the per-flow analysis'
+# Under the threshold the report must say the buffer is NOT the limit, because
+# the expensive wrong move here is buying a machine with more memory.
+out="$(render_window_report 2>&1)"
+[[ "$out" == *"本机缓冲不是瓶颈"* ]] || fail 'below the threshold the buffer must be cleared'
+[[ "$out" == *"换内存更大的机器，对这台都不会有任何作用"* ]] \
+  || fail 'and the expensive wrong move must be named'
+[[ "$out" == *"notsent_lowat"* ]] || fail 'the remaining levers must be ranked'
+pass 'a buffer with headroom is cleared and the remaining levers are ranked'
+# And when something really is pressed against the window, say so instead.
+record_measurement 1150 '近端' 1 155
+out="$(render_window_report 2>&1)"
+[[ "$out" == *"缓冲就是瓶颈"* ]] || fail 'a backend at the window must be reported as buffer-limited'
+pass 'a backend pressed against the window is reported as buffer-limited'
+rm -rf "$STATE_DIR"
+unset -f live_value canonical_qdisc current_default_route

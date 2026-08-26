@@ -36,8 +36,17 @@ total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 # 257.3 Mbps, the same buffer plus 2MiB averaged 272.7, both at zero
 # retransmission. A fixed margin recovers it without scaling faster machines up
 # proportionally.
+assert_eq "$((4 * 250 * 125 * 500 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+  'the ceiling is four bandwidth-delay products plus a fixed margin'
+# The multiplier was 2, from tcp_adv_win_scale=1 meaning the application gets
+# half the receive buffer. Measured on two machines across fifteen TcpQuality
+# nodes it is a quarter, not a half: BWG at rmem 43.4 MB settled at 11.27-11.64
+# MB in flight over RTTs from 148 to 174ms (a 3% spread against a 17% spread in
+# RTT), and DMIT at rmem 32.0 MB settled at 6.74-9.08. Ratios 0.264 and 0.247.
+BDP_MULTIPLIER=2
 assert_eq "$((2 * 250 * 125 * 500 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
-  'the ceiling is twice the bandwidth-delay product plus a fixed margin'
+  'the multiplier is a knob, and set back to 2 it reproduces 0.15.1 exactly'
+BDP_MULTIPLIER=4
 # The asymmetry that motivates a coverage RTT also motivates a floor: a ceiling
 # below what a distant client needs is a cap nobody can diagnose.
 assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope still gets the 8 MiB floor'
@@ -48,11 +57,11 @@ assert_eq "$((8 * 1024 * 1024))" "$(buffer_ceiling 10 20)" 'a tiny envelope stil
 # a memory ladder that knows nothing about the path. Clamping against RAM
 # directly let one connection monopolise the budget on a small box.
 total_ram_bytes() { printf '%s\n' $((512 * 1024 * 1024)); }
-assert_eq "$((512 * 1024 * 1024 / 3 / 4))" "$(buffer_ceiling 2000 1000)" \
-  'one socket is held to a quarter of the global TCP budget'
+assert_eq "$((512 * 1024 * 1024 / 3 / 2))" "$(buffer_ceiling 2000 1000)" \
+  'one socket is held to half of the global TCP budget'
 # The budget only grows when the need calls for it: a modest ceiling leaves the
 # budget at RAM/4 and is not clamped at all.
-assert_eq "$((2 * 400 * 125 * 200 + 2 * 1024 * 1024))" "$(buffer_ceiling 400 200)" \
+assert_eq "$((4 * 400 * 125 * 200 + 2 * 1024 * 1024))" "$(buffer_ceiling 400 200)" \
   'a ceiling that fits inside the starting budget is passed through unclamped'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 
@@ -67,7 +76,7 @@ total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 # against, BBR holding a huge cwnd, is now bounded by per-flow pacing.
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
 buf="$(buffer_ceiling 1000 250)"
-assert_eq "$((520 * 1024 * 1024 / 3 / 4))" "$buf" \
+assert_eq "$((520 * 1024 * 1024 / 3 / 2))" "$buf" \
   'a small box with a fast port is sized by budget, not by a RAM ladder'
 (( buf > 16 * 1024 * 1024 )) || fail 'the budget cap must beat the ladder it replaced here'
 pass 'the gigabit box gets more than the ladder would have allowed'
@@ -76,7 +85,7 @@ pass 'the gigabit box gets more than the ladder would have allowed'
 # could not. What matters is the rate the resulting window supports on the paths
 # that box actually serves — 140-176 ms, not the 250 ms worst case.
 for rtt in 150 176; do
-  win=$(( $(buffer_ceiling 1000 "$rtt") / 2 ))
+  win=$(( $(buffer_ceiling 1000 "$rtt") / BDP_MULTIPLIER ))
   mbps=$(( win / 125 / rtt ))
   (( mbps >= 1000 )) || fail "a 520 MB box must clear a gigabit at ${rtt}ms, got ${mbps} Mbps"
 done
@@ -418,14 +427,16 @@ assert_eq "$((958 * 1024 * 1024 / 4096 / 4))" "$tm_max" \
 [[ "$tm_low" -lt "$tm_pres" && "$tm_pres" -lt "$tm_max" ]] \
   || fail 'the three tcp_mem thresholds must be ordered'
 pass 'the tcp_mem thresholds are ordered low < pressure < max'
-# One socket takes at most a quarter of the budget, so four large flows still
-# fit before the kernel starts shrinking everyone. Four rather than eight
-# because on a small box with a fast port, eight would cap a single flow well
-# under the port — and tcp_mem itself is the backstop that prevents an OOM.
+# One socket takes at most half the budget, so two large flows still fit before
+# the kernel starts shrinking everyone. It was a quarter, which put the hard
+# per-socket ceiling at RAM/12; with the corrected multiplier that capped a
+# 520 MB box at 535 Mbps on a gigabit port. Trading two of the four concurrent
+# slots for single-flow line rate was a deliberate call, and tcp_mem is still
+# the backstop -- past it the kernel shrinks buffers rather than failing.
 buf="$(buffer_ceiling 500 250)"
-(( buf * 4 <= tm_max * 4096 )) \
-  || fail 'the ceiling must leave room for four flows inside the global budget'
-pass 'four flows at the ceiling fit inside the global budget'
+(( buf * 2 <= tm_max * 4096 )) \
+  || fail 'the ceiling must leave room for two flows inside the global budget'
+pass 'two flows at the ceiling fit inside the global budget'
 
 # ── 0.3.0 整形的 CPU 代价 ──────────────────────────────────────────────────
 # CAKE funnels the whole egress through one qdisc and does per-packet work. On a
@@ -515,7 +526,7 @@ out="$(explain_cover_rtt 1000 2>&1)"
 pass 'a clamped row in the cost table is marked'
 [[ "$out" == *"不会再增加缓冲"* ]] \
   || fail 'the point where the clamp starts binding must be named'
-[[ "$out" == *"全局 TCP 预算的 1/4"* ]] \
+[[ "$out" == *"全局 TCP 预算的一半"* ]] \
   || fail 'the binding rule must name itself'
 pass 'the binding rule explains which rule it is'
 pass 'the coverage RTT past which nothing changes is stated outright'
@@ -615,7 +626,7 @@ unset -f ss has
 # peak there. Overriding it is how that gets tested one variable at a time.
 total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
 BUF_MB=0
-assert_eq "$((500 * 125 * 250 * 2 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
+assert_eq "$((500 * 125 * 250 * 4 + 2 * 1024 * 1024))" "$(buffer_ceiling 500 250)" \
   'auto derives from the envelope when the budget has room'
 BUF_MB=32
 # The override must skip the ladder, or testing the ladder would be impossible.
@@ -753,8 +764,8 @@ COVER_RTT_MS=250
 # table computed its clamp once, up front, from RAM alone -- correct until the
 # budget started following the need, and silently wrong afterwards.
 out="$(explain_cover_rtt 1000 2>&1)"
-[[ "$out" == *"43.3 MB/socket"* ]] || fail 'the wizard table must show the need-driven ceiling'
-[[ "$out" != *"32.5 MB/socket"* ]] || fail 'the wizard table must not use the pre-0.9.1 clamp'
+[[ "$out" == *"86.7 MB/socket"* ]] || fail 'the wizard table must show the need-driven ceiling'
+[[ "$out" != *"43.3 MB/socket"* ]] || fail 'the wizard table must not use the RAM/12 clamp'
 pass 'the wizard table agrees with buffer_ceiling about the ceiling'
 # A machine with room says nothing of the sort.
 total_ram_bytes() { printf '%s\n' $((32 * 1024 * 1024 * 1024)); }
@@ -1121,16 +1132,19 @@ FQ_INITIAL_QUANTUM=0
 # The wizard said "above 173 ms the buffer stops growing" and recommended 200 in
 # the same breath. Two numbers on screen arguing with each other.
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+# With the ceiling at RAM/6 and four BDPs per flow, the knee on this box moves
+# from 173ms to 355ms: the same memory now covers twice the coverage RTT before
+# it stops growing.
 knee="$(buffer_knee_ms 1000)"
-assert_eq '173' "$knee" 'the knee is where the budget stops growing'
-(( knee < 200 )) || fail 'this box must have its knee below the 200 the wizard suggested'
-pass 'the knee sits below the suggestion, so the caveat is needed'
+assert_eq '355' "$knee" 'the knee is where the budget stops growing'
+(( knee > 200 )) || fail 'the corrected ceiling must push the knee past the usual suggestion'
+pass 'the knee moved out past the suggestion once the ceiling doubled'
 has() { [[ "$1" == sysctl ]]; }
 sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '8330\t16661\t33323\n'; }
-suggest_cover_rtt() { printf '200\t167\t9\n'; }
-COVER_RTT_MS=200
+suggest_cover_rtt() { printf '400\t333\t9\n'; }
+COVER_RTT_MS=400
 out="$(explain_cover_rtt 1000 2>&1)"
-[[ "$out" == *"填 200 和填 173 效果相同"* ]] \
+[[ "$out" == *"填 400 和填 355 效果相同"* ]] \
   || fail 'a suggestion past the knee must say it changes nothing'
 pass 'a suggestion past the knee says so instead of contradicting itself'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
@@ -1217,35 +1231,60 @@ pass 'an empty measurement log yields no window analysis'
 record_measurement 900 '没填RTT' 1 0
 if window_utilisation >/dev/null 2>&1; then fail 'a reading with no RTT must not be analysed'; fi
 pass 'a reading without an RTT is left out rather than guessed at'
-record_measurement 927.14 '黄石' 1 155
-record_measurement 881.27 '黄石' 1 163
-record_measurement 583.23 '深圳' 1 192
-record_measurement 580.54 '岳阳' 1 202
-assert_eq '4' "$(window_utilisation | wc -l)" 'only the readings carrying an RTT are analysed'
-IFS=$'\t' read -r wu_note _ _ _ wu_pct <<< "$(window_utilisation | sed -n 1p)"
-assert_eq '黄石' "$wu_note" 'the table leads with the backend using the most window'
-assert_eq '79' "$wu_pct" 'the fastest backend reaches 79% of the advertised window'
-# The two 黄石 points are the evidence for a fixed window: same in-flight bytes
-# at two different RTTs, so the rate difference is entirely the RTT.
-a="$(window_utilisation | awk -F'\t' '$2 == 155 {print $4}')"
-b="$(window_utilisation | awk -F'\t' '$2 == 163 {print $4}')"
-awk -v x="$a" -v y="$b" 'BEGIN {exit !(x > 0 && y > 0 && (x - y < 0.05) && (y - x < 0.05))}' \
-  || fail "the two 黄石 points must imply the same in-flight bytes, got $a and $b"
-pass 'two RTTs on one backend imply the same bytes in flight'
+# TcpQuality's 回程 figures, which are this box pulling from each node: the VPS
+# is the receiver and the RTT is its own, so they answer a receive-window
+# question. Six nodes at 0.00% retransmission, RTT 148-174ms.
+record_measurement 642.6 '上海电信' 1 149
+record_measurement 634.0 '上海联通' 1 151
+record_measurement 638.9 '上海移动' 1 148
+record_measurement 581.1 '北京电信' 1 168
+record_measurement 558.7 '广东电信' 1 174
+record_measurement 549.0 '广东移动' 1 174
+assert_eq '6' "$(window_utilisation | wc -l)" 'only the readings carrying an RTT are analysed'
+IFS=$'\t' read -r _ _ _ _ wu_pct <<< "$(window_utilisation | sed -n 1p)"
+# Under the old /2 assumption these same readings came out at 52-54% and the
+# tool told this operator their buffer had room to spare. Against the measured
+# ratio they are at the window.
+(( wu_pct >= 100 && wu_pct <= 110 )) \
+  || fail "these readings sit at the window, expected 100-110%, got ${wu_pct}%"
+pass 'the six-node sample lands at the window rather than half of it'
+# The in-flight bytes barely move while the RTT spreads 17%: that is what a
+# fixed window looks like, and why rate alone could never have shown it.
+lo="$(window_utilisation | awk -F'\t' '{print $4}' | sort -n | head -1)"
+hi="$(window_utilisation | awk -F'\t' '{print $4}' | sort -n | tail -1)"
+awk -v l="$lo" -v h="$hi" 'BEGIN {exit !(l > 0 && (h - l) / l < 0.05)}' \
+  || fail "in-flight bytes must cluster within 5%, got $lo to $hi"
+pass 'bytes in flight cluster while RTT spreads, which is a fixed window'
+# An end-to-end reading through the proxy carries the CLIENT's RTT over a
+# different leg, so it is not a measurement of this machine's receive window at
+# all. Reported as a percentage of our window it reads 158%, and the report has
+# to say what that means rather than treating it as a buffer verdict.
+record_measurement 927.14 '黄石端到端' 1 155
+out="$(render_window_report 2>&1)"
+[[ "$out" == *"量的不是这台机器的接收腿"* ]] \
+  || fail 'a reading past the window must be identified as measuring another leg'
+pass 'an end-to-end reading is not mistaken for a receive-window measurement'
 # Multi-thread readings are excluded: their in-flight is spread over N flows, so
 # dividing by one window would overstate what a single flow reached.
 record_measurement 917.4 '多线程' 4 175
-assert_eq '4' "$(window_utilisation | wc -l)" 'a multi-thread reading stays out of the per-flow analysis'
-# Under the threshold the report must say the buffer is NOT the limit, because
-# the expensive wrong move here is buying a machine with more memory.
+assert_eq '7' "$(window_utilisation | wc -l)" 'a multi-thread reading stays out of the per-flow analysis'
+# A buffer with genuine headroom is still cleared, and the levers ranked.
+: > "$MEASURE_LOG"
+record_measurement 300 '慢后端' 1 150
 out="$(render_window_report 2>&1)"
-[[ "$out" == *"本机缓冲不是瓶颈"* ]] || fail 'below the threshold the buffer must be cleared'
-[[ "$out" == *"换内存更大的机器，对这台都不会有任何作用"* ]] \
-  || fail 'and the expensive wrong move must be named'
+[[ "$out" == *"本机缓冲还有余量"* ]] || fail 'below the threshold the buffer must be cleared'
 [[ "$out" == *"notsent_lowat"* ]] || fail 'the remaining levers must be ranked'
 pass 'a buffer with headroom is cleared and the remaining levers are ranked'
+# 0.15.0 divided by rmem/2, reported these very readings as 52-54% and told the
+# operator a machine with more memory "would make no difference". Under the
+# measured ratio the box was at its window and memory-limited. The sentence must
+# never ship again.
+grep -q '换内存更大的机器，对这台都不会有任何作用' "$ROOT/tcpwide.sh" \
+  && fail 'the withdrawn advice against more memory must not still ship'
+pass 'the advice against buying more memory is withdrawn'
 # And when something really is pressed against the window, say so instead.
-record_measurement 1150 '近端' 1 155
+: > "$MEASURE_LOG"
+record_measurement 600 '贴窗口' 1 150
 out="$(render_window_report 2>&1)"
 [[ "$out" == *"缓冲就是瓶颈"* ]] || fail 'a backend at the window must be reported as buffer-limited'
 pass 'a backend pressed against the window is reported as buffer-limited'
@@ -1283,3 +1322,72 @@ for stale in '没有可靠依据' '只能靠你这条路径裁决' '唯一还没
 done
 pass 'no surface still calls the notsent_lowat question open'
 NOTSENT_LOWAT=131072
+
+
+# ── 0.16.0 持久化默认开、手动上限告警、窗口比例诊断 ────────────────────────
+restore_lib
+# Without persistence every reboot silently reverts the machine to stock and the
+# next speedtest measures something nobody configured.
+assert_eq '1' "$PERSIST" 'persistence is on by default'
+
+# A manual ceiling below what the derivation would pick is a cap set once during
+# an experiment and forgotten. A leftover 32 MB held the 958 MB box to 353 Mbps
+# on a 520 Mbps port while its memory allowed 49 MB, and nothing said so.
+total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
+BUF_MB=32
+IFS=$'\t' read -r mb_manual mb_auto mb_capped <<< "$(manual_buffer_shortfall 520 190)"
+assert_eq "$((32 * 1024 * 1024))" "$mb_manual" 'the manual ceiling is reported as set'
+(( mb_auto > mb_manual )) || fail 'the derivation would have picked more'
+(( mb_capped < 520 )) || fail 'and the manual value caps the port'
+out="$(warn_manual_buffer 520 190 2>&1)"
+[[ "$out" == *"低于自动值"* ]] || fail 'a manual ceiling under the auto one must warn'
+[[ "$out" == *"520"* ]] || fail 'and name the port it is capping'
+pass 'a manual ceiling below the derivation is reported with its cost'
+# Above the derivation it is a deliberate choice and must stay silent.
+BUF_MB=64
+if manual_buffer_shortfall 520 190 >/dev/null 2>&1; then
+  fail 'a manual ceiling above the derivation is not a shortfall'
+fi
+pass 'a manual ceiling above the derivation raises nothing'
+BUF_MB=0
+
+# window_ratio separates the two explanations for in-flight landing at a quarter
+# of rmem_max. They need different fixes, so guessing is not good enough.
+IFACE=eth0
+live_value() { printf '45497685\n'; }        # rmem_max 43.4 MB
+has() { [[ "$1" == ss ]]; }
+# rcvbuf at the ceiling, kernel handing out a quarter of it -> the ratio.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
+  printf '\t skmem:(r0,rb45497685,t0,tb87040) rtt:150/4 delivery_rate 640.0Mbps\n'
+}
+IFS=$'\t' read -r wr_rb _ _ wr_fill wr_ratio <<< "$(window_ratio)"
+assert_eq '45497685' "$wr_rb" 'the actual rcvbuf is read from the skmem block'
+(( wr_fill >= 95 )) || fail "autotuning reached the ceiling, expected ~100%, got ${wr_fill}%"
+(( wr_ratio <= 35 )) || fail "the kernel handed out about a quarter, got ${wr_ratio}%"
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"BDP 乘数 4 是对的"* ]] || fail 'a full buffer at a quarter ratio confirms the multiplier'
+pass 'rcvbuf at the ceiling with a quarter ratio confirms the multiplier'
+# rcvbuf far below the ceiling is a different fault entirely: raising rmem_max
+# would achieve nothing, and the knobs are tcp_rmem[1] and moderate_rcvbuf.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
+  printf '\t skmem:(r0,rb12000000,t0,tb87040) rtt:150/4 delivery_rate 320.0Mbps\n'
+}
+IFS=$'\t' read -r _ _ _ wr_fill _ <<< "$(window_ratio)"
+(( wr_fill < 70 )) || fail 'a buffer well under the ceiling must read as short'
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"autotuning 没长到顶"* ]] || fail 'a short buffer must be named as an autotuning fault'
+[[ "$out" == *"加大 rmem_max 没用"* ]] || fail 'and must say raising rmem_max will not help'
+pass 'a buffer short of the ceiling is diagnosed as autotuning, not as ratio'
+# A same-datacentre neighbour is not the client population here either.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 23.19.231.167:51000\n'
+  printf '\t skmem:(r0,rb45497685,t0,tb87040) rtt:0.6/0.3 delivery_rate 42.0Mbps\n'
+}
+if window_ratio >/dev/null 2>&1; then fail 'a local connection must not be the ratio sample'; fi
+pass 'the ratio sample ignores same-datacentre connections'
+unset -f ss has live_value

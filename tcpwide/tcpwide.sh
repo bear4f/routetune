@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.14.0"
+VERSION="0.14.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -782,6 +782,10 @@ qdisc_drift() {
   printf '%s\n' "$live"
 }
 
+# Fewer segments than this in the window and the ratio is noise: at 20 segments
+# a single retransmission reads as 5%. Roughly a second of a real transfer.
+RETRANS_MIN_SEGS=2000
+
 # Retransmissions over a sampling window, not since boot. On a machine that has
 # been up for weeks the lifetime average is a number that cannot move and
 # therefore cannot tell you whether a change helped.
@@ -797,7 +801,11 @@ retrans_rate() {
   sb="$(awk '$1 == "TcpOutSegs" {print $2; exit}' <<< "$out")"
   is_uint "${ra:-}" && is_uint "${rb:-}" && is_uint "${sa:-}" && is_uint "${sb:-}" || return 1
   a=$(( rb - ra )); b=$(( sb - sa ))
-  (( b > 0 )) || return 1
+  # An idle box sends a handful of segments in five seconds, and one
+  # retransmission out of fifty reads as a flat 2.0000% -- a suspiciously round
+  # number that is noise, not a loss rate. Below a floor there is nothing to
+  # report, so say so rather than print a figure that invites a wrong fix.
+  (( b >= RETRANS_MIN_SEGS )) || return 2
   awk -v r="$a" -v s="$b" 'BEGIN {printf "%.4f\n", r * 100 / s}'
 }
 
@@ -1206,8 +1214,13 @@ cmd_record() {
   printf '\n'
 }
 
-# Says out loud what the single/multi pair means, so nobody has to work it out
-# by hand the way this took five rounds of asking to establish.
+# Says out loud what the single/multi pair means.
+#
+# 0.13.0 said something stronger and it was wrong: that a single flow below the
+# aggregate is per-connection overhead which "no buffer or queue setting moves".
+# The very next change moved it by 70% -- fq's flow_limit took one thread from
+# 546 to 927 Mbps, level with what several threads had been managing. A gap
+# between the two arms says where to look, never that looking is pointless.
 render_verdict() {
   local port="${1:-0}" v single multi pct state
   v="$(throughput_verdict "$port")" || return 0
@@ -1215,10 +1228,17 @@ render_verdict() {
   printf '\n  %b单线程 %s Mbps ｜ 多线程 %s Mbps（%s%% 线速）%b\n' \
     "$BOLD" "$single" "$multi" "$pct" "$RESET"
   if [[ "$state" == tuned ]]; then
-    printf '  %b→ 聚合已经跑满端口，服务端这一侧调好了。单流低于它是每连接开销%b\n' \
-      "$GREEN" "$RESET"
-    printf '  %b  （代理的加解密链路 + BBR 单流行为），改缓冲或队列都不会动它。%b\n' \
-      "$DIM" "$RESET"
+    printf '  %b→ 聚合已经跑满端口，服务端的总能力没问题。%b\n' "$GREEN" "$RESET"
+    if awk -v s="$single" -v m="$multi" 'BEGIN {exit !(s < m * 0.85)}'; then
+      printf '  %b  但单流只有多线程的 %.0f%%，差的这块是「每流」的限制——%b\n' \
+        "$YELLOW" "$(awk -v s="$single" -v m="$multi" 'BEGIN {print s * 100 / m}')" "$RESET"
+      printf '  %b  fq 的 flow_limit、notsent_lowat、BBR 单流行为都在这一类里。面板 s) 逐个 A/B。%b\n' \
+        "$DIM" "$RESET"
+      printf '  %b  （0.13.0 曾断言这块动不了，随后 flow_limit 就把它抬了 70%%。）%b\n' \
+        "$DIM" "$RESET"
+    else
+      printf '  %b  单流也追平了多线程，两条腿都到位了。%b\n' "$GREEN" "$RESET"
+    fi
   else
     printf '  %b→ 多线程也没跑满端口，说明瓶颈还在服务端或上游，值得继续查。%b\n' \
       "$YELLOW" "$RESET"
@@ -1250,12 +1270,20 @@ canonical_qdisc() {
   # Only the fields we set ourselves survive. Everything else is either a
   # kernel default that never varies with our configuration, or bookkeeping
   # that varies without it.
+  # limit and flow_limit belong here even though they look like kernel defaults:
+  # since 0.14.0 they ARE configuration, and flow_limit is the setting that took
+  # a single thread from 546 to 927 Mbps. Leaving them out gave the winning
+  # configuration and the losing one the same fingerprint, which would have made
+  # the record log unable to tell apart the very knob it exists to compare.
   awk -v kind="$kind" '{
     out = kind
     for (i = 1; i <= NF; i++) {
       if ($i == "maxrate"    && i < NF) out = out " maxrate " $(i+1)
       if ($i == "bandwidth"  && i < NF) out = out " " $(i+1)
       if ($i == "rtt"        && i < NF) out = out " rtt " $(i+1)
+      if ($i == "limit"      && i < NF) out = out " limit " $(i+1)
+      if ($i == "flow_limit" && i < NF) out = out " flow_limit " $(i+1)
+      if ($i == "initial_quantum" && i < NF) out = out " initial_quantum " $(i+1)
       if ($i == "dual-dsthost" || $i == "dual-srchost" || $i == "triple-isolate") out = out " " $i
       if ($i == "no-split-gso") out = out " no-split-gso"
     }
@@ -1673,7 +1701,7 @@ peer_window_ceiling() {
       print substr($i, j + 1); break
     }
   }' | sort -u | tr '\n' ' ')" || return 1
-  ss -tinH 2>/dev/null | awk -v listen=" $ports " '
+  ss -tinH 2>/dev/null | awk -v listen=" $ports " -v floor="$LOCAL_RTT_SAMPLE_MS" '
     function portof(a,   i) {
       i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
       return (i > 0) ? substr(a, i + 1) : ""
@@ -1699,7 +1727,11 @@ peer_window_ceiling() {
         else if ($i ~ /^snd_wnd:/) wnd = substr($i, 9) + 0
         else if ($i == "delivery_rate" && i < NF) rate = tomb($(i + 1))
       }
-      if (rtt > 0 && wnd > 0 && rate > best && index(listen, " " portof(local) " ") > 0) {
+      # Same-datacentre and loopback connections are not the client population.
+      # A 0.6ms neighbour won the "fastest" contest and the panel then reported
+      # that the buffer supports 303318 Mbps on it -- an arithmetically correct
+      # number about a connection nobody is asking about.
+      if (rtt >= floor && wnd > 0 && rate > best && index(listen, " " portof(local) " ") > 0) {
         best = rate; brtt = rtt; bwnd = wnd; bpeer = ipof(peer)
       }
       local = ""; peer = ""; next
@@ -1768,7 +1800,10 @@ render_panel() {
   [[ "$live_cc" == bbr ]] && printf '%b（主线只有 v1，容量剧变后估值滞后）%b' "$DIM" "$RESET"
   [[ "$live_cc" == cubic ]] && printf '%b（每丢一次砍一次窗，无线链路上起不来）%b' "$YELLOW" "$RESET"
   printf '\n'
-  live_q="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | sed 's/^qdisc //' | cut -c1-58)"
+  # The raw dump is ~200 characters of kernel defaults, so it was cut to 58 and
+  # ended mid-word ("...flow_limit 2048p bucke"). The canonical form is the same
+  # information the fingerprint uses and fits without truncation.
+  live_q="$(canonical_qdisc 2>/dev/null)"
   printf '  %b根队列%b     %s\n' "$DIM" "$RESET" "${live_q:-未知}"
   local show_buf="$buf"; [[ -z "$live_buf" ]] || show_buf="$live_buf"
   printf '  %b缓冲上限%b   %s MB/socket' "$DIM" "$RESET" "$(mb "$show_buf")"
@@ -1876,11 +1911,24 @@ panel_diagnose() {
   title 'tcpwide 诊断'
   local pct drift other
   printf '  %b正在采样 5 秒的实时重传率…%b\n' "$DIM" "$RESET"
-  if pct="$(retrans_rate 5)"; then
+  local rc=0
+  pct="$(retrans_rate 5)" || rc=$?
+  if (( rc == 0 )); then
     printf '  实时重传率:        %s%%%b（5 秒窗口增量，不是自开机累计）%b\n' "$pct" "$DIM" "$RESET"
     if awk -v p="$pct" 'BEGIN {exit !(p >= 2)}'; then
-      warn "重传偏高。先确认根队列真的是 cake（有 pacing），再看是不是客户端侧无线丢包"
+      # The advice has to match the profile that is running. Telling someone on
+      # the no-shape profile to "check the queue is really cake" sends them to
+      # undo the setting that is correct for their machine.
+      if (( SHAPE == 1 )); then
+        warn "重传偏高。先确认根队列真的是 cake（有 pacing），再看是不是客户端侧无线丢包"
+      else
+        warn "重传偏高。fq maxrate 已经在给每条流限速，所以先看客户端侧无线丢包和上游线路"
+      fi
     fi
+  elif (( rc == 2 )); then
+    printf '  实时重传率:        %b样本太少，不作判断%b（5 秒内不足 %s 个报文，一次重传就能读成 2%%）\n' \
+      "$DIM" "$RESET" "$RETRANS_MIN_SEGS"
+    printf '  %b要测这个数，就在跑测速的同时进来看。%b\n' "$DIM" "$RESET"
   else
     printf '  实时重传率:        无法采样（缺少 nstat 或窗口内没有流量）\n'
   fi
@@ -1904,7 +1952,12 @@ panel_diagnose() {
     printf '  CPU（5 秒窗口）:   无法采样\n'
   fi
   local win peer wrtt wbytes wceil wobs
-  if win="$(peer_window_ceiling)"; then
+  if ! win="$(peer_window_ceiling)"; then
+    printf '\n  %b没有 %s ms 以外的活跃入站连接可看。%b\n' "$DIM" "$LOCAL_RTT_SAMPLE_MS" "$RESET"
+    printf '  %b同机房和本地连接不是你的客户端，拿它们算单流上限只会得到无意义的大数。%b\n' \
+      "$DIM" "$RESET"
+  fi
+  if [[ -n "${win:-}" ]]; then
     IFS=$'\t' read -r peer wrtt wbytes wceil wobs <<< "$win"
     printf '\n  %b最快的那条连接：%s%b\n' "$BOLD" "$peer" "$RESET"
     printf '    RTT %s ms｜对端通告窗口 %s MB｜实测 %s Mbps\n' \

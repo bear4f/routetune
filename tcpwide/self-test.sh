@@ -1030,11 +1030,25 @@ tc() {
 a="$(FAKE_H=8006 canonical_qdisc)"
 b="$(FAKE_H=8007 canonical_qdisc)"
 assert_eq "$a" "$b" 'a reassigned qdisc handle does not change the identity'
-assert_eq 'fq maxrate 980Mbit' "$a" 'the canonical form keeps only what we chose'
-for junk in 8006 refcnt limit buckets orphan_mask quantum horizon low_rate_threshold; do
+# limit and flow_limit are part of the identity since 0.14.0, because they are
+# configuration now: flow_limit is what took a single thread from 546 to 927
+# Mbps. Leaving them out gave the winning and losing configurations the same
+# fingerprint, so the record log could not compare the very knob it exists for.
+assert_eq 'fq limit 10000p flow_limit 100p initial_quantum 15140b maxrate 980Mbit' "$a" \
+  'the canonical form keeps only what we chose'
+for junk in 8006 refcnt buckets orphan_mask horizon low_rate_threshold refill_delay; do
   [[ "$a" != *"$junk"* ]] || fail "the canonical form must not carry $junk"
 done
 pass 'kernel bookkeeping and defaults are stripped from the identity'
+# The two arms of the measurement that mattered must not collide.
+tc() { printf 'qdisc fq 8006: root refcnt 2 limit 10240p flow_limit 2048p buckets 1024 maxrate 980Mbit
+'; }
+won="$(canonical_qdisc)"
+tc() { printf 'qdisc fq 8007: root refcnt 2 limit 10000p flow_limit 100p buckets 1024 maxrate 980Mbit
+'; }
+lost="$(canonical_qdisc)"
+[[ "$won" != "$lost" ]] || fail 'the flow_limit arms must be distinguishable'
+pass 'the two flow_limit arms carry different identities'
 tc() { printf 'qdisc cake 8005: root refcnt 2 bandwidth 950Mbit besteffort dual-dsthost nonat nowash no-ack-filter no-split-gso rtt 200ms raw overhead 0\n'; }
 assert_eq 'cake 950Mbit dual-dsthost no-split-gso rtt 200ms' "$(canonical_qdisc)" \
   'CAKE keeps its bandwidth, isolation, gso choice and rtt'
@@ -1121,3 +1135,62 @@ out="$(explain_cover_rtt 1000 2>&1)"
 pass 'a suggestion past the knee says so instead of contradicting itself'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 unset -f has sysctl suggest_cover_rtt
+
+
+# ── 0.14.1 面板上那几个假数字 ──────────────────────────────────────────────
+# A 0.6ms same-datacentre neighbour won the "fastest connection" contest, and
+# the panel then reported that the buffer supports 303318 Mbps on it -- true
+# arithmetic about a connection nobody asked about. Local connections are not
+# the client population.
+restore_lib
+IFACE=eth0
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 23.19.231.167:51000\n'
+  printf '\t rtt:0.6/0.3 snd_wnd:131072 delivery_rate 42.0Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
+  printf '\t rtt:155/4 snd_wnd:8388608 delivery_rate 900.0Mbps\n'
+}
+has() { [[ "$1" == ss ]]; }
+IFS=$'\t' read -r pw_peer pw_rtt _ _ _ <<< "$(peer_window_ceiling)"
+assert_eq '1.2.3.4' "$pw_peer" 'the real remote client is chosen over the local neighbour'
+[[ "$pw_rtt" != 0.6 ]] || fail 'a 0.6ms connection must never be the sample'
+pass 'a same-datacentre connection cannot become the single-flow reference'
+# With nothing but local connections there is no reference at all, and saying so
+# beats inventing one.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:443 23.19.231.167:51000\n'
+  printf '\t rtt:0.6/0.3 snd_wnd:131072 delivery_rate 42.0Mbps\n'
+}
+if peer_window_ceiling >/dev/null 2>&1; then fail 'an all-local sample yields no reference'; fi
+pass 'an all-local sample reports no reference rather than a fabricated one'
+unset -f ss has
+
+# A five-second window on an idle box carries a handful of segments, and one
+# retransmission out of fifty reads as a flat 2.0000% -- a suspiciously round
+# number that is noise. Below a floor there is nothing to report.
+has() { [[ "$1" == nstat ]]; }
+NSTAT_R=0; NSTAT_S=0
+nstat() { printf 'TcpRetransSegs %s 0\nTcpOutSegs %s 0\n' "$NSTAT_R" "$NSTAT_S"; }
+sleep() { NSTAT_R=$(( NSTAT_R + STEP_R )); NSTAT_S=$(( NSTAT_S + STEP_S )); }
+STEP_R=1; STEP_S=50
+rc=0; retrans_rate 0 >/dev/null 2>&1 || rc=$?
+assert_eq '2' "$rc" 'a 50-segment window is refused as too small to judge'
+STEP_R=60; STEP_S=6000
+assert_eq '1.0000' "$(retrans_rate 0)" 'a real transfer is measured normally'
+unset -f nstat sleep has
+
+# The advice has to match the profile that is running: telling someone on the
+# no-shape profile to check the queue is really cake sends them to undo the
+# setting that is correct for their machine.
+grep -q 'fq maxrate 已经在给每条流限速' "$ROOT/tcpwide.sh" \
+  || fail 'the no-shape path needs its own retransmission advice'
+pass 'the retransmission advice branches on the running profile'
+
+# 0.13.0 asserted a single flow below the aggregate could not be moved by any
+# buffer or queue setting. flow_limit moved it 70% in the next release. The
+# verdict must point at the per-flow levers, not close the question.
+grep -q '改缓冲或队列都不会动它' "$ROOT/tcpwide.sh" \
+  && fail 'the withdrawn claim must not still ship'
+pass 'the claim that per-flow limits cannot be moved is gone'

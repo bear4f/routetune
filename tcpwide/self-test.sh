@@ -352,16 +352,66 @@ conflicting_tool() { return 1; }
 PERSIST_SYSCTL="/nonexistent/tcpwide.conf"
 render_panel >/dev/null 2>&1 || fail 'the panel must render on a route without initcwnd'
 pass 'the panel renders on a default route that has no initcwnd yet'
-# And the global memory budget must be surfaced: a per-socket ceiling above a
-# meaningful share of tcp_mem is theoretical, because a handful of flows hit
-# global pressure first and the kernel shrinks them all.
-[[ "$(render_panel 2>/dev/null)" == *"tcp_mem"* ]] \
-  || fail 'the panel must surface the global tcp_mem budget beside the ceiling'
-pass 'the panel shows the global memory budget beside the per-socket ceiling'
-[[ "$(render_panel 2>/dev/null)" == *"实际生效的队列是 mq"* ]] \
+[[ "$(render_panel 2>/dev/null)" == *"队列实际是"*mq* ]] \
   || fail 'the panel must warn when the live qdisc differs from the config'
 pass 'the panel warns about a drifted qdisc'
-unset -f ip tc sysctl has conflicting_tool
+
+# ── 0.22.0 面板宽度 ────────────────────────────────────────────────────────
+# The panel reached 37 lines and 147 columns by accretion -- one explanatory
+# sentence at a time, each of them reasonable on its own. Nothing but a hard
+# assertion stops that happening again, so the width and the line count are
+# tests, not a style preference. 72 columns is the narrowest phone SSH client
+# worth designing for; anything wider wraps and the whole layout collapses.
+panel_widths() {
+  render_panel 2>/dev/null | python3 -c '
+import re, sys, unicodedata
+worst = 0
+lines = sys.stdin.read().rstrip("\n").split("\n")
+for line in lines:
+    line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+    w = sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in line)
+    worst = max(worst, w)
+print(worst, len(lines))
+'
+}
+if command -v python3 >/dev/null 2>&1; then
+  IFS=' ' read -r panel_cols_max panel_lines <<< "$(panel_widths)"
+  (( panel_cols_max <= 72 )) \
+    || fail "every panel line must fit 72 columns, widest is $panel_cols_max"
+  pass "the panel fits 72 columns (widest line $panel_cols_max)"
+  (( panel_lines <= 24 )) \
+    || fail "the panel must fit one screen, it is $panel_lines lines"
+  pass "the panel fits one screen ($panel_lines lines)"
+else
+  pass 'panel width check skipped, no python3'
+fi
+
+# The fingerprint is a single joined string meant to be pasted next to a
+# speedtest screenshot. On the panel it was 146 columns of restating the status
+# block above it; it belongs in `status` and `record`, which is where it is
+# actually copied out of.
+[[ "$(render_panel 2>/dev/null)" != *"｜ cover "* ]] \
+  || fail 'the configuration fingerprint must not be on the panel'
+pass 'the fingerprint stays in status and record, off the panel'
+
+# Every key the panel offers has to be explained somewhere, or the explanations
+# were not moved off the menu, they were lost.
+panel_menu_keys() {
+  render_panel 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E '^  [ >][0-9a-z] ' \
+    | grep -oE '[ >][0-9a-z] ' \
+    | sed 's/^[ >]//; s/ $//' | sort -u
+}
+help_text="$(panel_help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+while read -r key; do
+  [[ -n "$key" ]] || continue
+  [[ "$help_text" == *$'\n'"    $key "* ]] \
+    || fail "panel key [$key] has no entry in the help page"
+done <<< "$(panel_menu_keys)"
+pass 'every panel key is explained on the help page'
+unset -f ip tc sysctl has conflicting_tool panel_widths panel_menu_keys
+restore_lib
 
 
 # ── 0.2.1 覆盖 RTT 的实测 ──────────────────────────────────────────────────
@@ -561,22 +611,28 @@ pass 'a fully accepted spec reports nothing'
 unset -f tc has
 
 
-# ── 0.3.7 BBR 版本判定 ─────────────────────────────────────────────────────
-# BBRv3 has never been in mainline, so a stock kernel offering only "bbr" is
-# offering v1. But XanMod ships v3 under that same name, replacing the mainline
-# one, so the algorithm name alone cannot tell them apart and check would have
-# told a XanMod user they were on v1.
-assert_eq v1 "$(bbr_variant 'reno cubic bbr' '6.1.0-50-amd64')" \
-  'a stock Debian kernel offering only bbr is offering v1'
-assert_eq nonstock "$(bbr_variant 'reno cubic bbr' '6.6.7-x64v3-xanmod1')" \
-  'an out-of-tree kernel is not claimed to be v1 just because the name is bbr'
-assert_eq v3 "$(bbr_variant 'reno cubic bbr bbr3' '6.1.0-50-amd64')" \
-  'an explicit bbr3 wins over the kernel-provenance guess'
-assert_eq v2 "$(bbr_variant 'reno cubic bbr bbr2' '6.1.0-50-amd64')" 'bbr2 is recognised'
-assert_eq none "$(bbr_variant 'reno cubic' '6.1.0-50-amd64')" 'a kernel without BBR says so'
-[[ "$(bbr_variant_note v1)" == *"最大值滤波"* ]] \
-  || fail 'the v1 note must explain the stale bandwidth estimate'
-pass 'each variant carries an explanation of what it means'
+# ── 0.3.7 不做 BBR 版本考据 ────────────────────────────────────────────────
+# 0.22.0 dropped it. Reaching a newer BBR means replacing the kernel on a box
+# that is serving traffic, which is not something a tuning script should be
+# walking anyone through -- and the panel was carrying a whole page of kernel
+# archaeology to support an option nobody was going to take. pick_cc still
+# picks bbr3 or bbr2 when the kernel already offers them: that is a selection,
+# not a switch, and it costs nothing.
+for gone in explain_bbr3 bbr_variant bbr_variant_note; do
+  grep -q "$gone" "$ROOT/tcpwide.sh" \
+    && fail "$gone should have been removed in 0.22.0"
+done
+grep -qi xanmod "$ROOT/tcpwide.sh" && fail 'the kernel-swap instructions should be gone'
+pass 'no kernel-version archaeology and no kernel-swap instructions'
+assert_eq bbr "$(pick_cc 'reno cubic bbr')" 'a stock kernel still gets bbr'
+assert_eq bbr3 "$(pick_cc 'reno cubic bbr bbr3')" 'and a kernel that offers bbr3 still gets it'
+
+# The single-flow submenu lost its BBRv3 entry, so its numbering has to close
+# up. A menu that reads 1 2 3 5 is how an operator ends up pressing 4 and
+# getting the wrong knob.
+submenu_keys="$(sed -n '/^panel_single_flow()/,/^}/p' "$ROOT/tcpwide.sh" \
+  | grep -oE "%b[0-9]\)%b" | grep -oE '[0-9]' | sort -u | tr -d '\n')"
+assert_eq 01234 "$submenu_keys" 'the single-flow submenu is numbered 1-4 with no gap'
 
 
 # ── 0.4.0 对端窗口决定的单流上限 ───────────────────────────────────────────

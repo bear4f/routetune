@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.21.0"
+VERSION="0.22.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -244,9 +244,11 @@ default_iface() {
 
 available_cc() { sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true; }
 
-# BBRv3 has never been in mainline. A stock kernel offering only "bbr" is
-# offering v1, and no amount of poking at modinfo distinguishes them, so the
-# name is all there is to go on.
+# Picks from what the kernel already offers -- this is a selection, not a
+# switch, and it costs nothing. A stock kernel offers only "bbr" and that is
+# what comes back; the panel no longer talks about kernel versions at all,
+# because chasing a newer BBR means replacing the kernel on a box that is
+# serving traffic, which a tuning script has no business doing.
 pick_cc() {
   local avail=" ${1:-} "
   case "$avail" in
@@ -255,36 +257,6 @@ pick_cc() {
     *" bbr "*)  printf 'bbr\n';  return 0 ;;
   esac
   printf 'cubic\n'
-}
-
-# BBRv3 has never been in mainline, so a stock kernel offering only "bbr" is
-# offering v1. But XanMod ships v3 UNDER THE NAME bbr, replacing the mainline
-# one — so the algorithm name alone cannot tell them apart, and no amount of
-# poking at modinfo helps either: the module carries no version field. The
-# kernel's provenance is the only available answer.
-bbr_variant() {
-  local avail=" ${1:-} " release="${2:-}"
-  [[ -n "$release" ]] || release="$(uname -r 2>/dev/null || printf '')"
-  case "$avail" in
-    *" bbr3 "*) printf 'v3\n'; return 0 ;;
-    *" bbr2 "*) printf 'v2\n'; return 0 ;;
-    *" bbr "*)  ;;
-    *) printf 'none\n'; return 0 ;;
-  esac
-  case "$release" in
-    *xanmod*|*XanMod*|*XANMOD*) printf 'nonstock\n' ;;
-    *) printf 'v1\n' ;;
-  esac
-}
-
-bbr_variant_note() {
-  case "${1:-}" in
-    v3) printf '%s\n' '显式的 bbr3 —— 会响应丢包和 ECN，ProbeRTT 也温和得多' ;;
-    v2) printf '%s\n' '显式的 bbr2' ;;
-    v1) printf '%s\n' 'BBRv1（主线内核只有 v1）—— 带宽估计是约 10 个 RTT 的最大值滤波，链路变差后会抱着旧估值继续超发' ;;
-    nonstock) printf '%s\n' '非主线内核，算法名仍是 bbr —— XanMod 就是把 v3 装成这个名字，光看名字分不出版本，查该内核的构建说明' ;;
-    *) printf '%s\n' '内核没有提供 BBR' ;;
-  esac
 }
 
 have_cake() {
@@ -951,11 +923,10 @@ cmd_check() {
   printf '  内核:              %s\n' "$(uname -r 2>/dev/null || printf 未知)"
   printf '  可用拥塞控制:      %s\n' "${avail:-未知}"
   printf '  将会选用:          %s\n' "$cc"
-  case "$cc" in
-    cubic) printf '  %b内核没有 BBR。cubic 每丢一次砍一次窗，无线链路上会一直起不来%b\n' \
-             "$YELLOW" "$RESET" ;;
-    *)     printf '  版本判定:          %s\n' "$(bbr_variant_note "$(bbr_variant "$avail")")" ;;
-  esac
+  if [[ "$cc" == cubic ]]; then
+    printf '  %b内核没有 BBR。cubic 每丢一次砍一次窗，无线链路上会一直起不来%b\n' \
+      "$YELLOW" "$RESET"
+  fi
   resolve_iface
   printf '  出口网卡:          %s\n' "$IFACE"
   if have_cake; then cake=yes; else cake=no; fi
@@ -1582,8 +1553,7 @@ render_window_report() {
     printf '  %b  剩下的杠杆，按性价比：%b\n' "$BOLD" "$RESET"
     printf '  %b   1. 把 notsent_lowat 往【更大】试（面板 n，262144 / 524288）——%b\n' "$DIM" "$RESET"
     printf '  %b      131072 已经实测胜过 16384 四成，方向明确是越大越好，但上界没找到。%b\n' "$DIM" "$RESET"
-    printf '  %b   2. BBRv3（面板 s → 4）—— v1 在高 RTT 且有丢包的路径上估值最吃亏。%b\n' "$DIM" "$RESET"
-    printf '  %b   3. 换后端 —— 同一时刻不同后端差 20%%+ 且与 RTT 无关时，差的那块%b\n' "$DIM" "$RESET"
+    printf '  %b   2. 换后端 —— 同一时刻不同后端差 20%%+ 且与 RTT 无关时，差的那块%b\n' "$DIM" "$RESET"
     printf '  %b      在对端或路径上，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
   fi
 }
@@ -2135,140 +2105,207 @@ suggest_cover_rtt() {
   printf '%s\t%s\t%s\n' $(( (max * 12 / 10 + 49) / 50 * 50 )) "$max" "$n"
 }
 
-render_panel() {
-  local buf tcpmem drift live_cc live_q cwnd_now p1=' ' p2=' ' p3=' ' p4=' '
-  case "$PROFILE" in
-    stable) p1='▸' ;; balanced) p2='▸' ;; speed) p3='▸' ;; noshape) p4='▸' ;;
-  esac
-  buf="$(buffer_ceiling "${EGRESS_MBPS:-200}" "$COVER_RTT_MS")"
-  # The live value, not the computed one. These diverge whenever the safe
-  # direction refuses a write — a smaller target under `raise` is silently kept
-  # out — and a panel that prints the target as though it were running is
-  # exactly how an analysis ends up resting on a number that never applied.
-  local live_buf; live_buf="$(live_value net.core.rmem_max)"
-  title 'tcpwide 调优面板'
-  local fp; fp="$(config_fingerprint)"
-  printf '  %b%s%b\n' "$DIM" "$fp" "$RESET"
-  # The best run on record, and whether it is the one currently loaded. Eight
-  # rounds of reconfiguration went by with no way to see this.
-  local brow bm bf bn bw
-  if brow="$(best_measurement)"; then
-    IFS=$'\t' read -r bm bf bn bw <<< "$brow"
-    if [[ "$bf" == "$fp" ]]; then
-      printf '  %b历史最好 %s Mbps%b（%s%s）—— 就是当前这份配置%b\n' \
-        "$GREEN" "$bm" "$DIM" "$bw" "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )" "$RESET"
-    else
-      printf '  %b历史最好 %s Mbps%b（%s%s），配置是：%b\n' \
-        "$YELLOW" "$bm" "$DIM" "$bw" "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )" "$RESET"
-      printf '  %b  %s%b\n' "$DIM" "$bf" "$RESET"
-    fi
-  fi
-  render_verdict "${EGRESS_MBPS:-0}"
-  printf '\n'
-  if (( SHAPE == 1 )); then
-    printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
-      "${EGRESS_MBPS:-未设置}" "$DIM" "$SHAPE_PCT" \
-      "$(( ${EGRESS_MBPS:-0} * SHAPE_PCT / 100 ))" "$RESET"
-  else
-    printf '  %b出口带宽%b   %s Mbps%b（不整形，只做 pacing）%b\n' "$DIM" "$RESET" \
-      "${EGRESS_MBPS:-未设置}" "$DIM" "$RESET"
-  fi
-  printf '  %b覆盖 RTT%b   %s ms%b  ← 按最远的客户端，不是按你自己%b\n' \
-    "$DIM" "$RESET" "$COVER_RTT_MS" "$DIM" "$RESET"
-  live_cc="$(live_value net.ipv4.tcp_congestion_control)"
-  printf '  %b拥塞控制%b   %s' "$DIM" "$RESET" "${live_cc:-未知}"
-  [[ "$live_cc" == bbr ]] && printf '%b（主线只有 v1，容量剧变后估值滞后）%b' "$DIM" "$RESET"
-  [[ "$live_cc" == cubic ]] && printf '%b（每丢一次砍一次窗，无线链路上起不来）%b' "$YELLOW" "$RESET"
-  printf '\n'
-  # The raw dump is ~200 characters of kernel defaults, so it was cut to 58 and
-  # ended mid-word ("...flow_limit 2048p bucke"). The canonical form is the same
-  # information the fingerprint uses and fits without truncation.
-  live_q="$(canonical_qdisc 2>/dev/null)"
-  printf '  %b根队列%b     %s\n' "$DIM" "$RESET" "${live_q:-未知}"
-  local show_buf="$buf"; [[ -z "$live_buf" ]] || show_buf="$live_buf"
-  printf '  %b缓冲上限%b   %s MB/socket' "$DIM" "$RESET" "$(mb "$show_buf")"
-  if tcpmem="$(tcp_mem_high_bytes)"; then
-    printf '%b ｜ 全局 tcp_mem 高水位 %s MB（约 %s 条满上限就触发压力）%b' \
-      "$DIM" "$(mb "$tcpmem")" "$(( tcpmem / (buf > 0 ? buf : 1) ))" "$RESET"
-  fi
-  printf '\n'
-  # A route without the metric makes grep exit 1, which under pipefail takes
-  # the whole panel down mid-render rather than reporting the kernel default.
-  if [[ -n "$live_buf" && "$live_buf" != "$buf" ]]; then
-    printf '  %b            目标是 %s MB —— 目标更小时不会下调（上限只升不降）%b\n' \
-      "$DIM" "$(mb "$buf")" "$RESET"
-  fi
-  cwnd_now="$(current_default_route | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}')"
-  printf '  %b首窗%b       initcwnd %s%b（内核默认 10）%b\n' "$DIM" "$RESET" \
-    "${cwnd_now:-10}" "$DIM" "$RESET"
-  printf '  %b持久化%b     %s\n' "$DIM" "$RESET" \
-    "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '是' || printf '否（重启后失效）' )"
-  if drift="$(qdisc_drift)"; then
-    printf '  %b[!] 实际生效的队列是 %s，与配置不一致%b\n' "$YELLOW" "$drift" "$RESET"
-    printf '      %b可能是重启后没应用，或被别的服务覆盖。按 a 重新应用%b\n' "$DIM" "$RESET"
-  fi
-  local cpu_row cores rate
-  if cpu_row="$(shaping_cpu_warning "${EGRESS_MBPS:-0}")"; then
-    IFS=$'\t' read -r cores rate <<< "$cpu_row"
-    printf '  %b[!] %s 核整形 %s Mbps 可能是 CPU 瓶颈——单线程掉速时先用 4) 不整形 对照%b\n' \
-      "$YELLOW" "$cores" "$rate" "$RESET"
-  fi
-  if (( SHAPE == 1 )); then
-    printf '  %b注：整形按定义会让出 %s%% 峰值，而按设备公平对单线程测速没有帮助。%b\n' \
-      "$DIM" "$(( 100 - SHAPE_PCT ))" "$RESET"
-    printf '  %b    单线程跑分是这套设计主动交换掉的那一面；多设备并发才是它换来的东西。%b\n' \
-      "$DIM" "$RESET"
-  fi
-  local other
-  if other="$(conflicting_tool)"; then
-    printf '  %b[!] 检测到 %s —— 它同样接管根队列和全局 sysctl，谁后跑谁生效%b\n' \
-      "$YELLOW" "$other" "$RESET"
-  fi
-  rule
-  printf '  %b档位%b%b                                          ▸ 当前%b\n' \
-    "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b1)%b 整形 90%%    首窗 16%b  丢包敏感、跨境线路%b\n' \
-    "$GREEN" "$p1" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b2)%b 整形 95%%    首窗 20%b  多设备共享，要按设备公平%b\n' \
-    "$GREEN" "$p2" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b3)%b 整形 98%%    首窗 32%b  几乎等于不整形，却付全额 CAKE 开销%b\n' \
-    "$GREEN" "$p3" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b4)%b 不整形      首窗 20%b  只做 pacing；CPU 不够时这是最快的%b\n' \
-    "$GREEN" "$p4" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b设置%b\n' "$BOLD" "$RESET"
-  printf '    %b5)%b 出口带宽%b（当前 %s Mbps）%b   %b6)%b 覆盖 RTT%b（当前 %s ms）%b   %b7)%b 首窗%b（当前 %s）%b\n' \
-    "$BOLD" "$RESET" "$DIM" "${EGRESS_MBPS:-未设置}" "$RESET" \
-    "$BOLD" "$RESET" "$DIM" "$COVER_RTT_MS" "$RESET" \
-    "$BOLD" "$RESET" "$DIM" "$INITCWND" "$RESET"
-  printf '    %bn)%b 未发送数据上限 notsent_lowat%b（当前 %s，实测胜 16384 四成；更大的还没试）%b\n' \
-    "$BOLD" "$RESET" "$DIM" \
-    "$( (( NOTSENT_LOWAT > 0 )) && printf '%s' "$NOTSENT_LOWAT" || printf '不改' )" "$RESET"
-  printf '    %bb)%b 缓冲上限%b（当前 %s，接收窗口是它的一半，直接决定单流上限）%b\n' \
-    "$BOLD" "$RESET" "$DIM" \
-    "$( (( BUF_MB > 0 )) && printf '%s MB（手动）' "$BUF_MB" || printf '自动 %s MB' "$(mb "$(buffer_ceiling "${EGRESS_MBPS:-500}" "$COVER_RTT_MS")")" )" \
-    "$RESET"
-  printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
-  printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
-  printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
-  printf '    %bm)%b 记一次实测%b（跑完测速把数字填进来，和配置绑在一起）%b\n' \
-    "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '    %bs)%b 单流旋钮%b（notsent_lowat / fq 参数 / BBRv3，都还没测过）%b\n' \
-    "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '    %bl)%b 队列布局%b（当前：%s%s）%b\n' "$BOLD" "$RESET" "$DIM" \
-    "$QDISC_LAYOUT" \
-    "$( [[ "$QDISC_LAYOUT" == root ]] && printf '，有实测支撑' || printf '，未经实测' )" \
-    "$RESET"
-  printf '    %ba)%b 重新应用（重启后或队列被覆盖时用）\n' "$BOLD" "$RESET"
-  printf '    %bp)%b 持久化开关%b（当前：%s）%b\n' "$BOLD" "$RESET" "$DIM" \
-    "$( [[ -e "$PERSIST_SYSCTL" ]] && printf '开' || printf '关' )" "$RESET"
-  printf '    %br)%b 完整还原到 tcpwide 介入之前\n' "$BOLD" "$RESET"
-  printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
-  rule
+# Two columns, six fields, nothing that repeats what the menu already shows.
+#
+# The old panel ran 37 lines and 147 columns, wrapping seven times on a phone.
+# Most of that was duplication rather than detail: the fingerprint line restated
+# the whole status block, the queue line restated part of the fingerprint, and
+# every menu entry carried a "(current X)" that the status block had already
+# printed. Explanations moved to `h`; the fingerprint moved to `status` and
+# `record`, which are the places it is actually copied out of.
+# The panel's right edge is RULE's, and RULE prints at column 0 while the
+# section rules print one space in.
+PANEL_WIDTH=69
+
+# CJK costs two display columns but three UTF-8 bytes, so printf's `%-8s` pads
+# by the wrong unit and every value column comes out ragged -- which is half of
+# why the old panel looked like a pile. Measure in columns instead. `local
+# LC_ALL=C` makes ${#s} bytes whatever locale the operator's shell is in, and
+# bash restores it on return.
+panel_cols() {
+  local LC_ALL=C s="${1-}" ascii
+  ascii="${s//[^[:print:]]/}"
+  # Every non-ASCII character in this file is CJK: three bytes, two columns.
+  # The division is exact by construction, so the order does not lose anything.
+  printf '%s\n' "$(( ${#ascii} + ( ${#s} - ${#ascii} ) * 2 / 3 ))"
 }
 
-# Actions run in a subshell so one that calls die drops back to the menu instead
-# of closing the panel. Everything durable goes through save_config, and the
-# loop reloads it, so nothing is lost across the boundary.
+panel_pad() {
+  local s="${1-}" want="${2:-0}" have i pad=''
+  have="$(panel_cols "$s")"
+  for (( i = have; i < want; i++ )); do pad="$pad "; done
+  printf '%s%s' "$s" "$pad"
+}
+
+panel_dashes() {
+  local n="${1:-0}" i out=''
+  for (( i = 0; i < n; i++ )); do out="$out─"; done
+  printf '%s' "$out"
+}
+
+panel_rule() {
+  local label="${1:-}"
+  if [[ -z "$label" ]]; then
+    printf ' %b%s%b\n' "$DIM" "$(panel_dashes "$PANEL_WIDTH")" "$RESET"; return 0
+  fi
+  local pad=$(( PANEL_WIDTH - 4 - $(panel_cols "$label") ))
+  (( pad < 0 )) && pad=0
+  printf ' %b──%b %s %b%s%b\n' \
+    "$DIM" "$RESET" "$label" "$DIM" "$(panel_dashes "$pad")" "$RESET"
+}
+
+# The full qdisc spec runs past 60 columns on its own -- it is what the old
+# panel's 146-column line was mostly made of. The kind and the shaping rate are
+# the parts that vary with our configuration; the rest belongs in `status`,
+# which is where the spec is actually copied out of.
+short_qdisc() {
+  local q="${1-}"
+  [[ -n "$q" ]] || return 0
+  case "$q" in mq*) printf '%s\n' "$q"; return 0 ;; esac
+  awk '{ out = $1
+         for (i = 2; i < NF; i++)
+           if ($i == "maxrate" || $i == "bandwidth") out = out " " $i " " $(i + 1)
+         print out }' <<< "$q"
+}
+
+# One menu cell: a marker column, the key, and a label padded to a fixed width
+# so the four columns line up down the whole menu. The marker is ASCII on
+# purpose -- U+25B8 and friends are East Asian "ambiguous" width, so a terminal
+# is free to give them two columns and shove the rest of the row sideways.
+panel_item() {
+  printf '%s%b%s%b %s' "${3:- }" "$BOLD" "$1" "$RESET" "$(panel_pad "$2" 13)"
+}
+
+# Joins the cells and trims the padding off the last one, so no row carries
+# trailing whitespace into a copy-paste.
+panel_menu_row() {
+  local row='' cell
+  for cell in "$@"; do row="$row$cell"; done
+  printf '  %s\n' "${row%"${row##*[! ]}"}"
+}
+
+# One row of the status grid: two label/value pairs, columns fixed in display
+# width so the values line up whatever their length.
+panel_row() {
+  printf '   %b%s%b %s %b%s%b %s\n' \
+    "$DIM" "$(panel_pad "$1" 9)" "$RESET" "$(panel_pad "$2" 18)" \
+    "$DIM" "$(panel_pad "$3" 9)" "$RESET" "$4"
+}
+
+render_panel() {
+  local buf live_buf live_cc live_q cwnd_now
+  buf="$(buffer_ceiling "${EGRESS_MBPS:-200}" "$COVER_RTT_MS")"
+  # The live value, not the computed one. These diverge whenever the safe
+  # direction refuses a write, and a panel that prints the target as though it
+  # were running is how an analysis ends up resting on a number never applied.
+  # `|| true` on every one of these: under `set -e` a bare assignment carries
+  # the substitution's exit status, so one unreadable sysctl or a machine whose
+  # qdisc cannot be read takes the entire panel down without printing a thing.
+  live_buf="$(live_value net.core.rmem_max || true)"
+  live_cc="$(live_value net.ipv4.tcp_congestion_control || true)"
+  live_q="$(canonical_qdisc 2>/dev/null || true)"
+  local show_buf="$buf"; [[ -z "$live_buf" ]] || show_buf="$live_buf"
+
+  # Header badges: the four pieces of state worth seeing before anything else.
+  local shape_badge persist_badge
+  if (( SHAPE == 1 )); then shape_badge="整形 ${SHAPE_PCT}%"; else shape_badge='不整形'; fi
+  if [[ -e "$PERSIST_SYSCTL" ]]; then persist_badge='已持久化'; else persist_badge='未持久化'; fi
+  printf '\n%b%s%b\n' "$DIM" "$RULE" "$RESET"
+  printf '  %btcpwide %s%b   %b%s · %s · %s · %s Mbps 口%b\n' \
+    "$BOLD" "$VERSION" "$RESET" "$DIM" "$shape_badge" "${live_cc:-未知}" \
+    "$persist_badge" "${EGRESS_MBPS:-未设置}" "$RESET"
+  printf '%b%s%b\n\n' "$DIM" "$RULE" "$RESET"
+
+  cwnd_now="$(current_default_route 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}' || true)"
+  local best_cell='-'
+  local brow bm _bf _bn bw
+  if brow="$(best_measurement)"; then
+    IFS=$'\t' read -r bm _bf _bn bw <<< "$brow"
+    best_cell="$bm Mbps"
+    [[ "$bw" != - && -n "$bw" ]] && best_cell="$best_cell  ${bw%% *}"
+  fi
+  panel_row '覆盖 RTT' "$COVER_RTT_MS ms" '缓冲上限' "$(mb "$show_buf") MB/socket"
+  panel_row '首窗' "${cwnd_now:-内核默认}" '根队列' "$(short_qdisc "${live_q:-未知}" || true)"
+  panel_row '历史最好' "$best_cell" '未发送' "${NOTSENT_LOWAT}"
+
+  # Alerts only exist when something is wrong, so they cost nothing when it is
+  # not. These are the three that have actually mattered on live machines.
+  local drift other mrow alerts
+  alerts="$( {
+    if drift="$(qdisc_drift)"; then
+      printf '   %b[!]%b 队列实际是 %s，与配置不符 —— 按 a 重新应用\n' "$YELLOW" "$RESET" "$drift"
+    fi
+    if other="$(conflicting_tool)"; then
+      printf '   %b[!]%b 检测到 %s，它会盖掉这里的配置\n' "$YELLOW" "$RESET" "$other"
+    fi
+    if mrow="$(manual_buffer_shortfall "${EGRESS_MBPS:-200}" "$COVER_RTT_MS")"; then
+      local _m _a capped; IFS=$'\t' read -r _m _a capped <<< "$mrow"
+      printf '   %b[!]%b 手动缓冲上限只支持约 %s Mbps，低于端口 —— 按 b 填 0 交还自动\n' \
+        "$YELLOW" "$RESET" "$capped"
+    fi
+  } )"
+  [[ -z "$alerts" ]] || printf '\n%s\n' "$alerts"
+
+  local p1=' ' p2=' ' p3=' ' p4=' '
+  case "$PROFILE" in
+    stable) p1='>' ;; balanced) p2='>' ;; speed) p3='>' ;; noshape) p4='>' ;;
+  esac
+  printf '\n'
+  panel_rule '档位'
+  panel_menu_row \
+    "$(panel_item 1 '整形 90%' "$p1")" "$(panel_item 2 '整形 95%' "$p2")" \
+    "$(panel_item 3 '整形 98%' "$p3")" "$(panel_item 4 '不整形' "$p4")"
+  panel_rule '设置'
+  panel_menu_row \
+    "$(panel_item 5 '出口带宽')" "$(panel_item 6 '覆盖 RTT')" \
+    "$(panel_item 7 '首窗')" "$(panel_item b '缓冲上限')"
+  panel_menu_row \
+    "$(panel_item n '未发送上限')" "$(panel_item s '单流旋钮')" \
+    "$(panel_item l '队列布局')"
+  panel_rule '工具'
+  panel_menu_row \
+    "$(panel_item 8 '诊断')" "$(panel_item 9 '预演')" \
+    "$(panel_item m '记一次实测')" "$(panel_item a '重新应用')"
+  panel_menu_row \
+    "$(panel_item p '持久化')" "$(panel_item r '完整还原')" \
+    "$(panel_item h '看说明')" "$(panel_item 0 '退出')"
+  panel_rule
+}
+
+# Everything the menu entries used to drag along behind them. Off the selection
+# screen, where it was in the way, and in one place where it can be read.
+panel_help() {
+  title 'tcpwide 面板说明'
+  printf '  %b档位%b\n' "$BOLD" "$RESET"
+  printf '    1 整形 90%%   丢包敏感、跨境线路；CAKE 按设备公平 + AQM\n'
+  printf '    2 整形 95%%   多设备共享，要按设备公平\n'
+  printf '    3 整形 98%%   几乎等于不整形，却付全额 CAKE 开销\n'
+  printf '    4 不整形     只做 pacing。CPU 不够时这是最快的——实测同一台机器\n'
+  printf '                 同一后端，fq 峰值 629 Mbps，CAKE 只有 332\n\n'
+  printf '  %b设置%b\n' "$BOLD" "$RESET"
+  printf '    5 出口带宽   按套餐的端口速率填，决定 fq maxrate 和缓冲推导\n'
+  printf '    6 覆盖 RTT   填「最远那个客户端」的延迟，不是你自己的\n'
+  printf '    7 首窗       initcwnd，内核默认 10\n'
+  printf '    b 缓冲上限   接收窗口是它的一半，直接决定单流上限。填 0 = 自动\n'
+  printf '    n 未发送上限 tcp_notsent_lowat。131072 实测胜 16384 四成\n'
+  printf '    s 单流旋钮   fq 参数和缓冲起步值，都还没单独测过\n'
+  printf '    l 队列布局   root 单个 fq（有实测支撑）或 mq 挂叶子\n\n'
+  printf '  %b工具%b\n' "$BOLD" "$RESET"
+  printf '    8 诊断       实时重传率、每核占用、收发两个方向的窗口比例\n'
+  printf '    9 预演       逐项列出 当前值 → 目标值 和理由，不写入\n'
+  printf '    m 记一次实测 跑完测速把数字填进来，和当前配置绑在一起\n'
+  printf '    a 重新应用   重启后或队列被别的东西覆盖时用\n'
+  printf '    p 持久化     写 /etc/sysctl.d 和 systemd unit\n'
+  printf '    r 完整还原   回到 tcpwide 介入之前\n'
+  printf '    h 看说明     这一页\n'
+  printf '    0 退出       只离开面板，配置照旧生效\n\n'
+  printf '  %b标题栏%b 四个徽章：当前档位 · 拥塞控制 · 持久化与否 · 出口带宽。\n' \
+    "$BOLD" "$RESET"
+  printf '  %b状态格%b 的六项就是下面菜单里能改的那几个，加上根队列的实际样子。\n\n' \
+    "$BOLD" "$RESET"
+  printf '  %b配置指纹%b在 status 和 m) 里——那才是要贴出去对照的场合。\n\n' "$DIM" "$RESET"
+}
+
 run_action() { ( "$@" ) || warn "操作未完成，已返回菜单"; }
 
 pause_menu() {
@@ -2372,10 +2409,9 @@ panel_single_flow() {
     "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
   printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \
     "$FQ_FLOW_LIMIT" "$DIM" "$RESET"
-  printf '    %b5)%b 缓冲起步值           当前 %s MB%b（tcp_[rw]mem 中间值，决定爬升快慢）%b\n' \
+  printf '    %b4)%b 缓冲起步值           当前 %s MB%b（tcp_[rw]mem 中间值，决定爬升快慢）%b\n' \
     "$BOLD" "$RESET" "$(mb "$BUF_DEFAULT")" "$DIM" "$RESET"
   printf '       %b只影响平均速度，不影响峰值——峰值在爬完之后，两边都到得了。%b\n' "$DIM" "$RESET"
-  printf '    %b4)%b BBRv3 怎么上（只给方法，不替你装）\n' "$BOLD" "$RESET"
   printf '    %b0)%b 返回\n\n' "$BOLD" "$RESET"
   local pick value
   read -r -p '  请选择 [0]: ' pick || return 0
@@ -2392,40 +2428,12 @@ panel_single_flow() {
            "$FQ_FLOW_LIMIT" 0 100000)"; then
          FQ_FLOW_LIMIT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
-    4) explain_bbr3 ;;
-    5) if value="$(prompt_uint '缓冲起步值 字节（tcpfit 的代理档是 1048576）' \
+    4) if value="$(prompt_uint '缓冲起步值 字节（tcpfit 的代理档是 1048576）' \
            "$BUF_DEFAULT" 4096 16777216)"; then
          BUF_DEFAULT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
     *) return 0 ;;
   esac
-}
-
-# Mainline has only ever carried BBRv1. v3 means a different kernel, which is a
-# reboot and a real risk on a box that is serving traffic -- so this prints the
-# path and the way back out, and does not run any of it. Installing a kernel on
-# someone's production machine is not something a tuning script should do
-# quietly, however much the operator wants the throughput.
-explain_bbr3() {
-  title 'BBRv3'
-  printf '  %b当前内核：%s%b\n' "$DIM" "$(uname -r)" "$RESET"
-  printf '  %b拥塞控制：%s%b\n\n' "$DIM" "$(live_value net.ipv4.tcp_congestion_control)" "$RESET"
-  printf '  %b主线内核只有 BBRv1，而且一直只会有 v1。XanMod 以「bbr」这个名字发 v3，%b\n' "$DIM" "$RESET"
-  printf '  %b所以看名字分不出版本，只能看内核版本串。%b\n\n' "$DIM" "$RESET"
-  printf '  %bv1 单流吃亏最重的地方：ProbeRTT 每 10 秒把 cwnd 砸到 4 个包并保持 200ms。%b\n' "$DIM" "$RESET"
-  printf '  %bv3 改成只降到一半，并且会对丢包做出反应。单流受益最明显。%b\n\n' "$DIM" "$RESET"
-  printf '  %b换内核（Debian/Ubuntu）：%b\n' "$BOLD" "$RESET"
-  printf '    curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod.gpg\n'
-  printf '    echo "deb [signed-by=/usr/share/keyrings/xanmod.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod.list\n'
-  printf '    apt update && apt install linux-xanmod-x64v2\n'
-  printf '    reboot\n\n'
-  printf '  %b回滚：%b重启时在 grub 菜单选 Advanced options 里的旧内核；%b\n' "$BOLD" "$RESET" "$DIM"
-  printf '  确认旧内核能起来之后再 apt remove 掉 xanmod。%b\n\n' "$RESET"
-  printf '  %b[!] 这台机器 520 MB 内存，/boot 也可能装不下第二个内核——先 df -h /boot。%b\n' \
-    "$YELLOW" "$RESET"
-  printf '  %b[!] 换完内核 tcpwide 的 sysctl 不会自动回来（没加 --persist 的话），%b\n' \
-    "$YELLOW" "$RESET"
-  printf '  %b    重启后要重新 sudo tcpwide apply。%b\n' "$DIM" "$RESET"
 }
 
 panel_record() {
@@ -2486,7 +2494,7 @@ menu() {
   while true; do
     load_config
     render_panel
-    if ! read -r -p '  请选择 [0-9 / a / b / n / p / r]: ' answer; then printf '\n'; return 0; fi
+    if ! read -r -p '  请选择（h 看说明）: ' answer; then printf '\n'; return 0; fi
     case "$answer" in
       1) run_action panel_set_profile stable ;;
       2) run_action panel_set_profile balanced ;;
@@ -2542,6 +2550,7 @@ menu() {
       a|A) run_action panel_reapply ;;
       p|P) run_action panel_toggle_persist ;;
       r|R) run_action cmd_revert ;;
+      h|H|'?') run_action panel_help ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; continue ;;
     esac

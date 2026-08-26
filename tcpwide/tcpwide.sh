@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.18.0"
+VERSION="0.19.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1327,29 +1327,37 @@ window_ratio() {
     }
     /^[ \t]/ {
       if (local == "") next
-      rtt = 0; rate = 0; rb = 0; rq = 0; dr = 0
+      rtt = 0; rate = 0; rb = 0; rq = 0; dr = 0; tb = 0; wq = 0
+      sent = 0; recvd = 0; wnd = 0
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^rtt:/) { t = substr($i, 5); q = index(t, "/")
           rtt = ((q > 0) ? substr(t, 1, q - 1) : t) + 0 }
         else if ($i == "delivery_rate" && i < NF) rate = tomb($(i + 1))
+        else if ($i ~ /^bytes_sent:/)     sent  = substr($i, 12) + 0
+        else if ($i ~ /^bytes_received:/) recvd = substr($i, 16) + 0
+        else if ($i ~ /^snd_wnd:/)        wnd   = substr($i, 9) + 0
         else if ($i ~ /^skmem:/) {
           if (match($i, /rb[0-9]+/)) rb = substr($i, RSTART + 2, RLENGTH - 2) + 0
-          # r<N> is bytes sitting in the receive queue unread; d<N> is receive
-          # drops. Together they say whether the application is keeping up.
+          if (match($i, /tb[0-9]+/)) tb = substr($i, RSTART + 2, RLENGTH - 2) + 0
+          # r<N> is bytes queued unread on receive; w<N> is bytes queued to send;
+          # d<N> is receive drops.
           if (match($i, /\(r[0-9]+/)) rq = substr($i, RSTART + 2, RLENGTH - 2) + 0
-          if (match($i, /d[0-9]+\)/)) dr = substr($i, RSTART + 1, RLENGTH - 2) + 0
+          if (match($i, /,w[0-9]+/))   wq = substr($i, RSTART + 2, RLENGTH - 1) + 0
+          if (match($i, /d[0-9]+\)/))  dr = substr($i, RSTART + 1, RLENGTH - 2) + 0
         }
       }
-      # Both directions. The receive-buffer question does not care who opened
-      # the connection: if we are receiving, rcvbuf and the unread queue mean
-      # something. Restricting this to inbound made every connection a
-      # speedtest actually creates invisible -- the box dials OUT to each node,
-      # so the local port is ephemeral -- and left the SSH session as the only
-      # candidate on the machine.
-      if (rtt >= floor && rb > 0 && rate >= mbfloor && rate > best) {
-        best = rate; brtt = rtt; brb = rb; brq = rq; bdr = dr
-        bpeer = ipof(peer) ":" portof(peer)
-        bdir = (index(listen, " " portof(local) " ") > 0) ? "入站" : "出站"
+      if (rtt < floor || rate < mbfloor) { local = ""; peer = ""; next }
+      # Which way the bulk of the data is moving. delivery_rate is always the
+      # SENDING rate, so a socket we are only receiving on can never win a
+      # contest scored on it -- the two directions are ranked separately.
+      dir = (index(listen, " " portof(local) " ") > 0) ? "入站" : "出站"
+      id = ipof(peer) ":" portof(peer)
+      if (sent >= recvd) {
+        if (rate > sbest) { sbest = rate; srtt = rtt; stb = tb; swq = wq
+                            swnd = wnd; sid = id; sdir = dir }
+      } else {
+        if (rate > rbest) { rbest = rate; rrtt = rtt; rrb = rb; rrq = rq
+                            rdr = dr; rid = id; rdir = dir }
       }
       local = ""; peer = ""; next
     }
@@ -1357,55 +1365,142 @@ window_ratio() {
       if (NF >= 5 && $1 ~ /^[A-Z][A-Z0-9_-]*$/) { local = $4; peer = $5 }
       else if (NF >= 4) { local = $3; peer = $4 } }
     END {
-      if (best <= 0) exit 1
-      inflight = best * 1000000 * (brtt / 1000) / 8
-      printf "%d\t%d\t%d\t%.0f\t%.0f\t%d\t%d\t%.0f\t%s\t%s\t%.1f\t%.1f",
-             brb, rmem, inflight, brb * 100 / rmem, inflight * 100 / brb,
-             brq, bdr, brq * 100 / brb, bpeer, bdir, brtt, best
+      if (sbest <= 0 && rbest <= 0) exit 1
+      # send: id dir rtt rate inflight sndbuf sendq peerwnd
+      if (sbest > 0)
+        printf "send\t%s\t%s\t%.1f\t%.1f\t%d\t%d\t%d\t%d\n",
+               sid, sdir, srtt, sbest, sbest * 1000000 * (srtt / 1000) / 8,
+               stb, swq, swnd
+      # recv: id dir rtt rate inflight rcvbuf recvq drops rmem_max
+      if (rbest > 0)
+        printf "recv\t%s\t%s\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\n",
+               rid, rdir, rrtt, rbest, rbest * 1000000 * (rrtt / 1000) / 8,
+               rrb, rrq, rdr, rmem
     }'
 }
 
+# True when a byte count sits within tol% of a power-of-two megabyte boundary.
+# An autotuned window lands on arbitrary values; a configured rmem_max lands on
+# 8, 16 or 32 MiB. Two unrelated peers both advertising exactly 16.0 MB is the
+# tell that it was set, not grown.
+near_power_of_two_mb() {
+  local bytes="${1:-0}" tol="${2:-3}"
+  awk -v b="$bytes" -v tol="$tol" 'BEGIN {
+    if (b <= 0) exit 1
+    for (m = 4; m <= 64; m *= 2) {
+      t = m * 1048576
+      d = (b > t) ? (b - t) * 100 / t : (t - b) * 100 / t
+      if (d <= tol) { printf "%d", m; exit 0 }
+    }
+    exit 1 }'
+}
+
 render_window_ratio() {
-  local row rb rmem inflight fill ratio rq drops qpct
-  row="$(window_ratio)" || {
-    printf '\n  %b窗口比例：现在没有跑到 %s Mbps 以上的入站连接，测不了。%b\n' \
+  local rows had=0
+  rows="$(window_ratio)" || {
+    printf '\n  %b窗口比例：现在没有跑到 %s Mbps 以上的连接，测不了。%b\n' \
       "$DIM" "$SAMPLE_MBPS_FLOOR" "$RESET"
     printf '  %b开两个 SSH：一个跑测速，跑的同时另一个进来按 8。%b\n' "$DIM" "$RESET"
-    printf '  %b（空闲的 SSH 会话本身也是连接，但它的缓冲说明不了任何问题。）%b\n' "$DIM" "$RESET"
     return 0
   }
-  IFS=$'\t' read -r rb rmem inflight fill ratio rq drops qpct peer dir srtt srate <<< "$row"
   printf '\n  %b窗口比例实测%b\n' "$BOLD" "$RESET"
-  # Show what was sampled. Two rounds of confident wrong verdicts came partly
-  # from nobody being able to see that the sample was an idle SSH session.
-  printf '    %b样本：%s（%s）｜RTT %s ms｜%s Mbps%b\n' \
-    "$BOLD" "$peer" "$dir" "$srtt" "$srate" "$RESET"
+  local kind id dir rtt rate inflight a b c d
+  while IFS=$'\t' read -r kind id dir rtt rate inflight a b c d; do
+    [[ -n "$kind" ]] || continue
+    had=1
+    if [[ "$kind" == send ]]; then
+      render_send_sample "$id" "$dir" "$rtt" "$rate" "$inflight" "$a" "$b" "$c"
+    else
+      render_recv_sample "$id" "$dir" "$rtt" "$rate" "$inflight" "$a" "$b" "$c" "$d"
+    fi
+  done <<< "$rows"
+  (( had == 1 )) || printf '  %b没有可用样本。%b\n' "$DIM" "$RESET"
+}
+
+# The sending half. delivery_rate IS the send rate, so this is the direction a
+# mixed speedtest usually shows first. Comparing its in-flight bytes against the
+# RECEIVE buffer was a category error that printed "12965%" on live data.
+render_send_sample() {
+  local id="$1" dir="$2" rtt="$3" rate="$4" inflight="$5" sndbuf="$6" sendq="$7" wnd="$8"
+  printf '\n  %b发送方向%b  %s（%s）｜RTT %s ms｜%s Mbps\n' "$BOLD" "$RESET" "$id" "$dir" "$rtt" "$rate"
+  printf '    发送缓冲 %s MB｜待发队列 %s MB｜对端通告窗口 %s MB\n' \
+    "$(mb "$sndbuf")" "$(mb "$sendq")" "$(mb "$wnd")"
+  local ceil mbdiff
+  ceil="$(awk -v w="$wnd" -v r="$rtt" 'BEGIN {printf "%.1f", w * 8 / (r * 1000)}')"
+  printf '    对端窗口决定的上限 %s Mbps，在途 %s MB\n' "$ceil" "$(mb "$inflight")"
+  # A window sitting on a power-of-two boundary was configured, not grown, and
+  # when the rate matches window/RTT the hedge is settled: it is their ceiling.
+  local pow
+  if pow="$(near_power_of_two_mb "$wnd" 3)"; then
+    mbdiff="$(awk -v o="$rate" -v c="$ceil" 'BEGIN {d = (o > c) ? o - c : c - o
+      printf "%.0f", (c > 0) ? d * 100 / c : 999}')"
+    if (( mbdiff <= 5 )); then
+      printf '    %b→ 对端通告窗口正好是 %s MiB，实测与「窗口÷RTT」差 %s%%。%b\n' \
+        "$YELLOW" "$pow" "$mbdiff" "$RESET"
+      printf '    %b  自动伸缩的窗口不会落在 2 的整数次幂上，这是对端配置的 rmem_max。%b\n' \
+        "$DIM" "$RESET"
+      printf '    %b  这是外部天花板，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
+      return 0
+    fi
+  fi
+  # Our own pacer is the other thing that can cap a sender, and unlike the peer
+  # it is ours to change.
+  local maxrate pct
+  maxrate=$(( ${EGRESS_MBPS:-0} * SHAPE_PCT / 100 ))
+  if (( maxrate > 0 )); then
+    pct="$(awk -v o="$rate" -v m="$maxrate" 'BEGIN {printf "%.0f", o * 100 / m}')"
+    if (( pct >= 85 )); then
+      printf '    %b→ 实测已经是 fq maxrate %s Mbit 的 %s%%，你顶在自己设的出口带宽上。%b\n' \
+        "$YELLOW" "$maxrate" "$pct" "$RESET"
+      printf '    %b  端口真比这快就去改 5) 出口带宽；填小了 pacer 就是天花板。%b\n' "$DIM" "$RESET"
+      return 0
+    fi
+  fi
+  if awk -v q="$sendq" -v b="$sndbuf" 'BEGIN {exit !(b > 0 && q * 100 / b >= 50)}'; then
+    warn "待发队列占了发送缓冲的一半以上 —— 是应用喂得比网络快，不是网络慢"
+    return 0
+  fi
+  printf '    %b→ 既没贴对端窗口，也没贴自己的 pacer，看路径或对端处理能力。%b\n' "$DIM" "$RESET"
+}
+
+# The receiving half -- the leg that has never been sampled, and the one that
+# decides the 回程 numbers.
+render_recv_sample() {
+  local id="$1" dir="$2" rtt="$3" rate="$4" inflight="$5"
+  local rcvbuf="$6" recvq="$7" drops="$8" rmem="$9"
+  printf '\n  %b接收方向%b  %s（%s）｜RTT %s ms｜%s Mbps\n' "$BOLD" "$RESET" "$id" "$dir" "$rtt" "$rate"
+  local fill ratio qpct
+  fill="$(awk -v a="$rcvbuf" -v b="$rmem" 'BEGIN {printf "%.0f", (b > 0) ? a * 100 / b : 0}')"
+  ratio="$(awk -v a="$inflight" -v b="$rcvbuf" 'BEGIN {printf "%.0f", (b > 0) ? a * 100 / b : 0}')"
+  qpct="$(awk -v a="$recvq" -v b="$rcvbuf" 'BEGIN {printf "%.0f", (b > 0) ? a * 100 / b : 0}')"
   printf '    实际 rcvbuf %s MB ／ rmem_max %s MB = %s%%（autotuning 长到了多少）\n' \
-    "$(mb "$rb")" "$(mb "$rmem")" "$fill"
-  printf '    在途 %s MB ／ 实际 rcvbuf = %s%%（内核真正给出去的窗口比例）\n' \
-    "$(mb "$inflight")" "$ratio"
-  printf '    接收队列积压 %s MB（占 rcvbuf %s%%）｜接收丢弃 %s\n' \
-    "$(mb "$rq")" "$qpct" "$drops"
-  # Four causes, four different fixes. Guessing between them is what produced
-  # two rounds of wrong advice.
+    "$(mb "$rcvbuf")" "$(mb "$rmem")" "$fill"
+  printf '    在途 %s MB ／ 实际 rcvbuf = %s%%｜未读积压 %s MB（%s%%）｜接收丢弃 %s\n' \
+    "$(mb "$inflight")" "$ratio" "$(mb "$recvq")" "$qpct" "$drops"
+  # In-flight cannot exceed the buffer holding it. Anything past ~110% means the
+  # two numbers are not from the same side, and reasoning on it is how the last
+  # few rounds went wrong.
+  if (( ratio > 110 )); then
+    warn "在途比接收缓冲还大 ${ratio}% —— 这两个量不在同一侧，本次对比无效"
+    printf '    %b多半是这条 socket 其实在发送。别拿这个数往下推结论。%b\n' "$DIM" "$RESET"
+    return 0
+  fi
   if (( qpct >= 50 )); then
     warn "接收队列积压到 rcvbuf 的 ${qpct}% —— 是应用没把数据读走"
-    printf '    %b瓶颈在代理进程或 CPU，不在 TCP 配置。加大缓冲只会让积压更大。%b\n' \
-      "$DIM" "$RESET"
+    printf '    %b瓶颈在代理进程或 CPU，加大缓冲只会让积压更大。%b\n' "$DIM" "$RESET"
   elif (( drops > 0 )); then
     warn "接收侧丢弃 ${drops} —— 数据在进协议栈之前就没了"
     printf '    %b看 netdev_max_backlog 和每核占用，不是缓冲的问题。%b\n' "$DIM" "$RESET"
   elif (( fill < 70 )); then
-    printf '    %b→ rcvbuf 只长到 rmem_max 的 %s%%，而队列几乎是空的：%b\n' "$GREEN" "$fill" "$RESET"
-    printf '    %b  autotuning 没有理由长——发送端或路径本来就只有这么快。%b\n' "$DIM" "$RESET"
-    printf '    %b  加大 rmem_max 不会有任何作用（0.16.0 把它翻倍，实测一点没动）。%b\n' "$DIM" "$RESET"
+    printf '    %b→ rcvbuf 只长到 %s%%，而队列几乎是空的：autotuning 没有理由长，%b\n' \
+      "$GREEN" "$fill" "$RESET"
+    printf '    %b  发送端或路径本来就只有这么快。加大 rmem_max 不会有作用%b\n' "$DIM" "$RESET"
+    printf '    %b  （0.16.0 把它翻倍，实测一点没动）。%b\n' "$DIM" "$RESET"
   elif (( ratio >= 40 )); then
-    printf '    %b→ rcvbuf 到顶了，而且在途已经接近它的一半：真的是窗口限制。%b\n' \
+    printf '    %b→ rcvbuf 到顶且在途接近它的一半：真的是窗口限制，这时加大缓冲才有意义。%b\n' \
       "$YELLOW" "$RESET"
-    printf '    %b  这时候加大覆盖 RTT／缓冲上限才有意义。%b\n' "$DIM" "$RESET"
   else
-    printf '    %b→ rcvbuf 到顶但在途只有 %s%%，两头都不像瓶颈，看别处。%b\n' \
-      "$DIM" "$ratio" "$RESET"
+    printf '    %b→ rcvbuf 到顶但在途只有 %s%%，两头都不像瓶颈，看别处。%b\n' "$DIM" "$ratio" "$RESET"
   fi
 }
 

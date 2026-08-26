@@ -1351,44 +1351,33 @@ fi
 pass 'a manual ceiling above the derivation raises nothing'
 BUF_MB=0
 
-# window_ratio has to answer WHY in-flight stalls, and its four causes need four
-# different fixes. On two live boxes it answered from the operator's own SSH
-# session -- 5.6 Mbps at 139ms -- and reported "rcvbuf 0.1 MB / rmem_max 86.8 MB
-# = 0%, autotuning never grew". An idle shell has no reason to grow a buffer.
+# The receiving half answers WHY in-flight stalls, and its causes need different
+# fixes. On two live boxes this answered from the idle SSH session; now it needs
+# a loaded connection, and it is scored separately from the sending direction
+# because delivery_rate only ever reports the send rate.
+restore_lib
 IFACE=eth0
-live_value() { printf '45497685\n'; }        # rmem_max 43.4 MB
+RMEM=45497685; live_value() { printf '%s\n' "$RMEM"; }   # rmem_max 43.4 MB
 has() { [[ "$1" == ss ]]; }
+EGRESS_MBPS=1000; SHAPE_PCT=98
 # The exact shape that fooled it: a real remote RTT, a trivial rate.
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:22 119.237.129.39:51000\n'
-  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 delivery_rate 5.6Mbps\n'
+  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 bytes_sent:900 bytes_received:900 delivery_rate 5.6Mbps\n'
 }
 if window_ratio >/dev/null 2>&1; then fail 'an idle SSH session must not be the sample'; fi
 pass 'an idle shell at 5.6 Mbps is refused as a buffer sample'
 out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"跑测速"* ]] || fail 'with nothing under load it must say what it needs'
 pass 'with no loaded connection it asks for one instead of inventing a verdict'
-# A slow connection alongside a fast one must not win on being slower.
-ss() {
-  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
-  printf 'ESTAB 0 0 10.0.0.5:22 119.237.129.39:51000\n'
-  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 delivery_rate 5.6Mbps\n'
-  printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
-  printf '\t skmem:(r512000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 delivery_rate 640.0Mbps\n'
-}
-IFS=$'\t' read -r wr_rb _ _ wr_fill wr_ratio _ _ _ _ _ _ _ <<< "$(window_ratio)"
-assert_eq '45497685' "$wr_rb" 'the loaded connection is the one sampled'
-(( wr_fill >= 95 )) || fail "autotuning reached the ceiling, expected ~100%, got ${wr_fill}%"
-(( wr_ratio <= 35 )) || fail "the kernel handed out about a quarter, got ${wr_ratio}%"
-pass 'the loaded connection wins over the idle shell'
 
 # Cause 1: the application is not draining the socket. Bigger buffers only make
-# the backlog bigger, so this must never be read as a buffer problem.
+# the backlog bigger, so this must never read as a buffer problem.
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
-  printf '\t skmem:(r40000000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 delivery_rate 640.0Mbps\n'
+  printf '\t skmem:(r40000000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 bytes_sent:9000 bytes_received:900000000 delivery_rate 640.0Mbps\n'
 }
 out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"应用没把数据读走"* ]] || fail 'a full receive queue means the app is not draining'
@@ -1398,19 +1387,18 @@ pass 'a backed-up receive queue is named as an application problem'
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
-  printf '\t skmem:(r1000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d4211) rtt:150/4 delivery_rate 640.0Mbps\n'
+  printf '\t skmem:(r1000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d4211) rtt:150/4 bytes_sent:9000 bytes_received:900000000 delivery_rate 640.0Mbps\n'
 }
 out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"接收侧丢弃"* ]] || fail 'receive drops must be surfaced'
 pass 'receive-side drops are named rather than blamed on the buffer'
 
 # Cause 3: autotuning had no reason to grow, because the sender or the path is
-# the limit. This is the shape both live boxes are actually in, and it is why
-# doubling rmem_max there moved nothing.
+# the limit. This is why doubling rmem_max on the live box moved nothing.
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
-  printf '\t skmem:(r1000,rb12000000,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 delivery_rate 320.0Mbps\n'
+  printf '\t skmem:(r1000,rb12000000,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 bytes_sent:9000 bytes_received:900000000 delivery_rate 320.0Mbps\n'
 }
 out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"autotuning 没有理由长"* ]] || fail 'a small buffer with an empty queue is not a buffer fault'
@@ -1422,7 +1410,7 @@ pass 'a small buffer with an empty queue points at the sender, not the buffer'
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:443 1.2.3.4:52000\n'
-  printf '\t skmem:(r1000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 delivery_rate 1150.0Mbps\n'
+  printf '\t skmem:(r1000,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 bytes_sent:9000 bytes_received:900000000 delivery_rate 1150.0Mbps\n'
 }
 out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"真的是窗口限制"* ]] || fail 'a full buffer at half in flight is the window-limited case'
@@ -1463,43 +1451,87 @@ grep -q '这一条是真的' "$ROOT/tcpwide.sh" && fail 'the withdrawn memory ad
 pass 'the claim that more memory would help is gone'
 
 
-# ── 0.18.0 跑测速时那条连接是【出站】的 ────────────────────────────────────
-# Both samplers required the local port to be a listening port, i.e. inbound.
-# A speedtest dials OUT to each node, so its local port is ephemeral and the
-# whole connection was invisible -- leaving the SSH session as the only
-# candidate on the machine. Adding a throughput floor in 0.17.0 only turned a
-# false verdict into "cannot measure"; the direction filter was the fault.
+# ── 0.18.0/0.19.0 出站连接 + 收发要分开看 ──────────────────────────────────
+# Both samplers required the local port to be a listening port, so a speedtest
+# -- which dials OUT to each node -- was invisible and the SSH session won every
+# time. And delivery_rate is always the SENDING rate, so a socket we are only
+# receiving on could never win a contest scored on it either.
 restore_lib
 IFACE=eth0
 has() { [[ "$1" == ss ]]; }
-live_value() { printf '90995370\n'; }
-# Exactly what a TcpQuality run looks like: idle inbound SSH, loaded outbound.
+RMEM=90995370; live_value() { printf '%s\n' "$RMEM"; }
+EGRESS_MBPS=1000; SHAPE_PCT=98
+# A mixed speedtest: idle inbound SSH, a loaded outbound sender, a loaded
+# outbound receiver. All three are what a real run looks like.
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:22 119.237.129.39:51000\n'
-  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 snd_wnd:131072 delivery_rate 5.6Mbps\n'
-  printf 'ESTAB 0 0 10.0.0.5:41234 106.75.1.1:443\n'
-  printf '\t skmem:(r98304,rb45497685,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 snd_wnd:8388608 delivery_rate 640.0Mbps\n'
+  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:139.4/4 snd_wnd:131072 bytes_sent:900 bytes_received:900 delivery_rate 5.6Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:41234 157.255.228.103:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb4194304,f0,w2097152,o0,bl0,d0) rtt:169/4 snd_wnd:16777216 bytes_sent:900000000 bytes_received:120000 delivery_rate 792.4Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:41235 106.75.1.1:443\n'
+  printf '\t skmem:(r131072,rb25165824,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 snd_wnd:262144 bytes_sent:90000 bytes_received:800000000 delivery_rate 620.0Mbps\n'
 }
-IFS=$'\t' read -r wr_rb _ _ _ _ _ _ _ wr_peer wr_dir wr_rtt wr_rate <<< "$(window_ratio)"
-assert_eq '45497685' "$wr_rb" 'the outbound speedtest connection is the one sampled'
-assert_eq '106.75.1.1:443' "$wr_peer" 'and it is identified by peer'
-assert_eq '出站' "$wr_dir" 'and labelled as outbound'
-assert_eq '640.0' "$wr_rate" 'at the rate that made it the sample'
-[[ "$wr_rtt" == 150* ]] || fail "the sample RTT must be the loaded connection's, got $wr_rtt"
-pass 'a connection a speedtest actually creates is now visible to the diagnosis'
-# The sample line has to be printed, because two rounds of wrong verdicts came
-# partly from nobody being able to see what got sampled.
+rows="$(window_ratio)"
+assert_eq '2' "$(wc -l <<< "$rows")" 'both directions produce a sample, and the idle shell neither'
+IFS=$'\t' read -r k_s id_s dir_s _ rate_s _ _ _ wnd_s <<< "$(grep '^send' <<< "$rows")"
+assert_eq 'send' "$k_s" 'the sending sample is labelled as such'
+assert_eq '157.255.228.103:443' "$id_s" 'and is the loaded outbound sender'
+assert_eq '出站' "$dir_s" 'and carries its direction'
+assert_eq '792.4' "$rate_s" 'at the rate that selected it'
+assert_eq '16777216' "$wnd_s" "and the peer's advertised window"
+IFS=$'\t' read -r k_r id_r _ _ rate_r _ rb_r _ _ _ <<< "$(grep '^recv' <<< "$rows")"
+assert_eq 'recv' "$k_r" 'the receiving sample is reported separately'
+assert_eq '106.75.1.1:443' "$id_r" 'and is the loaded outbound receiver'
+assert_eq '620.0' "$rate_r" 'which a send-rate contest would have buried'
+assert_eq '25165824' "$rb_r" 'with its own rcvbuf, not the one from the sending sample'
+pass 'a mixed run yields one sample per direction'
+
+# The category error that printed 12965% on live data: in-flight from the SEND
+# rate divided by the RECEIVE buffer. In-flight cannot exceed the buffer holding
+# it, and anything past ~110% has to stop rather than feed a verdict.
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41236 1.2.3.4:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0) rtt:158.7/4 snd_wnd:262144 bytes_sent:1000 bytes_received:900000000 delivery_rate 856.5Mbps\n'
+}
 out="$(render_window_ratio 2>&1)"
-[[ "$out" == *"样本"* && "$out" == *"106.75.1.1:443"* && "$out" == *"出站"* ]] \
-  || fail 'the sample must be shown with peer and direction'
-pass 'the diagnosis shows which connection it sampled'
-# peer_window_ceiling had the same filter and needs the same release.
-IFS=$'\t' read -r pw_peer _ _ _ pw_obs pw_dir <<< "$(peer_window_ceiling)"
-assert_eq '106.75.1.1' "$pw_peer" 'the peer-window reference also sees outbound connections'
-assert_eq '出站' "$pw_dir" 'and reports the direction'
-assert_eq '640.0' "$pw_obs" 'at the loaded rate'
-pass 'the peer-window reference is no longer blind to outbound load'
+[[ "$out" == *"本次对比无效"* ]] || fail 'an impossible ratio must be refused, not reasoned from'
+[[ "$out" != *"autotuning 没有理由长"* ]] || fail 'and must not fall through to a verdict'
+pass 'in-flight larger than the buffer holding it is called invalid'
+
+# A peer window sitting on a power-of-two boundary was configured, not grown.
+# Two unrelated peers both advertising exactly 16.0 MB is the tell.
+assert_eq '16' "$(near_power_of_two_mb 16777216)" 'exactly 16 MiB is recognised'
+assert_eq '16' "$(near_power_of_two_mb 16672358)" 'and so is 15.9 MiB, within tolerance'
+if near_power_of_two_mb 11862343 >/dev/null 2>&1; then
+  fail 'an arbitrary 11.3 MB window is not a configured ceiling'
+fi
+pass 'only round window sizes read as configured rather than autotuned'
+# With the rate matching window/RTT, the hedge resolves to "their ceiling".
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41234 157.255.228.103:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb4194304,f0,w2097152,o0,bl0,d0) rtt:169/4 snd_wnd:16777216 bytes_sent:900000000 bytes_received:120000 delivery_rate 792.4Mbps\n'
+}
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"对端配置的 rmem_max"* ]] || fail 'a matched power-of-two window is the peer ceiling'
+[[ "$out" == *"本机怎么调都拿不回来"* ]] || fail 'and must be named as external'
+pass 'a peer window on a power-of-two boundary settles the hedge'
+
+# Our own pacer is the other thing that caps a sender, and unlike the peer it is
+# ours to change. DMIT sat at 95% of its own fq maxrate.
+EGRESS_MBPS=520
+ss() {
+  [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
+  printf 'ESTAB 0 0 10.0.0.5:41234 180.97.50.130:443\n'
+  printf '\t skmem:(r0,rb131072,t0,tb4194304,f0,w1048576,o0,bl0,d0) rtt:146/4 snd_wnd:16672358 bytes_sent:900000000 bytes_received:120000 delivery_rate 483.8Mbps\n'
+}
+out="$(render_window_ratio 2>&1)"
+[[ "$out" == *"顶在自己设的出口带宽上"* ]] || fail 'a sender at its own maxrate must be told so'
+[[ "$out" != *"对端配置的 rmem_max"* ]] || fail 'and must not be blamed on the peer'
+pass 'a sender at its own pacer is distinguished from a peer ceiling'
+EGRESS_MBPS=1000
 unset -f ss has live_value
 
 # observed_client_rtt must NOT follow: it sizes the coverage RTT from the client

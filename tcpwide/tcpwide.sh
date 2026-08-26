@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.19.0"
+VERSION="0.20.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -111,6 +111,22 @@ BUF_SLACK=$((2 * 1024 * 1024))
 # retransmission, so neither machine is receive-window limited and 0.15.0's
 # original reading was right all along.
 BDP_MULTIPLIER=2
+
+# The starting size for a socket's buffers, which autotuning grows from. It is
+# an allowance, not a preallocation, and it can never cap throughput -- only the
+# third value in tcp_rmem/tcp_wmem does that. What it decides is how long the
+# ramp takes.
+#
+# This was 131072 receive / 65536 send. At 150ms a 64KB send buffer carries
+# 3.5 Mbps through the first round trip and needs about eight doublings to reach
+# the ~12 MB these paths actually use -- roughly 1.2s of a 9s test. From 1 MB it
+# is four doublings, about half that. tcpfit uses 1 MB for the proxy role and
+# reports 2.2x overall on this workload, though that figure bundles every change
+# it makes, so this one knob is not independently measured.
+#
+# It affects the AVERAGE, not the peak: the peak is reached after the ramp
+# either way. Every measurement here has shown average at ~80% of peak.
+BUF_DEFAULT=1048576
 
 EGRESS_MBPS=""
 IFACE=""
@@ -413,9 +429,10 @@ target_sysctl() {
   printf 'net.core.rmem_max\t%s\traise\t%s\n' "$buf" \
     "接收缓冲上限，按覆盖 RTT ${rtt}ms × ${rate}Mbps 的 BDP 两倍算"
   printf 'net.core.wmem_max\t%s\traise\t%s\n' "$buf" '发送缓冲上限，同上'
-  printf 'net.ipv4.tcp_rmem\t4096 131072 %s\traise\t%s\n' "$buf" \
-    '第三个是上限；中间那个是初始接收窗口，抬高它让对端在等窗口更新前多发一些'
-  printf 'net.ipv4.tcp_wmem\t4096 65536 %s\traise\t%s\n' "$buf" '发送侧同上'
+  printf 'net.ipv4.tcp_rmem\t4096 %s %s\traise\t%s\n' "$BUF_DEFAULT" "$buf" \
+    "第三个是上限；中间那个是起步值，autotuning 从这里往上长。64KB 起步在 150ms 上第一个 RTT 只有 3.5 Mbps，要 8 次翻倍才够用"
+  printf 'net.ipv4.tcp_wmem\t4096 %s %s\traise\t%s\n' "$BUF_DEFAULT" "$buf" \
+    '发送侧同上。回程（服务器发给国内）就走这一侧，起步值直接决定爬升快慢'
   printf 'net.ipv4.tcp_slow_start_after_idle\t0\texact\t%s\n' \
     '默认会在连接短暂空闲后把 cwnd 打回初始值重新慢启动，而流媒体分块之间正好是这种空闲——这是「看着看着掉速」的一个真实机制'
   printf 'net.ipv4.tcp_no_metrics_save\t1\texact\t%s\n' \
@@ -617,6 +634,7 @@ load_config() {
       FQ_INITIAL_QUANTUM) is_uint "$value" && (( value <= 1048576 )) && FQ_INITIAL_QUANTUM="$value" ;;
       FQ_FLOW_LIMIT) is_uint "$value" && (( value <= 100000 )) && FQ_FLOW_LIMIT="$value" ;;
       FQ_LIMIT)      is_uint "$value" && (( value <= 1000000 )) && FQ_LIMIT="$value" ;;
+      BUF_DEFAULT)   is_uint "$value" && (( value >= 4096 && value <= 16777216 )) && BUF_DEFAULT="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
@@ -646,6 +664,7 @@ save_config() {
     printf 'FQ_INITIAL_QUANTUM=%s\n' "$FQ_INITIAL_QUANTUM"
     printf 'FQ_FLOW_LIMIT=%s\n' "$FQ_FLOW_LIMIT"
     printf 'FQ_LIMIT=%s\n' "$FQ_LIMIT"
+    printf 'BUF_DEFAULT=%s\n' "$BUF_DEFAULT"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
@@ -2390,6 +2409,9 @@ panel_single_flow() {
     "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
   printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \
     "$FQ_FLOW_LIMIT" "$DIM" "$RESET"
+  printf '    %b5)%b 缓冲起步值           当前 %s MB%b（tcp_[rw]mem 中间值，决定爬升快慢）%b\n' \
+    "$BOLD" "$RESET" "$(mb "$BUF_DEFAULT")" "$DIM" "$RESET"
+  printf '       %b只影响平均速度，不影响峰值——峰值在爬完之后，两边都到得了。%b\n' "$DIM" "$RESET"
   printf '    %b4)%b BBRv3 怎么上（只给方法，不替你装）\n' "$BOLD" "$RESET"
   printf '    %b0)%b 返回\n\n' "$BOLD" "$RESET"
   local pick value
@@ -2408,6 +2430,10 @@ panel_single_flow() {
          FQ_FLOW_LIMIT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
     4) explain_bbr3 ;;
+    5) if value="$(prompt_uint '缓冲起步值 字节（tcpfit 的代理档是 1048576）' \
+           "$BUF_DEFAULT" 4096 16777216)"; then
+         BUF_DEFAULT="$value"; save_config; cmd_apply
+       else info "已取消"; fi ;;
     *) return 0 ;;
   esac
 }

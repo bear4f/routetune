@@ -1579,3 +1579,37 @@ fi
 pass 'a placeholder arm is not mistaken for a reading'
 rm -rf "$STATE_DIR"
 unset -f live_value canonical_qdisc current_default_route
+
+
+# ── 0.20.0 缓冲起步值：借自 tcpfit，只影响爬升 ─────────────────────────────
+# tcp_[rw]mem's middle value is where autotuning starts, not a cap -- only the
+# third value caps. At 150ms a 64KB send buffer carries 3.5 Mbps through the
+# first round trip and needs about eight doublings to reach the ~12 MB these
+# paths use. From 1 MB it is four. tcpfit uses 1 MB for its proxy role.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+tgt="$(target_sysctl 1000 190)"
+mid() { awk -F'\t' -v k="$1" '$1 == k {split($2, f, " "); print f[2]}' <<< "$tgt"; }
+assert_eq '1048576' "$(mid net.ipv4.tcp_rmem)" 'the receive buffer starts at the tuned default'
+assert_eq '1048576' "$(mid net.ipv4.tcp_wmem)" 'and so does the send buffer'
+# The ceiling is still the third value, and the starting size must never exceed
+# it -- a start above the cap would be a configuration the kernel rejects.
+top() { awk -F'\t' -v k="$1" '$1 == k {split($2, f, " "); print f[3]}' <<< "$tgt"; }
+(( $(mid net.ipv4.tcp_wmem) < $(top net.ipv4.tcp_wmem) )) \
+  || fail 'the starting size must sit below the ceiling'
+pass 'the starting size sits below the ceiling it grows toward'
+# It stays a knob, because tcpfit reports 2.2x overall and that bundles every
+# change it makes -- this one is not independently measured.
+BUF_DEFAULT=65536
+tgt="$(target_sysctl 1000 190)"
+assert_eq '65536' "$(mid net.ipv4.tcp_wmem)" 'the previous value is one setting away'
+BUF_DEFAULT=1048576
+
+# What is deliberately NOT taken from tcpfit: netdev_budget. Its own comments
+# record 600 against the kernel's 300 at 3751 vs 3745 Mbps, n=5, 0% coefficient
+# of variation -- a 0.16% difference, and it warns that public 10G endpoints
+# vary 23-45% and once produced a false "600 is harmful" verdict. Copying a
+# setting whose own author measured it as noise is cargo cult.
+grep -q 'netdev_budget' "$ROOT/tcpwide.sh" && fail 'netdev_budget is noise by its own measurement'
+pass 'a setting its own author measured as noise is not copied'

@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.16.0"
+VERSION="0.17.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -69,6 +69,14 @@ COVER_RTT_MS=250
 # Below this, a "farthest client" measurement is describing the datacentre, not
 # the client population, and must not be turned into a coverage figure.
 LOCAL_RTT_SAMPLE_MS=20
+
+# A connection has to be carrying real traffic before anything about buffers can
+# be read off it. Both samplers filtered on RTT alone, so on two machines they
+# picked the operator's own SSH session -- 5.6 Mbps at 139ms from a phone -- and
+# reported "rcvbuf 0.1 MB / rmem_max 86.8 MB = 0%, autotuning never grew". An
+# idle shell has no reason to grow a buffer. The verdict was confident, specific
+# and about nothing, which is worse than declining to answer.
+SAMPLE_MBPS_FLOOR=50
 # Shaping below the provider's own limit is the point: their policer drops
 # bursts, a local AQM queues and marks them. Giving up a slice of peak buys
 # that, and buys the fairness that only exists when the queue is ours.
@@ -86,24 +94,23 @@ BUF_SLACK=$((2 * 1024 * 1024))
 
 # How many BDPs of rmem_max a flow needs to reach line rate.
 #
-# This was 2, from tcp_adv_win_scale=1 meaning "the application gets half the
-# receive buffer". Measured on two machines across fifteen TcpQuality nodes,
-# that is wrong by a factor of two -- bytes in flight settle at a QUARTER of
-# rmem_max, not a half:
+# 0.16.0 moved this to 4 on the strength of two machines whose in-flight bytes
+# both worked out to about a quarter of their rmem_max. A direct experiment on
+# one machine then falsified it: doubling rmem_max from 43.4 to 86.8 MB left
+# nine backends where they were, median in flight 11.41 -> 11.40 MB. If in
+# flight really tracked rmem_max/4 it would have doubled.
 #
-#   BWG   rmem 43.4 MB, six nodes at 0.00% retransmission, RTT 148-174ms:
-#         in flight 11.27-11.64 MB (3% spread) -> 11.45 / 43.4 = 0.264
-#   DMIT  rmem 32.0 MB, nine nodes: 6.74-9.08 MB -> 7.91 / 32.0 = 0.247
+# A correlation across two boxes was not causation, and the kernel story I
+# offered for it did not survive either -- that box runs 6.1, before the release
+# that replaced tcp_adv_win_scale with a measured scaling_ratio, so
+# tcp_adv_win_scale=1 does mean half the buffer there.
 #
-# The /2 model predicted 1071 and 706 Mbps for those two; /4 predicted 535 and
-# 353; measured were 549-583 and 375-405.
-#
-# The mechanism is not settled. Kernels since 6.6 may derive the window from a
-# measured scaling_ratio and ignore tcp_adv_win_scale, or receive autotuning may
-# simply never grow to rmem_max. Both explanations imply the same fix -- size
-# rmem_max at 4x BDP -- so the multiplier moves now, and window_ratio() exists
-# to tell the two apart. It stays a knob until it does.
-BDP_MULTIPLIER=4
+# Back to 2, which is what tcp_adv_win_scale=1 actually promises. Nothing is
+# lost: 86.8 MB and 43.4 MB measured identically. Under 2 those same readings
+# sit at 26% (BWG) and 44-50% (DMIT) of the advertised window with 0.00%
+# retransmission, so neither machine is receive-window limited and 0.15.0's
+# original reading was right all along.
+BDP_MULTIPLIER=2
 
 EGRESS_MBPS=""
 IFACE=""
@@ -323,47 +330,23 @@ target_tcp_mem() {
     printf "%d %d %d", low, pres, max }'
 }
 
-# How much one socket may take of the global TCP budget: half of it, so two
-# large flows still fit before the kernel starts shrinking anyone.
+# How much one socket may take of the global TCP budget: a quarter of it, so
+# four large flows still fit before the kernel starts shrinking anyone.
 #
-# This was a quarter, putting the per-socket hard ceiling at RAM/12. With the
-# corrected multiplier a 520 MB box needs 81 MB of rmem to fill a gigabit port
-# at 170ms, and RAM/12 gives it 43 -- capping a single flow at 535 Mbps on a
-# port that demonstrably carries 1718. Halving the divisor lifts that to RAM/6,
-# which clears it.
+# 0.16.0 halved this divisor -- lifting the per-socket ceiling from RAM/12 to
+# RAM/6 -- purely to make room for the 4x multiplier above. That multiplier is
+# withdrawn, so the reason for the wider ceiling is gone with it, and on the box
+# it was meant to help the extra headroom measured exactly the same. Handing one
+# connection half the budget on a 520 MB box was a real cost for no gain.
 #
-# The trade, chosen deliberately by the operator: two concurrent flows at the
-# ceiling instead of four. Past that the kernel hits tcp_mem pressure and
-# shrinks buffers -- it does not fail -- and every measurement driving this work
-# has been single-threaded.
-#
-# The budget is sized from what the link actually needs rather than from RAM
-# alone — see target_tcp_mem. Sizing it from RAM was wrong in the same way the
-# ladder was: a 520 MB box behind a gigabit port needs far more per socket than
-# its memory would suggest, and rmem_max is a CEILING, not an allocation.
-# Autotuning only grows a socket to what its connection needs, and tcp_mem is
-# the guard that catches the aggregate — when it binds the kernel shrinks
-# buffers, it does not OOM. So the budget can follow the need.
-#
-# This replaces netshape's RAM ladder, which was adopted in 0.5.0 and has to be
-# withdrawn on the evidence.
-#
-# The ladder derives a ceiling from memory alone and knows nothing about the
-# port. On a 520 MB box with a 1 Gbps port it returns 16 MB, which advertises an
-# 8 MB window and caps a single flow at 450 Mbps on a 149ms path — it configures
-# a gigabit machine as though it were a 500 Mbps one. Measured there: 349 Mbps
-# peak against a gigabit port.
-#
-# And the ladder was never shown to help. It was adopted because netshape
-# outperformed tcpwide, but on that machine the ladder never applied at all —
-# `raise` refuses to lower, and the box was already above it. The gain was
-# fq maxrate. Meanwhile the thing the ladder guards against, BBR holding a huge
-# cwnd, is now bounded by per-flow pacing rather than by the window.
+# The operator did choose RAM/6 when asked, but chose it from an analysis that
+# turned out to be wrong; the honest thing is to put it back and say so. Both
+# this and BDP_MULTIPLIER stay knobs.
 socket_budget_cap() {
   local ram="${1:-0}" need="${2:-0}" budget
   (( ram > 0 )) || { printf '0\n'; return 0; }
   budget="$(tcp_mem_budget_bytes "$ram" "$need")"
-  printf '%s\n' $(( budget / 2 ))
+  printf '%s\n' $(( budget / 4 ))
 }
 
 # The global TCP page budget in bytes. At least a quarter of RAM, grown toward a
@@ -374,8 +357,8 @@ tcp_mem_budget_bytes() {
   local ram="${1:-0}" need="${2:-0}" budget
   (( ram > 0 )) || { printf '0\n'; return 0; }
   budget=$(( ram / 4 ))
-  # Two sockets at the required ceiling, matching socket_budget_cap's divisor.
-  if (( need > 0 )) && (( need * 2 > budget )); then budget=$(( need * 2 )); fi
+  # Four sockets at the required ceiling, matching socket_budget_cap's divisor.
+  if (( need > 0 )) && (( need * 4 > budget )); then budget=$(( need * 4 )); fi
   (( budget > ram / 3 )) && budget=$(( ram / 3 ))
   printf '%s\n' "$budget"
 }
@@ -1315,7 +1298,8 @@ window_ratio() {
       print substr($i, j + 1); break
     }
   }' | sort -u | tr '\n' ' ')" || return 1
-  ss -tinmH 2>/dev/null | awk -v listen=" $ports " -v floor="$LOCAL_RTT_SAMPLE_MS" -v rmem="$rmem" '
+  ss -tinmH 2>/dev/null | awk -v listen=" $ports " -v floor="$LOCAL_RTT_SAMPLE_MS" \
+      -v mbfloor="$SAMPLE_MBPS_FLOOR" -v rmem="$rmem" '
     function portof(a,   i) {
       i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
       return (i > 0) ? substr(a, i + 1) : ""
@@ -1334,10 +1318,17 @@ window_ratio() {
         if ($i ~ /^rtt:/) { t = substr($i, 5); q = index(t, "/")
           rtt = ((q > 0) ? substr(t, 1, q - 1) : t) + 0 }
         else if ($i == "delivery_rate" && i < NF) rate = tomb($(i + 1))
-        else if ($i ~ /^skmem:/) { if (match($i, /rb[0-9]+/)) rb = substr($i, RSTART + 2, RLENGTH - 2) + 0 }
+        else if ($i ~ /^skmem:/) {
+          if (match($i, /rb[0-9]+/)) rb = substr($i, RSTART + 2, RLENGTH - 2) + 0
+          # r<N> is bytes sitting in the receive queue unread; d<N> is receive
+          # drops. Together they say whether the application is keeping up.
+          if (match($i, /\(r[0-9]+/)) rq = substr($i, RSTART + 2, RLENGTH - 2) + 0
+          if (match($i, /d[0-9]+\)/)) dr = substr($i, RSTART + 1, RLENGTH - 2) + 0
+        }
       }
-      if (rtt >= floor && rb > 0 && rate > best && index(listen, " " portof(local) " ") > 0) {
-        best = rate; brtt = rtt; brb = rb
+      if (rtt >= floor && rb > 0 && rate >= mbfloor && rate > best \
+          && index(listen, " " portof(local) " ") > 0) {
+        best = rate; brtt = rtt; brb = rb; brq = rq; bdr = dr
       }
       local = ""; next
     }
@@ -1347,39 +1338,55 @@ window_ratio() {
     END {
       if (best <= 0) exit 1
       inflight = best * 1000000 * (brtt / 1000) / 8
-      printf "%d\t%d\t%d\t%.0f\t%.0f", brb, rmem, inflight, brb * 100 / rmem, inflight * 100 / brb
+      printf "%d\t%d\t%d\t%.0f\t%.0f\t%d\t%d\t%.0f", brb, rmem, inflight,
+             brb * 100 / rmem, inflight * 100 / brb, brq, bdr, brq * 100 / brb
     }'
 }
 
 render_window_ratio() {
-  local row rb rmem inflight fill ratio
+  local row rb rmem inflight fill ratio rq drops qpct
   row="$(window_ratio)" || {
-    printf '\n  %b窗口比例：没有可测的高速入站连接（跑测速时进来看）%b\n' "$DIM" "$RESET"
+    printf '\n  %b窗口比例：现在没有跑到 %s Mbps 以上的入站连接，测不了。%b\n' \
+      "$DIM" "$SAMPLE_MBPS_FLOOR" "$RESET"
+    printf '  %b开两个 SSH：一个跑测速，跑的同时另一个进来按 8。%b\n' "$DIM" "$RESET"
+    printf '  %b（空闲的 SSH 会话本身也是连接，但它的缓冲说明不了任何问题。）%b\n' "$DIM" "$RESET"
     return 0
   }
-  IFS=$'\t' read -r rb rmem inflight fill ratio <<< "$row"
-  printf '\n  %b窗口比例实测（最快的一条真实连接）%b\n' "$BOLD" "$RESET"
+  IFS=$'\t' read -r rb rmem inflight fill ratio rq drops qpct <<< "$row"
+  printf '\n  %b窗口比例实测（正在跑流量的那条连接）%b\n' "$BOLD" "$RESET"
   printf '    实际 rcvbuf %s MB ／ rmem_max %s MB = %s%%（autotuning 长到了多少）\n' \
     "$(mb "$rb")" "$(mb "$rmem")" "$fill"
   printf '    在途 %s MB ／ 实际 rcvbuf = %s%%（内核真正给出去的窗口比例）\n' \
     "$(mb "$inflight")" "$ratio"
-  if (( fill < 70 )); then
-    warn "rcvbuf 只长到 rmem_max 的 ${fill}% —— 是 autotuning 没长到顶，不是窗口比例"
-    printf '    %b该动的是 tcp_rmem 的中间值和 tcp_moderate_rcvbuf，加大 rmem_max 没用。%b\n' \
+  printf '    接收队列积压 %s MB（占 rcvbuf %s%%）｜接收丢弃 %s\n' \
+    "$(mb "$rq")" "$qpct" "$drops"
+  # Four causes, four different fixes. Guessing between them is what produced
+  # two rounds of wrong advice.
+  if (( qpct >= 50 )); then
+    warn "接收队列积压到 rcvbuf 的 ${qpct}% —— 是应用没把数据读走"
+    printf '    %b瓶颈在代理进程或 CPU，不在 TCP 配置。加大缓冲只会让积压更大。%b\n' \
       "$DIM" "$RESET"
-  elif (( ratio <= 35 )); then
-    printf '    %b→ rcvbuf 到顶了，而内核只给出约四分之一。BDP 乘数 4 是对的。%b\n' \
-      "$GREEN" "$RESET"
-  elif (( ratio >= 45 )); then
-    printf '    %b→ 内核给的接近一半。这台机器上乘数 2 就够，面板可以调回去。%b\n' \
+  elif (( drops > 0 )); then
+    warn "接收侧丢弃 ${drops} —— 数据在进协议栈之前就没了"
+    printf '    %b看 netdev_max_backlog 和每核占用，不是缓冲的问题。%b\n' "$DIM" "$RESET"
+  elif (( fill < 70 )); then
+    printf '    %b→ rcvbuf 只长到 rmem_max 的 %s%%，而队列几乎是空的：%b\n' "$GREEN" "$fill" "$RESET"
+    printf '    %b  autotuning 没有理由长——发送端或路径本来就只有这么快。%b\n' "$DIM" "$RESET"
+    printf '    %b  加大 rmem_max 不会有任何作用（0.16.0 把它翻倍，实测一点没动）。%b\n' "$DIM" "$RESET"
+  elif (( ratio >= 40 )); then
+    printf '    %b→ rcvbuf 到顶了，而且在途已经接近它的一半：真的是窗口限制。%b\n' \
       "$YELLOW" "$RESET"
+    printf '    %b  这时候加大覆盖 RTT／缓冲上限才有意义。%b\n' "$DIM" "$RESET"
+  else
+    printf '    %b→ rcvbuf 到顶但在途只有 %s%%，两头都不像瓶颈，看别处。%b\n' \
+      "$DIM" "$ratio" "$RESET"
   fi
 }
 
 # A manual buffer ceiling below what the derivation would pick is a cap the
 # operator set once during an experiment and then forgot. On the 958 MB box a
 # leftover 32 MB held it to 353 Mbps on a 520 Mbps port while its memory would
-# have allowed 49 MB, and nothing said so.
+# have allowed more, and nothing said so.
 manual_buffer_shortfall() {
   local rate="${1:-0}" rtt="${2:-0}" auto manual
   is_uint "$BUF_MB" && (( BUF_MB > 0 )) || return 1
@@ -1426,18 +1433,13 @@ render_window_report() {
   elif (( peak >= 85 )); then
     printf '  %b→ 已经有后端贴着本机窗口跑，缓冲就是瓶颈。%b\n' "$YELLOW" "$RESET"
     printf '  %b  先把覆盖 RTT 填到实际最远客户端那个值。%b\n' "$DIM" "$RESET"
-    # 0.15.0 divided by rmem/2 and told this operator their buffer had headroom
-    # and that a machine with more memory "would make no difference". Under the
-    # measured ratio the same readings were at 104-107% of the window: the box
-    # was memory-limited and was advised not to fix it.
-    local ram cap
-    ram="$(total_ram_bytes)"
-    cap="$(socket_budget_cap "$ram" "$ram")"
-    if (( $(live_value net.core.rmem_max) >= cap * 95 / 100 )); then
-      printf '  %b  而这台已经顶到内存允许的最大值 %s MB（RAM/6）——%b\n' \
-        "$YELLOW" "$(mb "$cap")" "$RESET"
-      printf '  %b  再往上要么降覆盖 RTT，要么换内存更大的机器。这一条是真的。%b\n' "$DIM" "$RESET"
-    fi
+    # 0.16.0 added a line here telling the operator that a box at its memory
+    # ceiling needed more memory. Doubling rmem_max on that very box moved nine
+    # backends by nothing at all, so the advice was wrong and is gone. Being at
+    # the ceiling is only worth acting on once window_ratio shows the buffer is
+    # genuinely full, which is what the four-way verdict is for.
+    printf '  %b  先用 8) 的窗口比例确认 rcvbuf 真的长到了顶再动缓冲——%b\n' "$DIM" "$RESET"
+    printf '  %b  这台机器上 rmem_max 翻倍曾经一点效果都没有。%b\n' "$DIM" "$RESET"
   else
     printf '  %b→ 最高才用到 %s%%，本机缓冲还有余量。%b\n' "$GREEN" "$peak" "$RESET"
     printf '  %b  剩下的杠杆，按性价比：%b\n' "$BOLD" "$RESET"
@@ -1809,7 +1811,7 @@ explain_cover_rtt() {
       if knee="$(buffer_knee_ms "$rate")"; then
         printf '\n  %b这台机器 %s MB 内存，单 socket 上限最多长到 %s MB%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
-        printf '  %b（全局 TCP 预算的一半；预算本身会跟着需求从内存的 1/4 长到 1/3）。%b\n' "$DIM" "$RESET"
+        printf '  %b（全局 TCP 预算的 1/4；预算本身会跟着需求从内存的 1/4 长到 1/3）。%b\n' "$DIM" "$RESET"
         printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' "$DIM" "$knee" "$RESET"
         # The honest version of "capped": say what the link would need, what
         # memory allows, and what single-flow rate that leaves. On a small box
@@ -1937,7 +1939,8 @@ peer_window_ceiling() {
       print substr($i, j + 1); break
     }
   }' | sort -u | tr '\n' ' ')" || return 1
-  ss -tinH 2>/dev/null | awk -v listen=" $ports " -v floor="$LOCAL_RTT_SAMPLE_MS" '
+  ss -tinH 2>/dev/null | awk -v listen=" $ports " -v floor="$LOCAL_RTT_SAMPLE_MS" \
+      -v mbfloor="$SAMPLE_MBPS_FLOOR" '
     function portof(a,   i) {
       i = length(a); while (i > 0 && substr(a, i, 1) != ":") i--
       return (i > 0) ? substr(a, i + 1) : ""
@@ -1967,7 +1970,8 @@ peer_window_ceiling() {
       # A 0.6ms neighbour won the "fastest" contest and the panel then reported
       # that the buffer supports 303318 Mbps on it -- an arithmetically correct
       # number about a connection nobody is asking about.
-      if (rtt >= floor && wnd > 0 && rate > best && index(listen, " " portof(local) " ") > 0) {
+      if (rtt >= floor && wnd > 0 && rate >= mbfloor && rate > best \
+          && index(listen, " " portof(local) " ") > 0) {
         best = rate; brtt = rtt; bwnd = wnd; bpeer = ipof(peer)
       }
       local = ""; peer = ""; next

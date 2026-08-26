@@ -162,8 +162,27 @@ SHAPE=0
 # drops the overshoot — and BBRv1 does not read those drops as congestion, so it
 # keeps producing them. netshape puts this under its shaper; shaping the
 # aggregate is not a substitute for pacing the individual flow.
-assert_eq 'fq maxrate 475mbit' "$(target_qdisc 500 250)" \
-  'unshaped still paces each flow at the line rate'
+spec="$(target_qdisc 500 250)"
+[[ "$spec" == 'fq maxrate 475mbit'* ]] \
+  || fail 'unshaped still paces each flow at the line rate'
+pass 'unshaped still paces each flow at the line rate'
+# The queue limits come from netshape-manager, whose author reports it
+# saturating a port on a single thread. flow_limit is the one that matters:
+# it is a PER-FLOW packet quota, so N flows each get their own 100 and the
+# kernel default cannot hold back an aggregate transfer while it can hold back
+# a single one. That is the exact shape of 558 Mbps on one thread against 917
+# on several, same backend, seconds apart.
+assert_eq 'fq maxrate 475mbit limit 40960 flow_limit 8192' "$spec" \
+  'the fq queue limits follow netshape rather than the kernel default'
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+assert_eq 'fq maxrate 475mbit limit 10240 flow_limit 2048' "$(target_qdisc 500 250)" \
+  'a box under 1 GB gets the smaller rung of that ladder'
+# Still overridable, so it can be A/B'd back to the kernel values.
+FQ_LIMIT=10000; FQ_FLOW_LIMIT=100
+assert_eq 'fq maxrate 475mbit limit 10000 flow_limit 100' "$(target_qdisc 500 250)" \
+  'the ladder can be overridden back to the kernel defaults'
+FQ_LIMIT=0; FQ_FLOW_LIMIT=0
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 SHAPE=1
 
 # ── 方向安全 ───────────────────────────────────────────────────────────────
@@ -187,10 +206,14 @@ pass 'an adequate ceiling is not flagged'
 ip() { printf 'default via 10.0.0.1 dev eth0 proto static\n'; }
 route_is_simple "$(current_default_route)" || fail 'a single plain default route is editable'
 pass 'a single plain default route is editable'
-assert_eq 'default via 10.0.0.1 dev eth0 proto static initcwnd 20' \
+# initrwnd travels with initcwnd, following netshape. A relay is not only a
+# sender: it pulls from an upstream backend and forwards, and the initial
+# RECEIVE window governs how fast that upstream leg ramps. Setting only
+# initcwnd left half of every connection starting from the kernel default.
+assert_eq 'default via 10.0.0.1 dev eth0 proto static initcwnd 20 initrwnd 20' \
   "$(route_with_initcwnd "$(current_default_route)" 20)" 'initcwnd is appended to the existing route'
-# Re-applying must not stack a second initcwnd onto the line.
-assert_eq 'default via 10.0.0.1 dev eth0 proto static initcwnd 32' \
+# Re-applying must not stack a second initcwnd or initrwnd onto the line.
+assert_eq 'default via 10.0.0.1 dev eth0 proto static initcwnd 32 initrwnd 32' \
   "$(route_with_initcwnd 'default via 10.0.0.1 dev eth0 proto static initcwnd 20' 32)" \
   'reapplying replaces the metric instead of appending a second one'
 ip() { printf 'default proto static nhid 42\n'; }
@@ -257,8 +280,9 @@ apply_profile speed
 assert_eq '98|32|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the speed profile shapes closer to the line rate'
 apply_profile noshape
 assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
-assert_eq 'fq maxrate 490mbit' "$(target_qdisc 500 250)" \
-  'the no-shape profile yields paced fq, not cake'
+[[ "$(target_qdisc 500 250)" == 'fq maxrate 490mbit'* ]] \
+  || fail 'the no-shape profile yields paced fq, not cake'
+pass 'the no-shape profile yields paced fq, not cake'
 if apply_profile nonsense 2>/dev/null; then fail 'an unknown profile must be rejected'; fi
 pass 'an unknown profile is rejected'
 apply_profile balanced
@@ -292,11 +316,11 @@ unset -f tc
 # ── 0.2.0 默认路由空白归一 ─────────────────────────────────────────────────
 # `ip route show` emits a trailing space on some route types (onlink is one),
 # which produced "... onlink  initcwnd 20" with a doubled space on the live box.
-assert_eq 'default via 193.41.250.250 dev eth0 onlink initcwnd 20' \
+assert_eq 'default via 193.41.250.250 dev eth0 onlink initcwnd 20 initrwnd 20' \
   "$(route_with_initcwnd 'default via 193.41.250.250 dev eth0 onlink ' 20)" \
   'a trailing space in the route does not produce a doubled separator'
 # Re-applying must replace the metric, never stack a second one.
-assert_eq 'default via 10.0.0.1 dev eth0 initcwnd 32' \
+assert_eq 'default via 10.0.0.1 dev eth0 initcwnd 32 initrwnd 32' \
   "$(route_with_initcwnd 'default via 10.0.0.1 dev eth0 initcwnd 20' 32)" \
   'reapplying replaces the metric rather than appending another'
 
@@ -841,6 +865,8 @@ tc() {
 if mq_leaves_with fq >/dev/null 2>&1; then fail 'one paced leaf out of two is not a paced machine'; fi
 pass 'a partially paced mq root does not count as carrying the pacer'
 QDISC_LAYOUT=mq-leaves
+# qdisc_drift reaches target_qdisc, which now sizes the fq queue limits from RAM.
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
 assert_eq 'mq' "$(qdisc_drift)" 'a half-paced mq root reads as drift'
 unset -f tc
 
@@ -1065,16 +1091,17 @@ unset -f live_value canonical_qdisc current_default_route
 # 0.10.0 shipped a queue layout that was reasoned rather than measured and cost
 # 44% across three backends. These three are hypotheses too, so they ship as
 # knobs at their existing values and only a measurement gets to promote one.
-SHAPE=0; SHAPE_PCT=98; FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0
-assert_eq 'fq maxrate 980mbit' "$(target_qdisc 1000 200)" \
-  'an untouched knob leaves the applied qdisc exactly as 0.12.0 built it'
+# initial_quantum stays a pure knob: unlike the queue limits it has no
+# supporting measurement from anywhere, so it ships off and only a recorded A/B
+# gets to promote it.
+SHAPE=0; SHAPE_PCT=98; FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0; FQ_LIMIT=0
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+assert_eq 'fq maxrate 980mbit limit 40960 flow_limit 8192' "$(target_qdisc 1000 200)" \
+  'an untouched initial_quantum adds nothing to the spec'
 FQ_INITIAL_QUANTUM=65536
-assert_eq 'fq maxrate 980mbit initial_quantum 65536' "$(target_qdisc 1000 200)" \
-  'a set burst allowance reaches the spec'
-FQ_FLOW_LIMIT=500
-assert_eq 'fq maxrate 980mbit initial_quantum 65536 flow_limit 500' "$(target_qdisc 1000 200)" \
-  'and so does a set queue depth'
-FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0
+assert_eq 'fq maxrate 980mbit limit 40960 flow_limit 8192 initial_quantum 65536' \
+  "$(target_qdisc 1000 200)" 'a set burst allowance reaches the spec'
+FQ_INITIAL_QUANTUM=0
 
 # ── 0.13.0 覆盖 RTT 的建议值不该越过拐点 ───────────────────────────────────
 # The wizard said "above 173 ms the buffer stops growing" and recommended 200 in

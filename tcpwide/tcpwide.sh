@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.13.0"
+VERSION="0.14.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -129,21 +129,41 @@ QDISC_LAYOUT=root
 # that keeps getting misread as a server problem.
 RECORD_THREADS=1
 
-# fq's per-flow burst allowance and queue depth. Both default to 0, meaning
-# "leave the kernel's value alone" -- the live box reports initial_quantum
-# 15140b and flow_limit 100p, and neither has been measured on this path.
+# fq's queue limits. 0 means "leave the kernel's value alone"; anything else is
+# written into the qdisc spec.
 #
-# They are here as knobs, not as a new default. 0.10.0 shipped a queue layout
-# that was reasoned rather than measured and cost 44% across three backends;
-# the rule that came out of it is that measurement promotes a value, reasoning
-# does not. A/B these with `record` before changing what ships.
+# fq_queue_limits() supplies the default, taken from netshape-manager, whose
+# author reports it saturating a port on a single thread. It sets
+# limit 10240 / flow_limit 2048 below 1 GB of RAM and 40960 / 8192 above,
+# against kernel defaults of 10000 and 100.
 #
-# The theory worth testing: at 558 Mbps a single flow moves ~46 packets per
-# millisecond, so a 15140-byte initial burst is about 10 packets, and 100
-# packets of queue is under 3ms of data at that rate. On a high-BDP path both
-# could be tight.
+# flow_limit is the interesting one, and the reason it is a default rather than
+# a knob: it is a PER-FLOW packet quota. N flows each get their own 100, so the
+# kernel default cannot hold back an aggregate transfer while it can hold back
+# a single one. That is the exact shape of the measurement here -- 558 Mbps on
+# one thread, 917 on several, on the same backend seconds apart.
+#
+# Whether 100 really binds is not established: fq counts skbs, and with GSO one
+# skb can carry 64KB, so 100 of them is a lot of bytes. It is adopted because
+# it comes from a configuration reported to saturate, not because the mechanism
+# is proven -- and it stays overridable so it can be A/B'd back out.
 FQ_INITIAL_QUANTUM=0
+FQ_LIMIT=0
 FQ_FLOW_LIMIT=0
+
+# The ingress backlog, on netshape's memory ladder.
+netdev_backlog() {
+  local ram; ram="$(total_ram_bytes)"
+  if (( ram > 0 && ram < 1024 * 1024 * 1024 )); then printf '4096\n'
+  else printf '16384\n'; fi
+}
+
+# netshape's ladder. Returns "limit flow_limit".
+fq_queue_limits() {
+  local ram; ram="$(total_ram_bytes)"
+  if (( ram > 0 && ram < 1024 * 1024 * 1024 )); then printf '10240 2048\n'
+  else printf '40960 8192\n'; fi
+}
 # 0 means "derive it". An explicit value in MB overrides the whole derivation.
 #
 # netshape's RAM ladder exists because oversized buffers let BBR hold a huge
@@ -377,6 +397,17 @@ target_sysctl() {
     '默认会在连接短暂空闲后把 cwnd 打回初始值重新慢启动，而流媒体分块之间正好是这种空闲——这是「看着看着掉速」的一个真实机制'
   printf 'net.ipv4.tcp_no_metrics_save\t1\texact\t%s\n' \
     '默认会把每个目标的 ssthresh 缓存下来。5G 波动时缓存到一个很低的值，下一条连接会带着这个悲观值起步、提前退出慢启动——这是波动链路「爬不起来」的直接原因'
+  # A socket that has not been told otherwise starts here. TCP takes its
+  # initial sizes from tcp_rmem/tcp_wmem instead, but anything that calls
+  # setsockopt without a size, and every non-TCP socket, lands on these.
+  printf 'net.core.rmem_default\t262144\traise\t%s\n' '默认接收缓冲，没显式设置的 socket 从这里起步'
+  printf 'net.core.wmem_default\t262144\traise\t%s\n' '默认发送缓冲，同上'
+  printf 'net.core.optmem_max\t4194304\traise\t%s\n' '辅助缓冲上限，高并发下不够会直接分配失败'
+  # F-RTO and Fast Open join ECN in the cross-border blackhole family: all
+  # three are negotiated behaviours that middleboxes on these paths mishandle.
+  # tcpwide already took tcp_ecn=0 from netshape for exactly this reason.
+  printf 'net.ipv4.tcp_frto\t0\texact\t%s\n' 'F-RTO 依赖中间设备如实转发，跨境链路上不成立'
+  printf 'net.ipv4.tcp_fastopen\t0\texact\t%s\n' 'TFO 在跨境中间设备上会被黑洞，握手直接卡住'
   printf 'net.ipv4.tcp_mtu_probing\t1\texact\t%s\n' \
     '路径上有人钳制 MSS 时让内核探到能用的大小，而不是反复重传大包'
   # Everything above assumes the application gets half of a receive buffer.
@@ -397,8 +428,7 @@ target_sysctl() {
     printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
       '未发送数据上限。400Mbps 下 16KB 只够 0.33ms，代理进程稍慢一下管道就空了。真机 A/B/A 夹逼对照下 131072 比 16384 高 18%（均）/11%（峰），但只有一个 B 样本，证据不算强。要极致低延迟可以调小，填 0 保持系统现值'
   fi
-  printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' \
-    "$( (( $(total_ram_bytes) < 1024 * 1024 * 1024 )) && printf 4096 || printf 16384 )" \
+  printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' "$(netdev_backlog)" \
     '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
   # netshape turns ECN off on purpose, and its reason is specific and
   # field-earned: cross-border middleboxes blackhole ECN negotiation. That is
@@ -424,13 +454,15 @@ target_qdisc() {
   local perflow; perflow=$(( rate * SHAPE_PCT / 100 ))
   (( perflow > 0 )) || perflow="$rate"
   if (( SHAPE == 0 )); then
-    local extra=''
-    # Zero means "the kernel's value", so an untouched knob adds nothing to the
-    # spec and the applied qdisc is byte-identical to what 0.12.0 produced.
+    local extra='' lim flim
+    # The script runs under IFS=$'\n\t', so a bare `read` keeps both numbers in
+    # the first variable. This is the fifth time that has bitten this file.
+    IFS=' ' read -r lim flim <<< "$(fq_queue_limits)"
+    is_uint "$FQ_LIMIT"      && (( FQ_LIMIT > 0 ))      && lim="$FQ_LIMIT"
+    is_uint "$FQ_FLOW_LIMIT" && (( FQ_FLOW_LIMIT > 0 )) && flim="$FQ_FLOW_LIMIT"
+    extra=" limit $lim flow_limit $flim"
     is_uint "$FQ_INITIAL_QUANTUM" && (( FQ_INITIAL_QUANTUM > 0 )) \
       && extra="$extra initial_quantum $FQ_INITIAL_QUANTUM"
-    is_uint "$FQ_FLOW_LIMIT" && (( FQ_FLOW_LIMIT > 0 )) \
-      && extra="$extra flow_limit $FQ_FLOW_LIMIT"
     printf 'fq maxrate %smbit%s\n' "$perflow" "$extra"
     return 0
   fi
@@ -484,7 +516,11 @@ route_with_initcwnd() {
   # so appending naively produced "... onlink  initcwnd 20". iproute2 accepts it
   # but the panel has to display it, and a snapshot has to compare against it.
   line="$(awk '{$1 = $1; print}' <<< "$line")"
-  printf '%s initcwnd %s\n' "$line" "$cwnd"
+  # initrwnd as well as initcwnd, following netshape. A relay is not only a
+  # sender: it pulls from an upstream backend and forwards, and the initial
+  # RECEIVE window governs how fast that upstream leg ramps. Setting only
+  # initcwnd left half of every connection starting from the kernel default.
+  printf '%s initcwnd %s initrwnd %s\n' "$line" "$cwnd" "$cwnd"
 }
 
 # ── 配置持久化 ─────────────────────────────────────────────────────────────
@@ -557,6 +593,7 @@ load_config() {
       QDISC_LAYOUT) [[ "$value" =~ ^(root|mq-leaves)$ ]] && QDISC_LAYOUT="$value" ;;
       FQ_INITIAL_QUANTUM) is_uint "$value" && (( value <= 1048576 )) && FQ_INITIAL_QUANTUM="$value" ;;
       FQ_FLOW_LIMIT) is_uint "$value" && (( value <= 100000 )) && FQ_FLOW_LIMIT="$value" ;;
+      FQ_LIMIT)      is_uint "$value" && (( value <= 1000000 )) && FQ_LIMIT="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
@@ -585,6 +622,7 @@ save_config() {
     printf 'QDISC_LAYOUT=%s\n' "$QDISC_LAYOUT"
     printf 'FQ_INITIAL_QUANTUM=%s\n' "$FQ_INITIAL_QUANTUM"
     printf 'FQ_FLOW_LIMIT=%s\n' "$FQ_FLOW_LIMIT"
+    printf 'FQ_LIMIT=%s\n' "$FQ_LIMIT"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
@@ -1925,6 +1963,8 @@ panel_single_flow() {
     "$(live_value net.ipv4.tcp_notsent_lowat)"
   printf '       %b558 Mbps 下 128KB 只有 1.8ms 的数据。单核机器上代理的调度抖动%b\n' "$DIM" "$RESET"
   printf '       %b一旦超过这个数就会饿死网卡。131072 曾胜 16384（+18%%），再往上没测过。%b\n' "$DIM" "$RESET"
+  printf '       %b[!] netshape 在 RTT≥120ms 时反而用 16384，和这里的实测直接对立。%b\n' "$YELLOW" "$RESET"
+  printf '       %b这是下一个最该 A/B 的东西——两边都声称有依据，只能靠你这条路径裁决。%b\n' "$DIM" "$RESET"
   printf '    %b2)%b fq initial_quantum  当前 %s%b（0 = 用内核的 15140b）%b\n' "$BOLD" "$RESET" \
     "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
   printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \

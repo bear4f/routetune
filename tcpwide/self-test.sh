@@ -18,6 +18,15 @@ assert_eq() {
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
+# `unset -f` on a mock does not reveal the real function underneath -- it just
+# removes it, and the next caller gets "command not found". Blocks that need the
+# genuine definitions back re-source the library instead. Callers re-set any
+# configuration variables they depend on immediately afterwards.
+restore_lib() {
+  # shellcheck source=./tcpwide.sh
+  . "$ROOT/tcpwide.sh"
+}
+
 # ── 尺寸推导 ───────────────────────────────────────────────────────────────
 assert_eq "$((250 * 125 * 500))" "$(bdp_bytes 500 250)" 'BDP is rate x rtt with no lost precision'
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
@@ -893,15 +902,15 @@ live_value() { case "$1" in
   net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
   net.core.rmem_max) printf '45438293\n' ;;
 esac; }
-live_qdisc_layout() { printf 'fq maxrate 980mbit\n'; }
+canonical_qdisc() { printf 'fq maxrate 980Mbit\n'; }
 current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
 COVER_RTT_MS=176
 fp="$(config_fingerprint)"
-for want in "$VERSION" bbr 43.3 'fq maxrate 980mbit' 'initcwnd 20' '176 ms'; do
+for want in "$VERSION" bbr 43.3 'fq maxrate 980Mbit' 'initcwnd 20' '176 ms'; do
   [[ "$fp" == *"$want"* ]] || fail "the fingerprint must carry $want"
 done
 pass 'the fingerprint identifies version, cc, buffer, layout, initcwnd and coverage'
-unset -f live_value live_qdisc_layout current_default_route
+unset -f live_value canonical_qdisc current_default_route
 
 # BBR without a pacer bursts at line rate. The root qdisc is set explicitly, but
 # any queue the kernel makes on its own takes default_qdisc, and the stock value
@@ -956,7 +965,7 @@ live_value() { case "$1" in
   net.core.rmem_max) printf '45438293\n' ;;
 esac; }
 current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
-live_qdisc_layout() { printf '%s\n' "${FAKE_Q:-fq maxrate 950mbit}"; }
+canonical_qdisc() { printf '%s\n' "${FAKE_Q:-fq maxrate 950mbit}"; }
 COVER_RTT_MS=176
 if best_measurement >/dev/null 2>&1; then fail 'an empty log has no best run'; fi
 pass 'an empty measurement log reports no best run'
@@ -974,7 +983,114 @@ pass 'a non-numeric reading is refused rather than logged'
 assert_eq '3' "$(wc -l < "$MEASURE_LOG")" 'the refused reading did not reach the log'
 # A tab in the note would split the record into the wrong fields.
 FAKE_Q='fq maxrate 950mbit' record_measurement 100 "$(printf 'a\tb')"
-assert_eq '4' "$(awk -F'\t' 'NF == 4' "$MEASURE_LOG" | wc -l)" \
+assert_eq '4' "$(awk -F'\t' 'NF == 5' "$MEASURE_LOG" | wc -l)" \
   'a tab in the note cannot break the record into extra fields'
 rm -rf "$STATE_DIR"
-unset -f live_value current_default_route live_qdisc_layout
+unset -f live_value current_default_route canonical_qdisc
+
+
+# ── 0.13.0 指纹必须稳定，否则 A/B 无从谈起 ─────────────────────────────────
+# The fingerprint used the raw `tc` line, which carries a handle the kernel
+# reassigns on every replace (8006:, then 8007:) and a refcnt that moves on its
+# own. Two runs of the identical configuration produced two different strings,
+# so the panel's "the best run is the current configuration" test could never be
+# true. An A/B is worthless if the same arm is not recognisable twice.
+restore_lib          # the block above mocked canonical_qdisc; this needs the real one
+IFACE=eth0
+mq_root_handle() { printf ''; }
+tc() {
+  printf 'qdisc fq %s: root refcnt 2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b maxrate 980Mbit low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop\n' "${FAKE_H:-8006}"
+}
+a="$(FAKE_H=8006 canonical_qdisc)"
+b="$(FAKE_H=8007 canonical_qdisc)"
+assert_eq "$a" "$b" 'a reassigned qdisc handle does not change the identity'
+assert_eq 'fq maxrate 980Mbit' "$a" 'the canonical form keeps only what we chose'
+for junk in 8006 refcnt limit buckets orphan_mask quantum horizon low_rate_threshold; do
+  [[ "$a" != *"$junk"* ]] || fail "the canonical form must not carry $junk"
+done
+pass 'kernel bookkeeping and defaults are stripped from the identity'
+tc() { printf 'qdisc cake 8005: root refcnt 2 bandwidth 950Mbit besteffort dual-dsthost nonat nowash no-ack-filter no-split-gso rtt 200ms raw overhead 0\n'; }
+assert_eq 'cake 950Mbit dual-dsthost no-split-gso rtt 200ms' "$(canonical_qdisc)" \
+  'CAKE keeps its bandwidth, isolation, gso choice and rtt'
+mq_root_handle() { printf '8001:\n'; }
+tc() {
+  printf 'qdisc mq 8001: root\nqdisc fq 0: parent 8001:1 limit 10000p\nqdisc fq 0: parent 8001:2 limit 10000p\n'
+}
+assert_eq 'mq ← 2×fq ' "$(canonical_qdisc)" 'an mq root is identified by what its leaves carry'
+unset -f tc mq_root_handle
+
+# ── 0.13.0 单线程和多线程回答的是两个不同的问题 ────────────────────────────
+# Multi-thread hit 917 Mbps on a 1000 Mbps port, 43 seconds after the same
+# backend gave 558 single-threaded. That pair is what finally established the
+# server side was already tuned, and it took five rounds of asking to obtain.
+# The tool should state it rather than leaving it to be worked out by hand.
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+live_value() { case "$1" in
+  net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
+  net.core.rmem_max) printf '45438293\n' ;;
+esac; }
+canonical_qdisc() { printf 'fq maxrate 980Mbit\n'; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
+COVER_RTT_MS=200
+if throughput_verdict 1000 >/dev/null 2>&1; then fail 'one arm alone is not a verdict'; fi
+pass 'a single-thread reading on its own yields no verdict'
+record_measurement 557.8 '武汉 单线程' 1
+if throughput_verdict 1000 >/dev/null 2>&1; then fail 'still only one arm'; fi
+pass 'a verdict needs both arms, not just more readings'
+record_measurement 917.4 '武汉 多线程' 4
+IFS=$'\t' read -r v_s v_m v_pct v_state <<< "$(throughput_verdict 1000)"
+assert_eq '557.8' "$v_s" 'the single-thread arm is the fastest single-thread run'
+assert_eq '917.4' "$v_m" 'the multi-thread arm is the fastest multi-thread run'
+assert_eq '92' "$v_pct" '917 of 1000 Mbps is 92% of line rate'
+assert_eq 'tuned' "$v_state" 'aggregate near the port rate means the server side is done'
+# The arms must never be averaged together: a fast multi-thread run is not a
+# better single-thread run, and reading it as one is what sent this looking for
+# a server-side cause that did not exist.
+IFS=$'\t' read -r t_s t_m <<< "$(thread_split)"
+assert_eq '557.8' "$t_s" 'a multi-thread run does not raise the single-thread best'
+assert_eq '917.4' "$t_m" 'and the two are tracked separately'
+# Records written before 0.13.0 have no thread column and were single-thread.
+printf '%s\t%s\t%s\t%s\n' "$(date +%s)" 600 'old fingerprint' '旧记录' >> "$MEASURE_LOG"
+IFS=$'\t' read -r t_s _ <<< "$(thread_split)"
+assert_eq '600' "$t_s" 'a pre-0.13.0 record counts as the single-thread run it was'
+# A machine that cannot fill its port even in aggregate is a different verdict.
+: > "$MEASURE_LOG"
+record_measurement 330 '单' 1; record_measurement 500 '多' 4
+IFS=$'\t' read -r _ _ _ v_state <<< "$(throughput_verdict 1000)"
+assert_eq 'short' "$v_state" 'aggregate well under the port keeps the search open'
+rm -rf "$STATE_DIR"
+unset -f live_value canonical_qdisc current_default_route
+
+# ── 0.13.0 单流旋钮：默认必须和 0.12.0 逐字节相同 ──────────────────────────
+# 0.10.0 shipped a queue layout that was reasoned rather than measured and cost
+# 44% across three backends. These three are hypotheses too, so they ship as
+# knobs at their existing values and only a measurement gets to promote one.
+SHAPE=0; SHAPE_PCT=98; FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0
+assert_eq 'fq maxrate 980mbit' "$(target_qdisc 1000 200)" \
+  'an untouched knob leaves the applied qdisc exactly as 0.12.0 built it'
+FQ_INITIAL_QUANTUM=65536
+assert_eq 'fq maxrate 980mbit initial_quantum 65536' "$(target_qdisc 1000 200)" \
+  'a set burst allowance reaches the spec'
+FQ_FLOW_LIMIT=500
+assert_eq 'fq maxrate 980mbit initial_quantum 65536 flow_limit 500' "$(target_qdisc 1000 200)" \
+  'and so does a set queue depth'
+FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0
+
+# ── 0.13.0 覆盖 RTT 的建议值不该越过拐点 ───────────────────────────────────
+# The wizard said "above 173 ms the buffer stops growing" and recommended 200 in
+# the same breath. Two numbers on screen arguing with each other.
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+knee="$(buffer_knee_ms 1000)"
+assert_eq '173' "$knee" 'the knee is where the budget stops growing'
+(( knee < 200 )) || fail 'this box must have its knee below the 200 the wizard suggested'
+pass 'the knee sits below the suggestion, so the caveat is needed'
+has() { [[ "$1" == sysctl ]]; }
+sysctl() { [[ "$2" == net.ipv4.tcp_mem ]] && printf '8330\t16661\t33323\n'; }
+suggest_cover_rtt() { printf '200\t167\t9\n'; }
+COVER_RTT_MS=200
+out="$(explain_cover_rtt 1000 2>&1)"
+[[ "$out" == *"填 200 和填 173 效果相同"* ]] \
+  || fail 'a suggestion past the knee must say it changes nothing'
+pass 'a suggestion past the knee says so instead of contradicting itself'
+total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
+unset -f has sysctl suggest_cover_rtt

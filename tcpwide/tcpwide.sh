@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.12.0"
+VERSION="0.13.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -123,6 +123,27 @@ NOTSENT_LOWAT=131072
 # backends lost 42-47% together. Reasoning does not get to set defaults here;
 # measurement does. It stays available so it can be A/B'd, not deleted.
 QDISC_LAYOUT=root
+
+# How many parallel streams a `record` reading came from. 1 unless told
+# otherwise, because a single-thread reading is the common case and the one
+# that keeps getting misread as a server problem.
+RECORD_THREADS=1
+
+# fq's per-flow burst allowance and queue depth. Both default to 0, meaning
+# "leave the kernel's value alone" -- the live box reports initial_quantum
+# 15140b and flow_limit 100p, and neither has been measured on this path.
+#
+# They are here as knobs, not as a new default. 0.10.0 shipped a queue layout
+# that was reasoned rather than measured and cost 44% across three backends;
+# the rule that came out of it is that measurement promotes a value, reasoning
+# does not. A/B these with `record` before changing what ships.
+#
+# The theory worth testing: at 558 Mbps a single flow moves ~46 packets per
+# millisecond, so a 15140-byte initial burst is about 10 packets, and 100
+# packets of queue is under 3ms of data at that rate. On a high-BDP path both
+# could be tight.
+FQ_INITIAL_QUANTUM=0
+FQ_FLOW_LIMIT=0
 # 0 means "derive it". An explicit value in MB overrides the whole derivation.
 #
 # netshape's RAM ladder exists because oversized buffers let BBR hold a huge
@@ -402,7 +423,17 @@ target_qdisc() {
   # the aggregate is not a substitute for pacing the individual flow.
   local perflow; perflow=$(( rate * SHAPE_PCT / 100 ))
   (( perflow > 0 )) || perflow="$rate"
-  (( SHAPE == 1 )) || { printf 'fq maxrate %smbit\n' "$perflow"; return 0; }
+  if (( SHAPE == 0 )); then
+    local extra=''
+    # Zero means "the kernel's value", so an untouched knob adds nothing to the
+    # spec and the applied qdisc is byte-identical to what 0.12.0 produced.
+    is_uint "$FQ_INITIAL_QUANTUM" && (( FQ_INITIAL_QUANTUM > 0 )) \
+      && extra="$extra initial_quantum $FQ_INITIAL_QUANTUM"
+    is_uint "$FQ_FLOW_LIMIT" && (( FQ_FLOW_LIMIT > 0 )) \
+      && extra="$extra flow_limit $FQ_FLOW_LIMIT"
+    printf 'fq maxrate %smbit%s\n' "$perflow" "$extra"
+    return 0
+  fi
   # No `ecn` keyword: mainline sch_cake already marks ECN-capable packets
   # instead of dropping them, so there is nothing to switch on, and the option
   # does not exist in current iproute2 — the live node rejected the whole spec
@@ -524,6 +555,8 @@ load_config() {
       BUF_MB)       is_uint "$value" && (( value <= 512 )) && BUF_MB="$value" ;;
       PROFILE)      [[ "$value" =~ ^(stable|balanced|speed|noshape|custom)$ ]] && PROFILE="$value" ;;
       QDISC_LAYOUT) [[ "$value" =~ ^(root|mq-leaves)$ ]] && QDISC_LAYOUT="$value" ;;
+      FQ_INITIAL_QUANTUM) is_uint "$value" && (( value <= 1048576 )) && FQ_INITIAL_QUANTUM="$value" ;;
+      FQ_FLOW_LIMIT) is_uint "$value" && (( value <= 100000 )) && FQ_FLOW_LIMIT="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
@@ -550,6 +583,8 @@ save_config() {
     printf 'BUF_MB=%s\n'        "$BUF_MB"
     printf 'PROFILE=%s\n'      "$PROFILE"
     printf 'QDISC_LAYOUT=%s\n' "$QDISC_LAYOUT"
+    printf 'FQ_INITIAL_QUANTUM=%s\n' "$FQ_INITIAL_QUANTUM"
+    printf 'FQ_FLOW_LIMIT=%s\n' "$FQ_FLOW_LIMIT"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
@@ -808,8 +843,8 @@ cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1; }
 #
 # Anchored to a measurement rather than a guess. Same box, same backend, minutes
 # apart: `fq maxrate 980mbit` delivered 629 Mbps peak, `cake bandwidth 980Mbit`
-# on the same two cores delivered 332. So two cores cannot shape a gigabit, and
-# ~300 Mbps per core is what they actually managed.
+# delivered 332. That box reports ONE core -- the earlier "2 cores" reading of
+# it was wrong -- so ~300 Mbps of CAKE per core is what it actually managed.
 #
 # This was 400, and I raised it to 600 because the operator said a 2-core 0.5 GB
 # box can push 2 Gbps. That is true, and it is about the PORT -- not about
@@ -1023,6 +1058,21 @@ apply_route() {
   fi
 }
 
+# The coverage RTT past which the per-socket ceiling stops growing, because the
+# global budget has reached its own cap. Both the suggestion and the explanation
+# read it from here rather than each computing their own.
+buffer_knee_ms() {
+  local rate="${1:-0}" ram clamp knee
+  (( rate > 0 )) || return 1
+  ram="$(total_ram_bytes)"
+  (( ram > 0 )) || return 1
+  # Asking for a need nothing can satisfy returns the hard cap.
+  clamp="$(socket_budget_cap "$ram" "$ram")"
+  knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
+  (( knee >= 10 && knee <= 2000 )) || return 1
+  printf '%s\n' "$knee"
+}
+
 # One line that identifies exactly which configuration is running, built from
 # LIVE values rather than intended ones.
 #
@@ -1034,7 +1084,7 @@ config_fingerprint() {
   local cc buf layout cwnd
   cc="$(live_value net.ipv4.tcp_congestion_control)"
   buf="$(live_value net.core.rmem_max)"
-  layout="$(live_qdisc_layout 2>/dev/null || printf '?')"
+  layout="$(canonical_qdisc 2>/dev/null || printf '?')"
   cwnd="$(current_default_route | grep -o 'initcwnd [0-9]*' | awk '{print $2}')"
   printf '%s %s ｜ %s ｜ rmem %s MB ｜ %s ｜ initcwnd %s ｜ cover %s ms\n' \
     "$PROGRAM" "$VERSION" "${cc:-?}" "$(mb "${buf:-0}")" "$layout" \
@@ -1046,14 +1096,47 @@ config_fingerprint() {
 # The fingerprint made a configuration identifiable; this makes two of them
 # comparable. Without it every round starts from opinion.
 #
-# One record per line: unix time, Mbps, fingerprint, note.
+# One record per line: unix time, Mbps, fingerprint, note, threads.
+#
+# The thread count is the field that turns a pile of numbers into a diagnosis.
+# A single flow through a userspace proxy carries per-connection overhead that
+# no sysctl removes, so single-thread and multi-thread readings answer two
+# different questions and must never be averaged together.
 record_measurement() {
-  local mbps="${1:-}" note="${2:-}"
+  local mbps="${1:-}" note="${2:-}" threads="${3:-1}"
   [[ "$mbps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  is_uint "$threads" && (( threads > 0 )) || threads=1
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\n' \
-    "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" >> "$MEASURE_LOG"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" "$threads" >> "$MEASURE_LOG"
   chmod 0600 "$MEASURE_LOG" 2>/dev/null || true
+}
+
+# The fastest single-thread and multi-thread runs on record, as
+# "single<TAB>multi". Either may be empty. Records written before 0.13.0 have no
+# thread column and count as single-thread, which is what they were.
+thread_split() {
+  [[ -r "$MEASURE_LOG" ]] || return 1
+  awk -F'\t' '{
+      t = (NF >= 5 && $5 + 0 > 0) ? $5 + 0 : 1
+      if (t > 1) { if ($2 + 0 > m + 0) m = $2 }
+      else       { if ($2 + 0 > s + 0) s = $2 } }
+    END { if (s == "" && m == "") exit 1; printf "%s\t%s", s, m }' "$MEASURE_LOG"
+}
+
+# What the two readings mean together. Aggregate near the port rate says the
+# server side is done: the port, the memory, the queue and the TCP settings all
+# deliver. A single flow well below it is per-connection overhead, and no
+# amount of buffer or queue tuning moves it.
+throughput_verdict() {
+  local port="${1:-0}" row single multi
+  row="$(thread_split)" || return 1
+  IFS=$'\t' read -r single multi <<< "$row"
+  [[ -n "$single" && -n "$multi" ]] || return 1
+  awk -v s="$single" -v m="$multi" -v p="$port" 'BEGIN {
+    if (p <= 0) exit 1
+    pct = m * 100 / p
+    printf "%s\t%s\t%.0f\t%s", s, m, pct, (pct >= 85) ? "tuned" : "short" }'
 }
 
 # The fastest run on record. Prints "mbps<TAB>fingerprint<TAB>note<TAB>when".
@@ -1068,9 +1151,10 @@ best_measurement() {
 
 cmd_record() {
   local mbps="${1:-}" note="${2:-}" row bm bf bn bw
-  [[ -n "$mbps" ]] || die "用法：$PROGRAM record <Mbps> [备注]    例：$PROGRAM record 629 上海电信"
+  [[ -n "$mbps" ]] || die "用法：$PROGRAM record <Mbps> [备注] [--threads N]    例：$PROGRAM record 629 上海电信"
   resolve_iface
-  record_measurement "$mbps" "$note" || die "Mbps 需为数字，例：$PROGRAM record 629.1 上海电信"
+  record_measurement "$mbps" "$note" "$RECORD_THREADS" \
+    || die "Mbps 需为数字，例：$PROGRAM record 629.1 上海电信"
   title 'tcpwide 记录'
   log "已记录 $mbps Mbps"
   printf '  %b%s%b\n' "$DIM" "$(config_fingerprint)" "$RESET"
@@ -1080,7 +1164,64 @@ cmd_record() {
       "$( [[ -n "$bn" ]] && printf '，%s' "$bn" )"
     printf '  %b%s%b\n' "$DIM" "$bf" "$RESET"
   fi
+  render_verdict "${EGRESS_MBPS:-0}"
   printf '\n'
+}
+
+# Says out loud what the single/multi pair means, so nobody has to work it out
+# by hand the way this took five rounds of asking to establish.
+render_verdict() {
+  local port="${1:-0}" v single multi pct state
+  v="$(throughput_verdict "$port")" || return 0
+  IFS=$'\t' read -r single multi pct state <<< "$v"
+  printf '\n  %b单线程 %s Mbps ｜ 多线程 %s Mbps（%s%% 线速）%b\n' \
+    "$BOLD" "$single" "$multi" "$pct" "$RESET"
+  if [[ "$state" == tuned ]]; then
+    printf '  %b→ 聚合已经跑满端口，服务端这一侧调好了。单流低于它是每连接开销%b\n' \
+      "$GREEN" "$RESET"
+    printf '  %b  （代理的加解密链路 + BBR 单流行为），改缓冲或队列都不会动它。%b\n' \
+      "$DIM" "$RESET"
+  else
+    printf '  %b→ 多线程也没跑满端口，说明瓶颈还在服务端或上游，值得继续查。%b\n' \
+      "$YELLOW" "$RESET"
+  fi
+}
+
+# A stable identity for the running layout: the kind plus the options we chose,
+# with the kernel's own bookkeeping stripped out.
+#
+# The fingerprint used the raw `tc` line, which carries a handle the kernel
+# reassigns on every `tc qdisc replace` (8006:, then 8007:, ...) and a refcnt
+# that moves on its own. Two runs of the identical configuration therefore
+# produced two different fingerprint strings, and the panel's "this is the best
+# run" comparison could never be true. An A/B is worthless if the two arms
+# cannot be recognised as the same arm twice.
+canonical_qdisc() {
+  local raw kind handle leaves
+  handle="$(mq_root_handle)"
+  if [[ -n "$handle" ]]; then
+    leaves="$(tc qdisc show dev "$IFACE" 2>/dev/null |
+      awk -v h="$handle" '$1 == "qdisc" && $4 == "parent" && index($5, h) == 1 {
+        print $2 }' | sort | uniq -c | awk '{printf "%s×%s ", $1, $2}')"
+    printf 'mq ← %s\n' "${leaves:-（没有叶子）}"
+    return 0
+  fi
+  raw="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p')" || return 1
+  [[ -n "$raw" ]] || return 1
+  kind="$(awk '{print $2}' <<< "$raw")"
+  # Only the fields we set ourselves survive. Everything else is either a
+  # kernel default that never varies with our configuration, or bookkeeping
+  # that varies without it.
+  awk -v kind="$kind" '{
+    out = kind
+    for (i = 1; i <= NF; i++) {
+      if ($i == "maxrate"    && i < NF) out = out " maxrate " $(i+1)
+      if ($i == "bandwidth"  && i < NF) out = out " " $(i+1)
+      if ($i == "rtt"        && i < NF) out = out " rtt " $(i+1)
+      if ($i == "dual-dsthost" || $i == "dual-srchost" || $i == "triple-isolate") out = out " " $i
+      if ($i == "no-split-gso") out = out " no-split-gso"
+    }
+    print out }' <<< "$raw"
 }
 
 # Print the live layout beside what was asked for, and flag any disagreement.
@@ -1319,6 +1460,13 @@ explain_cover_rtt() {
     else
       printf '  %b建议填 %s（实测 ×1.2 后向上取整，给移动客户端留波动余量）%b\n' \
         "$GREEN" "$sug" "$RESET"
+      # Recommending a value past the knee while also printing "above N it stops
+      # growing" puts two numbers on screen that argue with each other.
+      local kn; kn="$(buffer_knee_ms "$rate")" || kn=''
+      if [[ -n "$kn" ]] && (( sug > kn )); then
+        printf '  %b（本机 %s ms 以上不再增加缓冲，填 %s 和填 %s 效果相同）%b\n' \
+          "$DIM" "$kn" "$sug" "$kn" "$RESET"
+      fi
       printf '  %b注意这是一次瞬时采样。如果刚好抓到某个客户端的尖峰，这个数会偏高。%b\n' \
         "$DIM" "$RESET"
     fi
@@ -1356,8 +1504,7 @@ explain_cover_rtt() {
     # what they actually mean is that the RAM clamp is already binding. Say so
     # rather than leaving the operator to notice the numbers repeat.
     if (( ram > 0 && rate > 0 )); then
-      knee=$(( (clamp - BUF_SLACK) / (250 * rate) ))
-      if (( knee >= 10 && knee <= 2000 )); then
+      if knee="$(buffer_knee_ms "$rate")"; then
         printf '\n  %b这台机器 %s MB 内存，单 socket 上限最多长到 %s MB%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
         printf '  %b（全局 TCP 预算的 1/4；预算本身会跟着需求从内存的 1/4 长到 1/3）。%b\n' "$DIM" "$RESET"
@@ -1566,6 +1713,7 @@ render_panel() {
       printf '  %b  %s%b\n' "$DIM" "$bf" "$RESET"
     fi
   fi
+  render_verdict "${EGRESS_MBPS:-0}"
   printf '\n'
   if (( SHAPE == 1 )); then
     printf '  %b出口带宽%b   %s Mbps%b（整形到 %s%% = %s Mbps）%b\n' "$DIM" "$RESET" \
@@ -1650,6 +1798,8 @@ render_panel() {
   printf '    %b8)%b 状态与诊断（实时重传率、队列、冲突）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 预演（逐项列出 当前值 → 目标值 和理由）\n' "$BOLD" "$RESET"
   printf '    %bm)%b 记一次实测%b（跑完测速把数字填进来，和配置绑在一起）%b\n' \
+    "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '    %bs)%b 单流旋钮%b（notsent_lowat / fq 参数 / BBRv3，都还没测过）%b\n' \
     "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '    %bl)%b 队列布局%b（当前：%s%s）%b\n' "$BOLD" "$RESET" "$DIM" \
     "$QDISC_LAYOUT" \
@@ -1764,13 +1914,82 @@ panel_diagnose() {
   render_plan "${EGRESS_MBPS:-200}" "$COVER_RTT_MS"
 }
 
+# The three single-flow levers, grouped so an A/B is a couple of keypresses
+# rather than a reinstall. All three are hypotheses: the panel says so, and
+# `record` is what settles them.
+panel_single_flow() {
+  title '单流旋钮（都还没测过）'
+  printf '  %b多线程已经能跑满端口时，下面这些是单流仅剩的几个杠杆。%b\n' "$DIM" "$RESET"
+  printf '  %b每改一个就 A/B/A 测一次并 record，别一次改两个。%b\n\n' "$DIM" "$RESET"
+  printf '    %b1)%b tcp_notsent_lowat   当前 %s\n' "$BOLD" "$RESET" \
+    "$(live_value net.ipv4.tcp_notsent_lowat)"
+  printf '       %b558 Mbps 下 128KB 只有 1.8ms 的数据。单核机器上代理的调度抖动%b\n' "$DIM" "$RESET"
+  printf '       %b一旦超过这个数就会饿死网卡。131072 曾胜 16384（+18%%），再往上没测过。%b\n' "$DIM" "$RESET"
+  printf '    %b2)%b fq initial_quantum  当前 %s%b（0 = 用内核的 15140b）%b\n' "$BOLD" "$RESET" \
+    "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
+  printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \
+    "$FQ_FLOW_LIMIT" "$DIM" "$RESET"
+  printf '    %b4)%b BBRv3 怎么上（只给方法，不替你装）\n' "$BOLD" "$RESET"
+  printf '    %b0)%b 返回\n\n' "$BOLD" "$RESET"
+  local pick value
+  read -r -p '  请选择 [0]: ' pick || return 0
+  case "${pick:-0}" in
+    1) if value="$(prompt_uint 'tcp_notsent_lowat（0=不动，试 262144 / 524288）' \
+           "$NOTSENT_LOWAT" 0 16777216)"; then
+         NOTSENT_LOWAT="$value"; save_config; cmd_apply
+       else info "已取消"; fi ;;
+    2) if value="$(prompt_uint 'initial_quantum 字节（0=用内核的，试 65536）' \
+           "$FQ_INITIAL_QUANTUM" 0 1048576)"; then
+         FQ_INITIAL_QUANTUM="$value"; save_config; cmd_apply
+       else info "已取消"; fi ;;
+    3) if value="$(prompt_uint 'flow_limit 包数（0=用内核的，试 500）' \
+           "$FQ_FLOW_LIMIT" 0 100000)"; then
+         FQ_FLOW_LIMIT="$value"; save_config; cmd_apply
+       else info "已取消"; fi ;;
+    4) explain_bbr3 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Mainline has only ever carried BBRv1. v3 means a different kernel, which is a
+# reboot and a real risk on a box that is serving traffic -- so this prints the
+# path and the way back out, and does not run any of it. Installing a kernel on
+# someone's production machine is not something a tuning script should do
+# quietly, however much the operator wants the throughput.
+explain_bbr3() {
+  title 'BBRv3'
+  printf '  %b当前内核：%s%b\n' "$DIM" "$(uname -r)" "$RESET"
+  printf '  %b拥塞控制：%s%b\n\n' "$DIM" "$(live_value net.ipv4.tcp_congestion_control)" "$RESET"
+  printf '  %b主线内核只有 BBRv1，而且一直只会有 v1。XanMod 以「bbr」这个名字发 v3，%b\n' "$DIM" "$RESET"
+  printf '  %b所以看名字分不出版本，只能看内核版本串。%b\n\n' "$DIM" "$RESET"
+  printf '  %bv1 单流吃亏最重的地方：ProbeRTT 每 10 秒把 cwnd 砸到 4 个包并保持 200ms。%b\n' "$DIM" "$RESET"
+  printf '  %bv3 改成只降到一半，并且会对丢包做出反应。单流受益最明显。%b\n\n' "$DIM" "$RESET"
+  printf '  %b换内核（Debian/Ubuntu）：%b\n' "$BOLD" "$RESET"
+  printf '    curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod.gpg\n'
+  printf '    echo "deb [signed-by=/usr/share/keyrings/xanmod.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod.list\n'
+  printf '    apt update && apt install linux-xanmod-x64v2\n'
+  printf '    reboot\n\n'
+  printf '  %b回滚：%b重启时在 grub 菜单选 Advanced options 里的旧内核；%b\n' "$BOLD" "$RESET" "$DIM"
+  printf '  确认旧内核能起来之后再 apt remove 掉 xanmod。%b\n\n' "$RESET"
+  printf '  %b[!] 这台机器 520 MB 内存，/boot 也可能装不下第二个内核——先 df -h /boot。%b\n' \
+    "$YELLOW" "$RESET"
+  printf '  %b[!] 换完内核 tcpwide 的 sysctl 不会自动回来（没加 --persist 的话），%b\n' \
+    "$YELLOW" "$RESET"
+  printf '  %b    重启后要重新 sudo tcpwide apply。%b\n' "$DIM" "$RESET"
+}
+
 panel_record() {
   local mbps note
   read -r -p '  刚测到多少 Mbps（峰值，q 返回）: ' mbps || return 0
   [[ "$mbps" =~ ^[qQ]$ || -z "$mbps" ]] && { info "已取消"; return 0; }
   read -r -p '  备注（后端名字之类，可留空）: ' note || note=''
-  record_measurement "$mbps" "$note" || { warn "需要一个数字，例：629.1"; return 0; }
-  log "已记录 $mbps Mbps，和当前配置绑在一起了"
+  local threads
+  read -r -p '  几个线程（默认 1）: ' threads || threads=1
+  is_uint "${threads:-}" && (( threads > 0 )) || threads=1
+  record_measurement "$mbps" "$note" "$threads" \
+    || { warn "需要一个数字，例：629.1"; return 0; }
+  log "已记录 $mbps Mbps（${threads} 线程），和当前配置绑在一起了"
+  render_verdict "${EGRESS_MBPS:-0}"
 }
 
 # The layout is a knob rather than a decision so it can be A/B'd on the machine
@@ -1863,6 +2082,7 @@ menu() {
       8) run_action panel_diagnose ;;
       9) run_action cmd_plan ;;
       m|M) run_action panel_record ;;
+      s|S) run_action panel_single_flow ;;
       l|L) run_action panel_toggle_layout ;;
       a|A) run_action panel_reapply ;;
       p|P) run_action panel_toggle_persist ;;
@@ -2015,7 +2235,10 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   tcpwide apply --egress 500           应用（先快照，可完整还原）
   tcpwide apply --egress 500 --persist 应用并持久化（重启仍在）
   tcpwide status                       当前状态
-  tcpwide record <Mbps> [备注]         记下一次实测，和当前配置绑在一起
+  tcpwide record <Mbps> [备注] [--threads N]
+                                       记下一次实测，和当前配置绑在一起
+                                       多线程结果一定要加 --threads，它和单线程
+                                       回答的是两个不同的问题
   tcpwide revert                       完整还原到 tcpwide 介入之前
 
 参数：
@@ -2062,6 +2285,7 @@ main() {
       --buf-mb)    [[ $# -ge 2 ]] || die "--buf-mb 缺少值"; BUF_MB="$2"; shift 2 ;;
       --no-shape)  apply_profile noshape; shift ;;
       --persist)   PERSIST=1; shift ;;
+      --threads)   [[ $# -ge 2 ]] || die "--threads 缺少值"; RECORD_THREADS="$2"; shift 2 ;;
       --yes)       ASSUME_YES=1; shift ;;
       # `record` takes its reading and note as positional arguments. Everything
       # else still refuses unknown words rather than silently ignoring a typo.

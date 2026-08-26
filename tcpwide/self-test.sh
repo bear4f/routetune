@@ -1222,7 +1222,7 @@ record_measurement 881.27 '黄石' 1 163
 record_measurement 583.23 '深圳' 1 192
 record_measurement 580.54 '岳阳' 1 202
 assert_eq '4' "$(window_utilisation | wc -l)" 'only the readings carrying an RTT are analysed'
-IFS=$'\t' read -r wu_note wu_rtt _ wu_mb wu_pct <<< "$(window_utilisation | sed -n 1p)"
+IFS=$'\t' read -r wu_note _ _ _ wu_pct <<< "$(window_utilisation | sed -n 1p)"
 assert_eq '黄石' "$wu_note" 'the table leads with the backend using the most window'
 assert_eq '79' "$wu_pct" 'the fastest backend reaches 79% of the advertised window'
 # The two 黄石 points are the evidence for a fixed window: same in-flight bytes

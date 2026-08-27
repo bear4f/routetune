@@ -323,14 +323,42 @@ assert_eq "$(buffer_ceiling 500 250)" \
 # that cannot see the difference reports a configuration that is not running.
 IFACE=eth0; LINK_MBPS=500; COVER_RTT_MS=250; SHAPE=1
 tc() { printf 'qdisc mq 0: root \n'; }
-assert_eq 'mq' "$(qdisc_drift)" 'a live mq root against a cake config reports drift'
-tc() { printf 'qdisc cake 8001: root refcnt 2 bandwidth 475Mbit\n'; }
+# The reported string is now the canonical live spec rather than the bare kind:
+# "mq with no leaves" tells the operator what is wrong, "mq" only tells them
+# something is.
+assert_eq 'mq ← （没有叶子）' "$(qdisc_drift)" \
+  'a live mq root against a cake config reports drift, and says what it found'
+# The mocks below are full `tc qdisc show` lines, not abbreviations. They have
+# to be: since 0.24.0 the drift check compares the whole spec, and a mock that
+# omits the fields tc really prints would pass for the wrong reason -- which is
+# exactly how three guards missed a live `maxrate 1960Mbit` for a whole release.
+tc() { printf 'qdisc cake 8001: root refcnt 2 bandwidth 475Mbit besteffort dual-dsthost nonat nowash no-ack-filter split-gso rtt 250ms raw overhead 0\n'; }
 if qdisc_drift >/dev/null 2>&1; then fail 'a matching qdisc must not report drift'; fi
 pass 'a matching qdisc reports no drift'
+# tc prints defaults nobody asked for (buckets, quantum, orphan_mask). Those
+# must not read as drift, or the panel cries wolf on every correct apply.
 SHAPE=0
-tc() { printf 'qdisc fq 8001: root refcnt 2\n'; }
+tc() { printf 'qdisc fq 8001: root refcnt 2 limit 10240p flow_limit 2048p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms\n'; }
 if qdisc_drift >/dev/null 2>&1; then fail 'fq matches the no-shape target'; fi
-pass 'fq matches the no-shape target'
+pass "fq matches the no-shape target, and tc's own defaults are not drift"
+
+# ── 0.24.0 队列漂移必须看见残留的 maxrate ──────────────────────────────────
+# The bug this release exists for. `tc qdisc replace` over a same-kind qdisc
+# only CHANGES the parameters it was given, so 0.23.0's `replace ... root fq
+# limit 10240 flow_limit 2048` left the previous release's per-flow cap running.
+# Both read-back guards compared only the qdisc kind -- fq against fq -- so the
+# panel printed 队列与配置一致 while a 1960 Mbit cap sat on the interface.
+tc() { printf 'qdisc fq 8006: root refcnt 2 limit 10240p flow_limit 2048p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b maxrate 1960Mbit low_rate_threshold 550Kbit\n'; }
+drift="$(qdisc_drift)" || fail 'a stale per-flow cap must be reported as drift'
+[[ "$drift" == *maxrate* ]] || fail "the drift report must name what it found: [$drift]"
+pass 'a rate ceiling the target never asked for is drift'
+# And the read-back at apply time has to say the same thing.
+live_qdisc_layout() { printf 'fq 8006: root refcnt 2 limit 10240p flow_limit 2048p maxrate 1960Mbit\n'; }
+out="$(report_live_qdisc 'fq limit 10240 flow_limit 2048' 2>&1)"
+[[ "$out" == *"回读与目标不符"* ]] \
+  || fail 'the read-back must not accept a queue carrying a cap it did not ask for'
+pass 'the apply-time read-back compares the whole spec, not just the kind'
+unset -f live_qdisc_layout
 SHAPE=1
 unset -f tc
 
@@ -935,7 +963,7 @@ pass 'mq with fq leaves does not read as drift'
 # Shaping is the one case that still has to take the root: CAKE can only shape
 # what it can all see. An mq root there is real drift.
 SHAPE=1
-assert_eq 'mq' "$(qdisc_drift)" 'under shaping an mq root really is drift'
+assert_eq 'mq ← 2×fq ' "$(qdisc_drift)" 'under shaping an mq root really is drift'
 SHAPE=0
 
 # ── 0.11.0 半套 pacing 比没有 pacing 更糟 ──────────────────────────────────
@@ -952,7 +980,8 @@ pass 'a partially paced mq root does not count as carrying the pacer'
 QDISC_LAYOUT=mq-leaves
 # qdisc_drift reaches target_qdisc, which now sizes the fq queue limits from RAM.
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
-assert_eq 'mq' "$(qdisc_drift)" 'a half-paced mq root reads as drift'
+assert_eq 'mq ← 1×fq 1×fq_codel ' "$(qdisc_drift)" \
+  'a half-paced mq root reads as drift, naming which leaves are wrong'
 unset -f tc
 
 # All or nothing: a leaf that refuses the spec rolls back the ones already
@@ -999,7 +1028,9 @@ ip() { printf 'default via 10.0.0.1 dev eth0\n'; }
 has() { [[ "$1" == tc || "$1" == ip ]]; }
 QDISC_SNAP="$(mktemp -d)/qdisc"; ROUTE_SNAP="$(mktemp -d)/route"
 apply_link 1000 250 >/dev/null 2>&1 || true
-grep -q 'qdisc replace dev eth0 root fq' "$root_log" \
+grep -q 'qdisc del dev eth0 root' "$root_log" \
+  || fail 'a queue that is not the target must be deleted first, not merged into'
+grep -q 'qdisc add dev eth0 root fq' "$root_log" \
   || fail 'the default layout must take the root even when mq is there'
 if grep -q 'parent 8001:' "$root_log"; then fail 'the default layout must not touch mq leaves'; fi
 pass 'the default layout is root fq even on an mq-rooted interface'
@@ -1941,10 +1972,30 @@ out="$(render_conn_evidence 1.2.3.4:443 32.1 1448 180 12 0 2600000 70.1 61.2 41.
 [[ "$out" == *"指向对端接收窗口"* ]] || fail 'rwnd_limited above the threshold is a peer ceiling'
 [[ "$out" == *"本机怎么调都拿不回来"* ]] || fail 'and must be named as external'
 pass 'a peer ceiling is named as one, on the field that establishes it'
-# Nothing pinned means nothing is claimed.
+# In-flight well below BOTH windows with no retransmission rules two candidates
+# out, and that is a finding rather than an absence of one -- it is most of the
+# search space, and it is what the live Shanghai connection actually showed
+# (31% of cwnd, 20% of the peer window, zero retransmission).
 out="$(render_conn_evidence 1.2.3.4:443 100 1448 8000 2000 16777216 14480 2000 400 0.0 0.0 0 131072 8388608 1048576 2>&1)"
-[[ "$out" == *"没有明显的本机侧天花板"* ]] || fail 'an unconstrained connection must claim nothing'
-pass 'a connection with no ceiling in evidence gets no verdict'
+[[ "$out" == *"两个窗口都没用满"* ]] || fail 'unused windows must be stated, not passed over'
+[[ "$out" == *"往发送侧看"* ]] || fail 'and must point at what is left'
+pass 'ruling out the peer window and congestion control is reported as evidence'
+
+# But with retransmission present the same ratios mean something else, so that
+# claim must not be made.
+out="$(render_conn_evidence 1.2.3.4:443 100 1448 8000 5600 16777216 14480 2000 400 0.0 0.0 40 131072 8388608 1048576 2>&1)"
+[[ "$out" != *"两个窗口都没用满"* ]] || fail 'loss on the path is not an idle sender'
+pass 'the ruled-out verdict requires the zero-retransmission it rests on'
+
+# A ratio over 110% is not a finding, it is two numbers that do not belong in
+# the same fraction. The idle Apple socket produced "实测已是 pacing_rate 的
+# 1205%" from a stale delivery_rate over a live pacing_rate.
+out="$(render_conn_evidence 17.253.83.132:443 151.7 128 1 1 0 0 4.4 53.0 0.0 0.0 8 1048576 1048576 0 2>&1)"
+[[ "$out" != *1205* ]] || fail 'a nonsense ratio must never be printed'
+[[ "$out" != *"pacing_rate 的"* ]] || fail 'a ratio past the ceiling must be refused outright'
+pass 'ratios past 110% are refused rather than reported'
+assert_eq '' "$(pct_or_nothing 100 0 || printf '')" 'a zero denominator yields nothing'
+assert_eq '50' "$(pct_or_nothing 50 100)" 'and an ordinary ratio still comes through'
 
 
 # ── 0.23.0 幂等 ────────────────────────────────────────────────────────────
@@ -1986,3 +2037,157 @@ pass 'sysctl application converges in one step and stays converged'
 assert_eq "$(target_qdisc 2000 180)" "$(target_qdisc 2000 180)" \
   'the queue spec is deterministic'
 unset -f live_value
+
+
+# ── 0.24.0 起步值必须从快照读，不能从活跃值读 ──────────────────────────────
+# 0.23.0 fixed the ratchet in safe_value and welded it back on in start_size:
+# BUF_DEFAULT=0 meant "keep the kernel's starting size", implemented as "read
+# the live middle field". On a machine where tcpwide had already written 1 MB,
+# the live value IS that 1 MB, so it preserved its own past mistake forever.
+# The user's box came back from the 0.23.0 upgrade still on 4096 1048576 ...
+restore_lib
+SYSCTL_SNAP="$(mktemp)"
+printf 'net.ipv4.tcp_rmem\t4096 131072 6291456\nnet.ipv4.tcp_wmem\t4096 16384 4194304\n' \
+  > "$SYSCTL_SNAP"
+live_value() { printf '4096 1048576 90995370\n'; }
+BUF_DEFAULT=0
+assert_eq '131072' "$(start_size net.ipv4.tcp_rmem)" \
+  'the starting size comes from before tcpwide ran, not from what tcpwide wrote'
+assert_eq '16384' "$(start_size net.ipv4.tcp_wmem)" 'same on the send side'
+# No snapshot at all: a machine tcpwide has never applied to.
+rm -f "$SYSCTL_SNAP"; SYSCTL_SNAP="/nonexistent/snapshot"
+assert_eq '131072' "$(start_size net.ipv4.tcp_rmem)" 'no snapshot falls back to the kernel default'
+assert_eq '16384' "$(start_size net.ipv4.tcp_wmem)" 'and on the send side'
+BUF_DEFAULT=262144
+assert_eq '262144' "$(start_size net.ipv4.tcp_wmem)" 'an explicit choice still wins'
+BUF_DEFAULT=0
+unset -f live_value
+
+
+# ── 0.24.0 撤回一个键必须还原它 ────────────────────────────────────────────
+# apply_sysctl only writes the keys it emits, so dropping a key from
+# target_sysctl does not unset it -- it freezes it. 0.23.0 withdrew tcp_frto and
+# tcp_no_metrics_save and neither moved on the machine it was withdrawn for:
+# they were still 0 and 1 after the upgrade.
+restore_lib
+SYSCTL_SNAP="$(mktemp)"
+printf 'net.ipv4.tcp_frto\t2\nnet.ipv4.tcp_no_metrics_save\t0\n' > "$SYSCTL_SNAP"
+live_value() {
+  case "$1" in
+    net.ipv4.tcp_frto) printf '0\n' ;;
+    net.ipv4.tcp_no_metrics_save) printf '1\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+sysctl_log="$(mktemp)"
+sysctl() { [[ "$1" == -qw ]] && printf '%s\n' "$2" >> "$sysctl_log"; return 0; }
+assert_eq '2' "$(restore_retired_sysctl 2>/dev/null)" 'both withdrawn keys are put back'
+grep -qx 'net.ipv4.tcp_frto=2' "$sysctl_log" || fail 'tcp_frto must be restored from the snapshot'
+grep -qx 'net.ipv4.tcp_no_metrics_save=0' "$sysctl_log" \
+  || fail 'tcp_no_metrics_save must be restored from the snapshot'
+pass 'a withdrawn key is restored, not merely left alone'
+# Already correct: nothing to do, and it must not churn.
+: > "$sysctl_log"
+live_value() { case "$1" in net.ipv4.tcp_frto) printf '2\n' ;; *) printf '0\n' ;; esac; }
+assert_eq '0' "$(restore_retired_sysctl 2>/dev/null)" 'a key already at its target is left alone'
+# No snapshot: fall back to the documented kernel default rather than guessing.
+rm -f "$SYSCTL_SNAP"; SYSCTL_SNAP="/nonexistent/snapshot"
+: > "$sysctl_log"
+live_value() { case "$1" in net.ipv4.tcp_frto) printf '0\n' ;; *) printf '1\n' ;; esac; }
+restore_retired_sysctl >/dev/null 2>&1
+grep -qx 'net.ipv4.tcp_frto=2' "$sysctl_log" || fail 'without a snapshot the kernel default is used'
+pass 'the kernel default is the fallback when there is no snapshot'
+rm -f "$sysctl_log"
+unset -f live_value sysctl
+
+# A key cannot be both retired and current, or apply would fight itself.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+tgt="$(target_sysctl 1000 190)"
+for entry in "${RETIRED_SYSCTL[@]}"; do
+  IFS=$'\t' read -r rk _ <<< "$(printf '%b' "$entry")"
+  awk -F'\t' -v k="$rk" '$1 == k {exit 1}' <<< "$tgt" \
+    || fail "$rk is both retired and still emitted by target_sysctl"
+done
+pass 'no key is both withdrawn and still written'
+
+
+# ── 0.24.0 apply 必须自证 ──────────────────────────────────────────────────
+# Five bugs reached a live machine together in 0.23.0 and apply reported success
+# for all five, because it checked tc's exit code and the qdisc kind and nothing
+# else. A tool that changes system state has to be able to answer "did that
+# work" -- and any one of those bugs would have printed itself here.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+cpu_count() { printf '1\n'; }
+IFACE=eth0; LINK_MBPS=2000; COVER_RTT_MS=180; SHAPE=0; PROFILE=noshape
+BUF_DEFAULT=0; QDISC_LAYOUT=root; FLOW_MAXRATE_MBPS=0; NOTSENT_LOWAT=131072
+SYSCTL_SNAP="$(mktemp)"
+printf 'net.ipv4.tcp_rmem\t4096 131072 6291456\nnet.ipv4.tcp_wmem\t4096 16384 4194304\nnet.ipv4.tcp_frto\t2\nnet.ipv4.tcp_no_metrics_save\t0\n' > "$SYSCTL_SNAP"
+# The machine exactly as the user reported it after upgrading to 0.23.0.
+live_value() {
+  case "$1" in
+    net.ipv4.tcp_rmem|net.ipv4.tcp_wmem) printf '4096 1048576 90995370\n' ;;
+    net.ipv4.tcp_frto) printf '0\n' ;;
+    net.ipv4.tcp_no_metrics_save) printf '1\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+tc() { printf 'qdisc fq 8006: root refcnt 2 limit 10240p flow_limit 2048p buckets 1024 quantum 3028b initial_quantum 15140b maxrate 1960Mbit\n'; }
+out="$(verify_applied 2000 180 2>&1)" && fail 'verify must fail on a machine that did not take the change'
+[[ "$out" == *"应用后仍与目标不符"* ]] || fail 'and must say so'
+[[ "$out" == *"net.ipv4.tcp_wmem"* ]] || fail 'the frozen starting size must be listed'
+[[ "$out" == *"net.ipv4.tcp_frto"* ]] || fail 'the withdrawn key must be listed'
+[[ "$out" == *maxrate* ]] || fail 'the stale per-flow cap must be listed'
+pass 'apply catches every one of the 0.23.0 failures instead of reporting success'
+
+# And a machine that DID take the change says so plainly.
+live_value() { awk -F'\t' -v k="$1" '$1 == k {print $2; f = 1} END {if (!f) print ""}' <<< "$FAKE_LIVE"; }
+FAKE_LIVE="$(target_sysctl 2000 180 | awk -F'\t' '{printf "%s\t%s\n", $1, $2}')
+net.ipv4.tcp_frto	2
+net.ipv4.tcp_no_metrics_save	0"
+tc() { printf 'qdisc fq 8006: root refcnt 2 limit 10240p flow_limit 2048p buckets 1024 quantum 3028b initial_quantum 15140b\n'; }
+out="$(verify_applied 2000 180 2>&1)" || fail 'a correctly applied machine must verify clean'
+[[ "$out" == *"回读一致"* ]] || fail 'and must say so'
+pass 'a machine that did take the change verifies clean'
+unset -f live_value tc
+
+
+# ── 0.24.0 诊断只看真的在搬数据的连接 ──────────────────────────────────────
+# delivery_rate is the kernel's max-filtered estimate, not the current rate: an
+# Apple push socket idle for minutes still reported 53 Mbps and sailed through
+# the 50 Mbps floor. Bytes moved across the window is a measurement.
+restore_lib
+DIAG_DIR="$(mktemp -d)"
+{
+  printf 'ESTAB 0 0 10.0.0.5:41234 17.253.83.132:443\n'
+  printf '\t bbr rtt:151.7/4 mss:128 cwnd:1 unacked:1 bytes_sent:1000 bytes_received:71500000 delivery_rate 53Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:443 58.38.51.162:61324\n'
+  printf '\t bbr rtt:128/4 mss:1448 cwnd:4872 unacked:1508 bytes_sent:16000000 bytes_received:1000 delivery_rate 149.7Mbps\n'
+} > "$DIAG_DIR/ss.a"
+{
+  printf 'ESTAB 0 0 10.0.0.5:41234 17.253.83.132:443\n'
+  printf '\t bbr rtt:151.7/4 mss:128 cwnd:1 unacked:1 bytes_sent:1000 bytes_received:71500000 delivery_rate 53Mbps\n'
+  printf 'ESTAB 0 0 10.0.0.5:443 58.38.51.162:61324\n'
+  printf '\t bbr rtt:128/4 mss:1448 cwnd:4872 unacked:1508 snd_wnd:10700000 bytes_sent:166000000 bytes_received:1000 delivery_rate 149.7Mbps\n'
+} > "$DIAG_DIR/ss.b"
+DIAG_SECS=8
+moved="$(ss_throughput)"
+# Apple moved zero bytes across the window and must not appear at all.
+[[ "$moved" != *17.253.83.132* ]] || fail 'a connection that moved nothing must not be a sample'
+[[ "$moved" == *58.38.51.162* ]] || fail 'the connection that did move data must be'
+assert_eq '150.0' "$(awk -F'\t' '/58.38.51.162/ {print $3}' <<< "$moved")" \
+  'throughput is measured from the byte delta, not read off delivery_rate'
+pass 'the sample is chosen by bytes actually moved'
+# End to end: the idle socket must not reach the evidence block.
+ss() { [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }; }
+has() { [[ "$1" == ss ]]; }
+out="$(render_connections 2>&1)"
+[[ "$out" != *17.253.83.132* ]] || fail 'an idle socket must be filtered before the verdicts'
+[[ "$out" == *58.38.51.162* ]] || fail 'and the real transfer must survive the filter'
+[[ "$out" == *"入站：对方连进来"* ]] || fail 'the leg is still identified by the listen port'
+pass 'only connections that moved data reach the evidence block'
+unset -f ss has
+rm -rf "$DIAG_DIR"; DIAG_DIR=""

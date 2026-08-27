@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.23.0"
+VERSION="0.24.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -119,6 +119,21 @@ BDP_MULTIPLIER=2
 # invented by the script, on a machine whose operator had configured nothing.
 # Nothing derived from this number may ever reach a qdisc rate.
 UNKNOWN_LINK_MBPS=200
+
+# Keys tcpwide used to set and has since withdrawn, with the kernel's default as
+# a fallback.
+#
+# Dropping a key from target_sysctl does NOT unset it: apply_sysctl only writes
+# the keys it emits, so a machine that once got tcp_frto=0 keeps tcp_frto=0
+# forever, through every future upgrade. 0.23.0 withdrew two keys and neither
+# moved on the box it was withdrawn for.
+#
+# Anything withdrawn from target_sysctl in future has to be added here, or the
+# withdrawal only happens in the source code.
+RETIRED_SYSCTL=(
+  'net.ipv4.tcp_frto\t2'
+  'net.ipv4.tcp_no_metrics_save\t0'
+)
 
 # The starting size for a socket's buffers -- the middle field of
 # tcp_rmem/tcp_wmem -- which autotuning grows from. It decides how long the ramp
@@ -433,20 +448,36 @@ live_flow_maxrate_mbit() {
     }'
 }
 
+# The value a key had BEFORE tcpwide ever ran, from the first-apply snapshot.
+# This is the only honest answer to "what was the kernel using": the live value
+# may well be something tcpwide itself wrote.
+snapshot_value() {
+  local key="${1:-}"
+  [[ -r "$SYSCTL_SNAP" ]] || return 1
+  awk -F'\t' -v k="$key" '$1 == k && $2 != "" { print $2; found = 1; exit }
+    END { if (!found) exit 1 }' "$SYSCTL_SNAP"
+}
+
 # The starting size to request for a tcp_[rw]mem tuple. BUF_DEFAULT=0 means
-# "keep what the kernel is using", so read the live middle field back rather
-# than inventing a number -- with the field marked `exact`, inventing one would
-# overwrite the kernel's choice on every apply.
+# "put back what the kernel was using".
+#
+# 0.23.0 read the LIVE middle field for that, which is wrong in the one case
+# that matters: on a machine where tcpwide had already written 1 MB, the live
+# value IS that 1 MB, so it got faithfully preserved forever. The ratchet was
+# taken out of safe_value and welded back on here. The snapshot is the value
+# from before tcpwide touched the machine, which is what "the kernel's own" has
+# to mean.
 start_size() {
-  local key="${1:-}" live mid
+  local key="${1:-}" snap mid
   if is_uint "${BUF_DEFAULT:-}" && (( BUF_DEFAULT > 0 )); then
     printf '%s\n' "$BUF_DEFAULT"; return 0
   fi
-  live="$(live_value "$key" || true)"
-  IFS=' ' read -r _ mid _ <<< "${live:-}"
-  if is_uint "${mid:-}" && (( mid > 0 )); then printf '%s\n' "$mid"; return 0; fi
-  # No live value to preserve (a kernel without the key, or an unreadable
-  # sysctl). Fall back to the kernel's own documented starting sizes.
+  if snap="$(snapshot_value "$key")"; then
+    IFS=' ' read -r _ mid _ <<< "$snap"
+    if is_uint "${mid:-}" && (( mid > 0 )); then printf '%s\n' "$mid"; return 0; fi
+  fi
+  # No snapshot (tcpwide has never applied here, or the file is gone). The
+  # kernel's own documented starting sizes.
   case "$key" in
     *rmem) printf '131072\n' ;;
     *)     printf '16384\n' ;;
@@ -935,19 +966,30 @@ mq_leaves_with() {
   printf '%s\n' "$n"
 }
 
+# Reports the live queue when it is not the configured one.
+#
+# This used to compare only the qdisc KIND, with a comment explaining that tc
+# prints defaults nobody asked for so a full string match would cry wolf. That
+# is true of EXTRA fields and false of fields we used to set and no longer do:
+# against `fq maxrate 1960Mbit` the target `fq ...` is also "fq", so the panel
+# printed 队列与配置一致 while a 1960 Mbit per-flow cap sat on the interface.
+# qdisc_is_target compares the fields we control, units normalised, and treats a
+# rate ceiling the target does not ask for as the drift it is.
 qdisc_drift() {
-  local want live
-  want="$(target_qdisc "$(sizing_mbps)" "$COVER_RTT_MS" | awk '{print $1}')"
-  live="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p' | awk '{print $2}')"
+  local want live kind
+  want="$(target_qdisc "$(sizing_mbps)" "$COVER_RTT_MS")"
+  live="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p')"
   [[ -n "$live" ]] || return 1
+  kind="$(awk '{print $2}' <<< "$live")"
   # An mq root carrying the pacer on its leaves is the intended layout, not
   # drift. Reporting it as drift would send the operator to press "apply" over
   # and over on a configuration that is already correct.
-  if [[ "$live" == mq ]] && (( SHAPE == 0 )) && mq_leaves_with "$want" >/dev/null; then
+  if [[ "$kind" == mq ]] && (( SHAPE == 0 )) \
+     && mq_leaves_with "$(awk '{print $1}' <<< "$want")" >/dev/null; then
     return 1
   fi
-  [[ "$live" != "$want" ]] || return 1
-  printf '%s\n' "$live"
+  qdisc_is_target "$want" && return 1
+  canonical_qdisc 2>/dev/null || printf '%s\n' "$kind"
 }
 
 # Fewer segments than this in the window and the ratio is noise: at 20 segments
@@ -1143,6 +1185,26 @@ cmd_plan() {
 # Writes SYSCTL_WROTE rather than echoing a count, because the caller used to
 # capture stdout to read that count — which swallowed every progress line with
 # it, so an apply looked like it had touched nothing.
+# Puts back every key tcpwide has withdrawn, preferring the value the machine
+# had before tcpwide ran and falling back to the kernel default. Prints how many
+# it wrote so the caller can count them.
+restore_retired_sysctl() {
+  local entry k def want now n=0
+  for entry in "${RETIRED_SYSCTL[@]}"; do
+    IFS=$'\t' read -r k def <<< "$(printf '%b' "$entry")"
+    now="$(live_value "$k" || true)"
+    [[ -n "$now" ]] || continue
+    want="$(snapshot_value "$k" || printf '%s' "$def")"
+    [[ "$now" == "$want" ]] && continue
+    if sysctl -qw "$k=$want" 2>/dev/null; then
+      n=$(( n + 1 ))
+      printf '  %b[还原]%b %s = %s%b（这一项已不再由 tcpwide 设置）%b\n' \
+        "$GREEN" "$RESET" "$k" "$want" "$DIM" "$RESET" >&2
+    fi
+  done
+  printf '%s\n' "$n"
+}
+
 SYSCTL_WROTE=0
 apply_sysctl() {
   local rate="$1" rtt="$2" k v dir now n=0
@@ -1159,6 +1221,7 @@ apply_sysctl() {
       printf '  %b[跳过]%b %s —— 这个内核不接受该键\n' "$YELLOW" "$RESET" "$k"
     fi
   done < <(target_sysctl "$rate" "$rtt")
+  n=$(( n + $(restore_retired_sysctl) ))
   # Snapshot only on the first apply: revert must return the machine to what it
   # was before tcpwide ever ran, not to what the previous apply left behind.
   if [[ -e "$SYSCTL_SNAP" ]]; then rm -f "$SYSCTL_SNAP.tmp"
@@ -1366,10 +1429,15 @@ diag_sample() {
   if [[ -r /proc/stat ]]; then awk '/^cpu[0-9]+ /' /proc/stat > "$DIAG_DIR/cpu.a"; fi
   if has tc; then tc -s -d qdisc show dev "$IFACE" > "$DIAG_DIR/qdisc.a" 2>/dev/null || true; fi
   nic_counters > "$DIAG_DIR/nic.a" 2>/dev/null || true
+  # Two dumps, one at each end of the window, because `delivery_rate` is the
+  # kernel's max-filtered ESTIMATE and not the current rate: a connection that
+  # went idle minutes ago keeps reporting whatever it last managed. An Apple
+  # push socket with cwnd 1 and mss 128 came through the 50 Mbps floor claiming
+  # 53 Mbps. Bytes moved across the window is a measurement and cannot do that.
+  if has ss; then ss -tinm > "$DIAG_DIR/ss.a" 2>/dev/null || true; fi
   sleep "$half"
-  # The midpoint dump. -tinm gives the TCP info block and skmem in one pass.
-  if has ss; then ss -tinm > "$DIAG_DIR/ss.mid" 2>/dev/null || true; fi
   sleep "$half"
+  if has ss; then ss -tinm > "$DIAG_DIR/ss.b" 2>/dev/null || true; fi
   if has nstat; then nstat -asz > "$DIAG_DIR/nstat.b" 2>/dev/null || true; fi
   if [[ -r /proc/stat ]]; then awk '/^cpu[0-9]+ /' /proc/stat > "$DIAG_DIR/cpu.b"; fi
   if has tc; then tc -s -d qdisc show dev "$IFACE" > "$DIAG_DIR/qdisc.b" 2>/dev/null || true; fi
@@ -1387,9 +1455,51 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # Rates are Mbps, sizes bytes, limits percent. Missing fields are 0, never
 # blank -- an empty field collapses under `IFS=$'\t' read` and shifts every
 # column after it, which has produced a wrong panel line twice in this file.
+# Throughput actually observed over the window: bytes moved between the two ss
+# dumps, divided by the elapsed seconds, per connection. Emits
+# `local<TAB>peer<TAB>mbps`.
+#
+# This replaces delivery_rate as the "is this connection doing anything" test.
+# delivery_rate answers "what is the best this connection ever managed", which
+# an idle socket answers just as loudly as a saturated one.
+# shellcheck disable=SC2120 # the file arguments are optional by design
+ss_throughput() {
+  local a="${1:-$DIAG_DIR/ss.a}" b="${2:-$DIAG_DIR/ss.b}" secs="${3:-$DIAG_SECS}"
+  [[ -r "$a" && -r "$b" ]] || return 1
+  awk -v secs="$secs" '
+    function flush(   tot) {
+      if (peer == "") return
+      tot = sent + recv
+      # `cur`, not FILENAME: the last connection in the first file is flushed
+      # only when the first record of the SECOND file arrives, by which time
+      # FILENAME has already moved on -- so it would be recorded as a delta
+      # against a baseline that was never taken.
+      if (cur == first) { base[lcl "\t" peer] = tot }
+      else {
+        k = lcl "\t" peer
+        if (k in base) {
+          d = tot - base[k]
+          if (d > 0) printf "%s\t%.1f\n", k, d * 8 / secs / 1000000
+        }
+      }
+      peer = ""
+    }
+    function num(tok,   p) { p = index(tok, ":"); return substr(tok, p + 1) + 0 }
+    BEGIN { first = ARGV[1] }
+    $1 == "ESTAB" && NF >= 5 {
+      flush(); cur = FILENAME; lcl = $4; peer = $5; sent = 0; recv = 0; next }
+    peer != "" {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^bytes_sent:/)     sent = num($i)
+        if ($i ~ /^bytes_received:/) recv = num($i)
+      }
+    }
+    END { flush() }' "$a" "$b"
+}
+
 # shellcheck disable=SC2120 # the source file argument is optional by design
 ss_metrics() {
-  local src="${1:-$DIAG_DIR/ss.mid}"
+  local src="${1:-$DIAG_DIR/ss.b}"
   [[ -r "$src" ]] || return 1
   awk '
     function tomb(v,   n) {
@@ -1466,6 +1576,22 @@ ss_metrics() {
 # The old panel asserted the first of these from a buffer ratio alone and got it
 # wrong twice, which is how "买内存更大的机器" ended up in a report. Nothing here
 # is asserted without the field that establishes it.
+# A percentage, or nothing at all when the fraction is not one a reader should
+# act on: a zero denominator, or a result past 110%.
+#
+# Over 110% means the numerator and denominator are not measuring the same
+# thing. That has happened twice in this file -- send-side in-flight divided by
+# a receive buffer gave 12965%, and a stale delivery_rate over a live
+# pacing_rate gave 1205% -- and both times the number was printed as a finding.
+PCT_CEILING=110
+pct_or_nothing() {
+  local num="${1:-0}" den="${2:-0}" p
+  awk -v d="$den" 'BEGIN {exit !(d > 0)}' || return 1
+  p="$(awk -v n="$num" -v d="$den" 'BEGIN {printf "%.0f", n * 100 / d}')"
+  (( p > PCT_CEILING )) && return 1
+  printf '%s\n' "$p"
+}
+
 render_conn_evidence() {
   local peer="$1" rtt="$2" mss="$3" cwnd="$4" unacked="$5" snd_wnd="$6" \
         rcv_space="$7" pacing="$8" delivery="$9" rwndlim="${10}" sndlim="${11}" \
@@ -1488,34 +1614,54 @@ render_conn_evidence() {
     "$(mb "$rcvbuf")" "$(mb "$sndbuf")" "$(mb "$rcv_space")"
 
   # Evidence, ranked by how directly the field settles the question.
+  #
+  # Every ratio below goes through pct_or_nothing. A ratio over 110% is not a
+  # finding, it is a sign the two numbers do not belong in the same fraction --
+  # the diagnostic printed "实测已是 pacing_rate 的 1205%" on an idle socket
+  # whose delivery_rate was a stale estimate. render_window_ratio has had this
+  # guard since 0.19.0; this block was written without it.
   local said=0
+  local r
   if awk -v l="$rwndlim" 'BEGIN {exit !(l >= 15)}'; then
     printf '    %b→ 指向对端接收窗口%b：内核自己记的 rwnd_limited 占了 %s%% 的发送时间。\n' \
       "$YELLOW" "$RESET" "$rwndlim"
     printf '      %b本机怎么调都拿不回来——那是对端的 rmem。%b\n' "$DIM" "$RESET"
     said=1
-  elif (( snd_wnd > 0 )) && awk -v f="$inflight" -v w="$snd_wnd" 'BEGIN {exit !(w > 0 && f * 100 / w >= 90)}'; then
+  elif r="$(pct_or_nothing "$inflight" "$snd_wnd")" && (( r >= 90 )); then
     printf '    %b→ 指向对端接收窗口%b：在途已是 snd_wnd 的 %s%%，压在它上面。\n' \
-      "$YELLOW" "$RESET" "$(awk -v f="$inflight" -v w="$snd_wnd" 'BEGIN {printf "%.0f", f * 100 / w}')"
+      "$YELLOW" "$RESET" "$r"
     said=1
   fi
-  if (( said == 0 )) && (( cwndbytes > 0 )) \
-     && awk -v f="$inflight" -v c="$cwndbytes" 'BEGIN {exit !(f * 100 / c >= 85)}'; then
+  if (( said == 0 )) && r="$(pct_or_nothing "$inflight" "$cwndbytes")" && (( r >= 85 )); then
     printf '    %b→ 指向拥塞窗口/路径丢包%b：在途已是 cwnd×mss 的 %s%%，\n' \
-      "$YELLOW" "$RESET" "$(awk -v f="$inflight" -v c="$cwndbytes" 'BEGIN {printf "%.0f", f * 100 / c}')"
+      "$YELLOW" "$RESET" "$r"
     printf '      %b而 rwnd_limited 只有 %s%%——限制在拥塞控制这边，不在对端窗口。%b\n' \
       "$DIM" "$rwndlim" "$RESET"
     said=1
   fi
-  if awk -v d="$delivery" -v p="$pacing" 'BEGIN {exit !(p > 0 && d * 100 / p >= 90)}'; then
+  if r="$(pct_or_nothing "$delivery" "$pacing")" && (( r >= 90 )); then
     printf '    %b→ 指向 pacing/qdisc%b：实测已是 pacing_rate 的 %s%%。\n' \
-      "$YELLOW" "$RESET" "$(awk -v d="$delivery" -v p="$pacing" 'BEGIN {printf "%.0f", d * 100 / p}')"
+      "$YELLOW" "$RESET" "$r"
     printf '      %b确认一下根队列上有没有 maxrate（s) 里的单流上限）。%b\n' "$DIM" "$RESET"
     said=1
   fi
   if awk -v l="$sndlim" 'BEGIN {exit !(l >= 15)}'; then
     printf '    %b→ 发送缓冲受限 %s%%%b：wmem 不够，或者应用写得比内核发得快。\n' \
       "$YELLOW" "$sndlim" "$RESET"
+    said=1
+  fi
+  # Ruling two candidates OUT is a finding, not an absence of one. In-flight
+  # well below both windows with no retransmission says the limit is neither the
+  # peer's window nor congestion control -- which is most of the search space,
+  # and worth stating rather than leaving the reader to notice.
+  local cpct wpct
+  cpct="$(pct_or_nothing "$inflight" "$cwndbytes" || printf '')"
+  wpct="$(pct_or_nothing "$inflight" "$snd_wnd" || printf '')"
+  if [[ -n "$cpct" && -n "$wpct" ]] && (( cpct < 60 && wpct < 60 && retr == 0 )); then
+    printf '    %b→ 两个窗口都没用满%b：在途只占拥塞窗口 %s%%、对端窗口 %s%%，且零重传。\n' \
+      "$BOLD" "$RESET" "$cpct" "$wpct"
+    printf '      %b所以限制既不在对端窗口也不在拥塞控制——往发送侧看（sndbuf、%b\n' "$DIM" "$RESET"
+    printf '      %bnotsent_lowat、应用喂数据的速度）。%b\n' "$DIM" "$RESET"
     said=1
   fi
   (( said == 0 )) && printf '    %b→ 这条连接没有明显的本机侧天花板。%b\n' "$GREEN" "$RESET"
@@ -2003,9 +2149,6 @@ report_live_qdisc() {
   local want="${1:-}" live
   live="$(live_qdisc_layout)" || { warn "无法回读队列，手动检查 tc qdisc show dev $IFACE"; return 0; }
   printf '  %b实际生效：%s%b\n' "$DIM" "$live" "$RESET"
-  # Only the kind is compared: tc prints its own defaults (limit, flow_limit,
-  # quantum) that were never asked for, so a full string match would cry wolf
-  # on every correct application.
   local want_kind live_kind
   want_kind="$(awk '{print $1}' <<< "$want")"
   live_kind="$(awk '{print $1}' <<< "$live")"
@@ -2014,8 +2157,107 @@ report_live_qdisc() {
     warn "mq 的叶子没有全部挂上 $want_kind —— 没挂上的那些队列完全没有 pacing"
     return 0
   fi
-  [[ "$live_kind" == "$want_kind" ]] && return 0
-  warn "回读到的是 $live_kind，不是 $want_kind —— 写入被接受了但没有生效"
+  # Compares the whole spec, not just the kind. `tc qdisc replace` over a
+  # same-kind queue only CHANGES the parameters it was given, so a command that
+  # returned success can leave the interface carrying settings from a previous
+  # release -- which is precisely what a read-back exists to catch, and what a
+  # kind-only comparison could not see.
+  qdisc_is_target "$want" && return 0
+  warn "回读与目标不符 —— 写入被接受了但没有完全生效"
+  printf '  %b目标：%s%b\n' "$DIM" "$want" "$RESET"
+}
+
+# Installs a root qdisc spec so that the result is the spec -- nothing more.
+#
+# `tc qdisc replace` sounds like it replaces. It does not: tc(8) says that when
+# a qdisc of the SAME KIND is already there, replace "changes its parameters",
+# and sch_fq's change handler only touches the attributes present in the netlink
+# message. So `replace ... root fq limit 10240 flow_limit 2048` over a running
+# `fq maxrate 1960Mbit` returns success and leaves the 1960 Mbit per-flow cap
+# exactly where it was.
+#
+# That is how 0.23.0 shipped a release whose entire point was removing that cap,
+# and removed nothing: the command succeeded, the read-back compared only the
+# qdisc KIND, and the drift check compared only the kind too. Three guards, one
+# blind spot, because "we no longer pass maxrate" is not the same statement as
+# "maxrate is no longer set".
+#
+# Deleting first is the only way to get a clean slate. There is a brief moment
+# with the kernel default queue, which is the real cost of actually changing the
+# configuration -- and it is only paid when the live spec differs from the
+# target, so a no-op apply stays a no-op.
+# The fields of a qdisc spec that we control, as sorted `key=value` lines with
+# units normalised away. Works on both a spec we generated (`fq limit 10240
+# flow_limit 2048`) and a line from `tc qdisc show` (`qdisc fq 8006: root refcnt
+# 2 limit 10240p flow_limit 2048p ... maxrate 1960Mbit ...`), so the two can be
+# compared at all -- tc writes `10240p` where we write `10240`, prints `1900Mbit`
+# where we asked for `1900000kbit`, and orders the fields its own way.
+#
+# canonical_qdisc() is NOT reusable here: it exists to build a human-readable
+# fingerprint for a screenshot, so it keeps tc's spelling and tc's order.
+qdisc_fields() {
+  awk -v spec="${1:-}" 'BEGIN {
+    n = split(spec, f, /[ \t]+/)
+    # Kind: the first bare word of a spec, or field 2 of a `tc qdisc show` line.
+    start = 1
+    if (f[1] == "qdisc") { kind = f[2]; start = 3 } else { kind = f[1]; start = 2 }
+    printf "kind=%s\n", kind
+    for (i = start; i <= n; i++) {
+      k = f[i]
+      if (k == "maxrate" || k == "bandwidth")      { printf "%s=%d\n", k, rate(f[i+1]); i++ }
+      else if (k == "limit" || k == "flow_limit" || k == "initial_quantum" ||
+               k == "quantum")                     { printf "%s=%d\n", k, num(f[i+1]); i++ }
+      else if (k == "rtt")                         { printf "rtt=%d\n", num(f[i+1]); i++ }
+      else if (k == "dual-dsthost" || k == "dual-srchost" || k == "triple-isolate" ||
+               k == "besteffort" || k == "no-split-gso" || k == "split-gso")
+                                                   { printf "%s=1\n", k }
+    }
+  }
+  function num(v) { return v + 0 }
+  # Everything to kbit, so 1900000kbit and 1900Mbit compare equal.
+  function rate(v,   x) {
+    x = v + 0
+    if (v ~ /[Gg]bit/)  return x * 1000000
+    if (v ~ /[Mm]bit/)  return x * 1000
+    if (v ~ /[Kk]bit/)  return x
+    return x / 1000       # bare bits per second
+  }' </dev/null | sort
+}
+
+# True when the running root queue already IS the target -- not merely the same
+# kind of queue with some of the right numbers on it.
+#
+# Every field of the target must match, AND the live queue must carry no rate
+# ceiling the target does not ask for. That second half is the one that matters:
+# tc prints maxrate/bandwidth only when they are actually set, so their presence
+# against a target that does not mention them is exactly the 1960 Mbit cap that
+# survived 0.23.0.
+qdisc_is_target() {
+  local want="${1:-}" live_raw live want_f live_f
+  live_raw="$(tc qdisc show dev "$IFACE" 2>/dev/null | sed -n '1p')" || return 1
+  [[ -n "$live_raw" ]] || return 1
+  want_f="$(qdisc_fields "$want")"
+  live_f="$(qdisc_fields "$live_raw")"
+  local line key
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -qxF "$line" <<< "$live_f" || return 1
+  done <<< "$want_f"
+  for key in maxrate bandwidth; do
+    if grep -q "^$key=" <<< "$live_f" && ! grep -q "^$key=" <<< "$want_f"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+install_root_qdisc() {
+  local want="${1:-}"
+  qdisc_is_target "$want" && return 0
+  # A missing root qdisc is the normal case on a fresh boot, not a failure.
+  tc qdisc del dev "$IFACE" root 2>/dev/null || true
+  split_words "$want"
+  tc qdisc add dev "$IFACE" root "${SPLIT_WORDS[@]}"
 }
 
 apply_link() {
@@ -2034,9 +2276,8 @@ apply_link() {
     apply_route
     return 0
   fi
-  split_words "$want_q"
   local tc_err bad
-  if tc_err="$(tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>&1)"; then
+  if tc_err="$(install_root_qdisc "$want_q" 2>&1)"; then
     log "根队列已设为：$want_q"
     report_live_qdisc "$want_q"
   else
@@ -2051,8 +2292,7 @@ apply_link() {
     # over a keyword -- the same over-reaction the `ecn` rejection caused.
     if [[ "$want_q" == *" no-split-gso"* ]]; then
       local without="${want_q% no-split-gso}"
-      split_words "$without"
-      if tc qdisc replace dev "$IFACE" root "${SPLIT_WORDS[@]}" 2>/dev/null; then
+      if install_root_qdisc "$without" 2>/dev/null; then
         warn "本机 sch_cake 不认识 no-split-gso，已去掉它：$without"
         printf '  %b整形保住了，但每包成本回到高位——CPU 不够时优先考虑 4) 不整形。%b\n' \
           "$DIM" "$RESET"
@@ -2063,7 +2303,7 @@ apply_link() {
     fi
     # Pacing is the single most important item in the whole set, so falling back
     # to fq is far better than leaving the interface on whatever it had.
-    if tc qdisc replace dev "$IFACE" root fq >/dev/null 2>&1; then
+    if install_root_qdisc fq >/dev/null 2>&1; then
       warn "已退回 fq：pacing 保住了，但没有按设备公平和 AQM"
     else
       printf '  %b没有 pacing 的话，突发会按线速打出去——这是重传的主要来源。%b\n' "$DIM" "$RESET"
@@ -2145,6 +2385,7 @@ cmd_apply() {
   apply_sysctl "$rate" "$rtt"; n="$SYSCTL_WROTE"
   apply_link "$rate" "$rtt"
   (( PERSIST == 1 )) && write_persistence "$rate" "$rtt"
+  verify_applied "$rate" "$rtt" || true
   printf '\n'
   printf '  %b指纹:%b %s\n' "$BOLD" "$RESET" "$(config_fingerprint)"
   log "完成。$PROGRAM status 看状态，$PROGRAM revert 完整还原"
@@ -2179,6 +2420,52 @@ cmd_apply_link() {
   resolve_iface
   has tc || die "缺少 tc；请安装 iproute2"
   apply_link "$rate" "$rtt"
+}
+
+# Reads back everything apply just wrote and says so when the machine did not
+# end up where it was told to go.
+#
+# This exists because five separate bugs reached a user's machine together in
+# 0.23.0 -- a queue that ignored the new spec, two guards that compared only the
+# qdisc kind, a starting size that preserved its own past mistake, and two
+# withdrawn keys nothing ever unset -- and apply reported success for all of
+# them. It checked tc's exit code and the qdisc kind, and nothing else.
+#
+# A tool that changes system state has to be able to answer "did that work".
+verify_applied() {
+  local rate="$1" rtt="$2" k v dir now want want_q bad=0 out=''
+  while IFS=$'\t' read -r k v dir _; do
+    [[ -n "$k" ]] || continue
+    now="$(live_value "$k" || true)"
+    # A key this kernel does not have was already reported as skipped.
+    [[ -n "$now" ]] || continue
+    want="$(safe_value "$now" "$v" "$dir")"
+    [[ "$now" == "$want" ]] && continue
+    out="$out$(printf '    %-32s 目标 %-26s 实际 %s\n' "$k" "$want" "$now")"$'\n'
+    bad=1
+  done < <(target_sysctl "$rate" "$rtt")
+  local entry rk rdef rwant
+  for entry in "${RETIRED_SYSCTL[@]}"; do
+    IFS=$'\t' read -r rk rdef <<< "$(printf '%b' "$entry")"
+    now="$(live_value "$rk" || true)"
+    [[ -n "$now" ]] || continue
+    rwant="$(snapshot_value "$rk" || printf '%s' "$rdef")"
+    [[ "$now" == "$rwant" ]] && continue
+    out="$out$(printf '    %-32s 应还原为 %-22s 实际 %s\n' "$rk" "$rwant" "$now")"$'\n'
+    bad=1
+  done
+  want_q="$(target_qdisc "$rate" "$rtt")"
+  if [[ "$QDISC_LAYOUT" != mq-leaves ]] && ! qdisc_is_target "$want_q"; then
+    out="$out$(printf '    %s 目标 %s\n' "$(panel_pad '根队列' 32)" "$want_q")"$'\n'
+    out="$out$(printf '    %-32s 实际 %s\n' '' "$(canonical_qdisc 2>/dev/null || printf 未知)")"$'\n'
+    bad=1
+  fi
+  (( bad == 0 )) && { printf '\n  %b[验证]%b 回读一致：sysctl 和根队列都是目标值\n' "$GREEN" "$RESET"; return 0; }
+  printf '\n'
+  warn "应用后仍与目标不符："
+  printf '%s' "$out"
+  printf '  %b这不是警告是缺陷 —— 请把上面这几行贴出来。%b\n' "$DIM" "$RESET"
+  return 1
 }
 
 cmd_status() {
@@ -2735,6 +3022,11 @@ panel_reapply() { cmd_apply; }
 
 # Everything from one sampling window. See diag_sample for why that matters.
 DIAG_SECS=8
+# Below this there is no window to reason about. An idle socket has the same
+# fields as a saturated one and every ratio computed from them is noise.
+DIAG_MIN_INFLIGHT=65536
+# And below a real MSS, cwnd x mss is not a byte count worth printing.
+DIAG_MIN_MSS=500
 
 panel_diagnose() {
   title 'tcpwide 诊断'
@@ -2859,46 +3151,49 @@ render_nic_delta() {
 # diagnosis ends up describing the SSH session instead of the transfer -- which
 # this file has already done once.
 render_connections() {
-  local rows listen
+  local rows listen moved
   rows="$(ss_metrics)" || { printf '\n  %b没有可用的 socket 样本（ss 缺失或窗口内没有连接）。%b\n' "$DIM" "$RESET"; return 0; }
   [[ -n "$rows" ]] || { printf '\n  %b窗口内没有 ESTAB 连接。测速跑着的时候再看一次。%b\n' "$DIM" "$RESET"; return 0; }
-  # Ports this box listens on, so an inbound connection can be told from one
-  # this box opened. That distinction plus the byte counts is what separates a
-  # relay's two legs; guessing from throughput alone is how the diagnosis once
-  # ended up analysing the operator's own SSH session.
+  # Measured bytes over the window, keyed by local<TAB>peer. A connection that
+  # is not in here moved nothing and has nothing to diagnose, whatever its
+  # delivery_rate still claims.
+  moved="$(ss_throughput 2>/dev/null || true)"
   listen=" $(ss -tlnH 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | tr '\n' ' ')"
-  printf '\n  %b连接（取自窗口中点）%b —— 只列出有实际吞吐的：\n' "$BOLD" "$RESET"
+  printf '\n  %b连接（%s 秒窗口内实际搬了数据的）%b\n' "$BOLD" "$DIAG_SECS" "$RESET"
   printf '  %b中继有两段 TCP，它们回答的是不同的问题，所以分开列。%b\n' "$DIM" "$RESET"
   local shown=0 lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing delivery \
-        rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv lport leg
+        rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv lport leg mbps inflight
   while IFS=$'\t' read -r lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing \
         delivery rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv; do
-    # Below this there is nothing to diagnose: an idle control connection has
-    # the same fields as a saturated one and none of them mean anything. This
-    # floor is why the diagnosis stopped reporting on the operator's own SSH
-    # session as though it were the transfer.
-    awk -v d="$delivery" -v f="$SAMPLE_MBPS_FLOOR" 'BEGIN {exit !(d >= f)}' || continue
+    mbps="$(awk -F'\t' -v l="$lcl" -v p="$peer" '$1 == l && $2 == p {print $3; exit}' <<< "$moved")"
+    [[ -n "$mbps" ]] || continue
+    awk -v d="$mbps" -v f="$SAMPLE_MBPS_FLOOR" 'BEGIN {exit !(d >= f)}' || continue
+    # Two more gates. An Apple push socket sat at cwnd 1 x mss 128 -- 128 bytes
+    # in flight -- and the evidence block solemnly reported it was "at 100% of
+    # cwnd x mss". Below a real window there is no window to reason about, and
+    # below a real MSS the cwnd arithmetic is meaningless.
+    inflight=$(( unacked * mss ))
+    (( inflight >= DIAG_MIN_INFLIGHT )) || continue
+    (( mss >= DIAG_MIN_MSS )) || continue
     lport="${lcl##*:}"
     # Who dialled whom, which is all the listen-port test can establish. Which
-    # way the DATA flows is a separate fact and the byte counts state it -- a
-    # relay both pulls from a backend and serves a client, and on this box the
-    # outbound connection was the one doing the sending.
+    # way the DATA flows is a separate fact and the byte counts state it.
     if [[ "$listen" == *" $lport "* ]]; then
       leg='入站：对方连进来'
     else
       leg='出站：本机拨出去'
     fi
-    printf '\n  %b[%s]%b  发出 %s MB / 收到 %s MB\n' \
-      "$DIM" "$leg" "$RESET" "$(mb "$sent")" "$(mb "$recv")"
+    printf '\n  %b[%s]%b  窗口内实测 %s Mbps｜累计发出 %s MB / 收到 %s MB\n' \
+      "$DIM" "$leg" "$RESET" "$mbps" "$(mb "$sent")" "$(mb "$recv")"
     render_conn_evidence "$peer" "$rtt" "$mss" "$cwnd" "$unacked" "$snd_wnd" \
-      "$rcv_space" "$pacing" "$delivery" "$rwndlim" "$sndlim" "$retr" \
+      "$rcv_space" "$pacing" "$mbps" "$rwndlim" "$sndlim" "$retr" \
       "$rcvbuf" "$sndbuf" "$wmemq"
     shown=$(( shown + 1 ))
   done <<< "$rows"
   if (( shown == 0 )); then
-    printf '  %b窗口内没有任何一条连接超过 %s Mbps —— 这些数字都不能用来定位瓶颈。%b\n' \
-      "$DIM" "$SAMPLE_MBPS_FLOOR" "$RESET"
-    printf '  %b在测速跑到一半的时候再进来一次。%b\n' "$DIM" "$RESET"
+    printf '  %b窗口内没有一条连接真的在搬数据（门槛 %s Mbps、在途 %s KB）。%b\n' \
+      "$DIM" "$SAMPLE_MBPS_FLOOR" "$(( DIAG_MIN_INFLIGHT / 1024 ))" "$RESET"
+    printf '  %b这些数字定位不了瓶颈。在测速跑到一半的时候再进来一次。%b\n' "$DIM" "$RESET"
   fi
   return 0
 }

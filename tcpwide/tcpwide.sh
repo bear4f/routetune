@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.24.0"
+VERSION="0.25.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1043,23 +1043,38 @@ retrans_rate() {
 # Prints "busiest<TAB>average<TAB>cores<TAB>steal".
 # Busiest core / mean / count / peak steal, from two /proc/stat snapshots the
 # caller already holds.
+# max<TAB>mean<TAB>cores<TAB>steal<TAB>user<TAB>softirq, all percentages over
+# the same window, from two /proc/stat snapshots.
+#
+# The user/softirq split says WHICH kind of work is filling the core: user+sys
+# is the proxy and its crypto, irq+softirq is the kernel network stack. On a
+# single-core box that is the difference between "swap the cipher or add a core"
+# and "the stack is the cost", and the aggregate number cannot tell them apart.
+# Both are measured on the busiest core, since that is the one that runs out.
 busiest_core_delta() {
   printf '%s\n%s\n' "${1:-}" "${2:-}" | awk '
     { busy = 0; tot = 0
       # $5 idle, $6 iowait: neither is work this machine is doing.
       for (i = 2; i <= NF; i++) { tot += $i; if (i != 5 && i != 6) busy += $i }
       st = (NF >= 9) ? $9 : 0
+      us = $2 + $3 + $4                       # user + nice + system
+      si = ((NF >= 7) ? $7 : 0) + ((NF >= 8) ? $8 : 0)   # irq + softirq
       if ($1 in seen) {
         d = tot - t[$1]
         if (d > 0) {
           p = (busy - u[$1]) * 100 / d
-          sp = (st - v[$1]) * 100 / d
           sum += p; n++
-          if (p > max) max = p
+          sp = (st - v[$1]) * 100 / d
           if (sp > maxst) maxst = sp
+          if (p > max) {
+            max = p
+            mus = (us - w[$1]) * 100 / d
+            msi = (si - x[$1]) * 100 / d
+          }
         }
-      } else { seen[$1] = 1; t[$1] = tot; u[$1] = busy; v[$1] = st } }
-    END { if (n < 1) exit 1; printf "%.0f\t%.0f\t%d\t%.0f", max, sum / n, n, maxst }'
+      } else { seen[$1] = 1; t[$1] = tot; u[$1] = busy; v[$1] = st; w[$1] = us; x[$1] = si } }
+    END { if (n < 1) exit 1
+      printf "%.0f\t%.0f\t%d\t%.0f\t%.0f\t%.0f", max, sum / n, n, maxst, mus, msi }'
 }
 
 busiest_core_pct() {
@@ -1408,6 +1423,8 @@ record_measurement() {
 # past its ramp and still running), and the closing snapshots are taken after.
 # One sleep, one window.
 DIAG_DIR=""
+# Index of the last ss dump in the window, so readers know how many there are.
+DIAG_SS_LAST=0
 
 # shellcheck disable=SC2120 # the interface argument is optional by design
 nic_counters() {
@@ -1422,27 +1439,44 @@ nic_counters() {
 }
 
 diag_sample() {
-  local secs="${1:-6}" half
+  local secs="${1:-6}" i
   DIAG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tcpwide-diag.XXXXXX")" || return 1
-  half="$(awk -v s="$secs" 'BEGIN {printf "%.2f", s / 2}')"
   if has nstat; then nstat -asz > "$DIAG_DIR/nstat.a" 2>/dev/null || true; fi
   if [[ -r /proc/stat ]]; then awk '/^cpu[0-9]+ /' /proc/stat > "$DIAG_DIR/cpu.a"; fi
   if has tc; then tc -s -d qdisc show dev "$IFACE" > "$DIAG_DIR/qdisc.a" 2>/dev/null || true; fi
   nic_counters > "$DIAG_DIR/nic.a" 2>/dev/null || true
-  # Two dumps, one at each end of the window, because `delivery_rate` is the
-  # kernel's max-filtered ESTIMATE and not the current rate: a connection that
-  # went idle minutes ago keeps reporting whatever it last managed. An Apple
-  # push socket with cwnd 1 and mss 128 came through the 50 Mbps floor claiming
-  # 53 Mbps. Bytes moved across the window is a measurement and cannot do that.
-  if has ss; then ss -tinm > "$DIAG_DIR/ss.a" 2>/dev/null || true; fi
-  sleep "$half"
-  sleep "$half"
-  if has ss; then ss -tinm > "$DIAG_DIR/ss.b" 2>/dev/null || true; fi
+  # One ss dump per second for the whole window, not two at the ends.
+  #
+  # Two endpoints only measure a connection that exists at BOTH of them. A
+  # speedtest runs 8 seconds and this window is 8 seconds, so the two can never
+  # be aligned: any connection that opens or closes mid-window fails to pair up
+  # and was silently dropped. That is why three consecutive diagnostics found
+  # nothing while the box was pushing 400 Mbps at 58% of its only core.
+  #
+  # Per-second dumps let each connection be measured between its OWN first and
+  # last appearance. `ss -tinm` costs microseconds.
+  for (( i = 0; i < secs; i++ )); do
+    if has ss; then ss -tinm > "$DIAG_DIR/ss.$i" 2>/dev/null || true; fi
+    sleep 1
+  done
+  if has ss; then ss -tinm > "$DIAG_DIR/ss.$secs" 2>/dev/null || true; fi
+  DIAG_SS_LAST="$secs"
   if has nstat; then nstat -asz > "$DIAG_DIR/nstat.b" 2>/dev/null || true; fi
   if [[ -r /proc/stat ]]; then awk '/^cpu[0-9]+ /' /proc/stat > "$DIAG_DIR/cpu.b"; fi
   if has tc; then tc -s -d qdisc show dev "$IFACE" > "$DIAG_DIR/qdisc.b" 2>/dev/null || true; fi
   nic_counters > "$DIAG_DIR/nic.b" 2>/dev/null || true
   return 0
+}
+
+# The ss dumps of one window, oldest first. Named ss.0 .. ss.N so a numeric sort
+# is the chronological one.
+diag_ss_files() {
+  local i dumps=()
+  for (( i = 0; i <= ${DIAG_SS_LAST:-0}; i++ )); do
+    [[ -s "$DIAG_DIR/ss.$i" ]] && dumps+=( "$DIAG_DIR/ss.$i" )
+  done
+  (( ${#dumps[@]} > 0 )) || return 1
+  printf '%s\n' "${dumps[@]}"
 }
 
 diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; DIAG_DIR=""; return 0; }
@@ -1455,52 +1489,74 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # Rates are Mbps, sizes bytes, limits percent. Missing fields are 0, never
 # blank -- an empty field collapses under `IFS=$'\t' read` and shifts every
 # column after it, which has produced a wrong panel line twice in this file.
-# Throughput actually observed over the window: bytes moved between the two ss
-# dumps, divided by the elapsed seconds, per connection. Emits
-# `local<TAB>peer<TAB>mbps`.
+# Throughput actually observed, per connection, from the window's ss dumps.
 #
-# This replaces delivery_rate as the "is this connection doing anything" test.
-# delivery_rate answers "what is the best this connection ever managed", which
-# an idle socket answers just as loudly as a saturated one.
-# shellcheck disable=SC2120 # the file arguments are optional by design
+# Emits `local<TAB>peer<TAB>mbps<TAB>status`, one row per connection SEEN,
+# including the ones with no usable rate -- the status column says which:
+#
+#   ok        measured between its own first and last appearance
+#   onesample seen in exactly one dump, so there is no interval to divide by
+#   idle      seen across an interval but moved no bytes
+#
+# Emitting the rejects rather than dropping them is the point. 0.24.0 dropped
+# them silently and three consecutive diagnostics reported "no connection moved
+# data" while the box pushed 400 Mbps, with no way to tell which gate had fired.
+#
+# Each connection is measured over ITS OWN interval, not the window's: a flow
+# alive for three of eight seconds is a three-second measurement, and dividing
+# its bytes by eight would understate it by more than half.
 ss_throughput() {
-  local a="${1:-$DIAG_DIR/ss.a}" b="${2:-$DIAG_DIR/ss.b}" secs="${3:-$DIAG_SECS}"
-  [[ -r "$a" && -r "$b" ]] || return 1
-  awk -v secs="$secs" '
-    function flush(   tot) {
+  local files
+  files="$(diag_ss_files)" || return 1
+  # shellcheck disable=SC2086 # deliberate word splitting on the newline list
+  awk '
+    function flush(   k, tot) {
       if (peer == "") return
+      k = lcl "\t" peer
       tot = sent + recv
-      # `cur`, not FILENAME: the last connection in the first file is flushed
-      # only when the first record of the SECOND file arrives, by which time
-      # FILENAME has already moved on -- so it would be recorded as a delta
-      # against a baseline that was never taken.
-      if (cur == first) { base[lcl "\t" peer] = tot }
-      else {
-        k = lcl "\t" peer
-        if (k in base) {
-          d = tot - base[k]
-          if (d > 0) printf "%s\t%.1f\n", k, d * 8 / secs / 1000000
-        }
-      }
+      if (!(k in firstidx)) { firstidx[k] = idx; firstb[k] = tot }
+      lastidx[k] = idx; lastb[k] = tot
       peer = ""
     }
     function num(tok,   p) { p = index(tok, ":"); return substr(tok, p + 1) + 0 }
-    BEGIN { first = ARGV[1] }
+    FNR == 1 { flush(); idx++ }
     $1 == "ESTAB" && NF >= 5 {
-      flush(); cur = FILENAME; lcl = $4; peer = $5; sent = 0; recv = 0; next }
+      flush(); lcl = $4; peer = $5; sent = 0; recv = 0; next }
     peer != "" {
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^bytes_sent:/)     sent = num($i)
         if ($i ~ /^bytes_received:/) recv = num($i)
       }
     }
-    END { flush() }' "$a" "$b"
+    END {
+      flush()
+      for (k in firstidx) {
+        span = lastidx[k] - firstidx[k]
+        if (span <= 0) { printf "%s\t0\tonesample\n", k; continue }
+        d = lastb[k] - firstb[k]
+        if (d <= 0) { printf "%s\t0\tidle\n", k; continue }
+        printf "%s\t%.1f\tok\n", k, d * 8 / span / 1000000
+      }
+    }' $files
 }
 
 # shellcheck disable=SC2120 # the source file argument is optional by design
 ss_metrics() {
-  local src="${1:-$DIAG_DIR/ss.b}"
-  [[ -r "$src" ]] || return 1
+  # Every connection seen ANYWHERE in the window, each described by its most
+  # recent appearance.
+  #
+  # Reading only the last dump was the other half of the empty-diagnostic bug: a
+  # transfer that ended before the window closed had been measured by
+  # ss_throughput and then dropped here, because it was not in the one file this
+  # function looked at. Instantaneous fields still describe a moment -- just the
+  # last moment that connection existed, rather than the last moment of the
+  # window.
+  local src=( "$@" )
+  if (( ${#src[@]} == 0 )); then
+    local list; list="$(diag_ss_files)" || return 1
+    # shellcheck disable=SC2206 # the list is one path per line, no globbing
+    src=( $list )
+  fi
   awk '
     function tomb(v,   n) {
       n = v + 0
@@ -1517,11 +1573,13 @@ ss_metrics() {
       }
       return 0
     }
-    function flush(   i) {
+    function flush(   i, k) {
       if (peer == "") return
-      printf "%s\t%s\t%.1f\t%d\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\n",
+      k = lcl "\t" peer
+      if (!(k in rec)) order[++norder] = k
+      rec[k] = sprintf("%s\t%s\t%.1f\t%d\t%d\t%d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d",
         lcl, peer, rtt, mss, cwnd, unacked, snd_wnd, rcv_space, pacing, delivery,
-        rwndlim, sndlim, retr, rcvbuf, sndbuf, wmemq, sent, recv
+        rwndlim, sndlim, retr, rcvbuf, sndbuf, wmemq, sent, recv)
       peer = ""
     }
     # A state line: STATE recvq sendq local peer
@@ -1560,7 +1618,9 @@ ss_metrics() {
         }
       }
     }
-    END { flush() }' "$src"
+    FNR == 1 { flush() }
+    END { flush()
+      for (i = 1; i <= norder; i++) print rec[order[i]] }' "${src[@]}"
 }
 
 # One connection's evidence, rendered. Every line is a measured number and the
@@ -3027,6 +3087,12 @@ DIAG_SECS=8
 DIAG_MIN_INFLIGHT=65536
 # And below a real MSS, cwnd x mss is not a byte count worth printing.
 DIAG_MIN_MSS=500
+# The floor for LISTING a connection. Low, because throughput here is measured
+# from byte deltas rather than read off delivery_rate -- the old 50 Mbps floor
+# existed to defeat that stale estimate and has no reason to be this high now.
+# SAMPLE_MBPS_FLOOR stays at 50 for window_ratio, which still reads
+# delivery_rate and still needs the protection.
+DIAG_MIN_MBPS=5
 
 panel_diagnose() {
   title 'tcpwide 诊断'
@@ -3060,16 +3126,11 @@ panel_diagnose() {
   # ── CPU ──
   if bc="$(busiest_core_delta "$(cat "$DIAG_DIR/cpu.a" 2>/dev/null)" \
                               "$(cat "$DIAG_DIR/cpu.b" 2>/dev/null)")"; then
-    IFS=$'\t' read -r bmax bavg bcores bsteal <<< "$bc"
-    printf '  CPU（同一窗口）:   最忙的核 %s%%｜%s 核平均 %s%%｜steal 峰值 %s%%\n' \
-      "$bmax" "$bcores" "$bavg" "$bsteal"
-    if (( bmax >= 85 )) && (( bavg < 70 )); then
-      warn "有单核接近打满而平均只有 ${bavg}% —— 单条连接在用户态代理里基本只用得到一个核"
-      printf '    %b这个天花板和 RTT 无关，所以调缓冲、调窗口都不会让它变快。%b\n' "$DIM" "$RESET"
-      printf '    %b验证：多线程测速。多线程能上去 = 每流受 CPU 限，服务端配置没问题。%b\n' "$DIM" "$RESET"
-    elif (( bmax >= 85 )); then
-      warn "所有核都接近打满 —— 这台机器的转发能力本身就到顶了"
-    fi
+    local buser bsoft
+    IFS=$'\t' read -r bmax bavg bcores bsteal buser bsoft <<< "$bc"
+    printf '  CPU（同一窗口）:   最忙的核 %s%%（用户态 %s%%｜软中断 %s%%）｜%s 核平均 %s%%｜steal %s%%\n' \
+      "$bmax" "$buser" "$bsoft" "$bcores" "$bavg" "$bsteal"
+    render_cpu_ceiling "$bmax" "$buser" "$bsoft" "$bcores"
     (( bsteal >= 10 )) && warn "steal ${bsteal}% —— 宿主机超售，这部分算力买不回来"
   else
     printf '  CPU（同一窗口）:   无法采样\n'
@@ -3097,6 +3158,56 @@ panel_diagnose() {
   fi
   diag_cleanup
   printf '\n'
+}
+
+# What a core utilisation figure implies, given what the window actually moved.
+#
+# The old code only warned at >=85%, so a single core sitting at 58% while the
+# box pushed 405 Mbps said nothing at all -- and that was the strongest signal
+# in the whole sample. A percentage on its own is not actionable; the same
+# percentage divided by the throughput that produced it is a ceiling.
+#
+# The extrapolation is linear and therefore optimistic: per-packet costs do not
+# scale down as the core saturates. It is a bound to test, not a prediction, and
+# the test is stated alongside it.
+render_cpu_ceiling() {
+  local bmax="${1:-0}" buser="${2:-0}" bsoft="${3:-0}" bcores="${4:-1}" total ceiling
+  total="$(diag_total_mbps)"
+  if awk -v t="${total:-0}" -v p="$bmax" 'BEGIN {exit !(t > 0 && p >= 5)}'; then
+    ceiling="$(awk -v t="$total" -v p="$bmax" 'BEGIN {printf "%.0f", t * 100 / p}')"
+    printf '    %b这个占用对应的单核上限约 %s Mbps（窗口内实测 %s Mbps ÷ %s%%，线性外推）%b\n' \
+      "$DIM" "$ceiling" "$total" "$bmax" "$RESET"
+  fi
+  if (( buser > bsoft * 2 )); then
+    printf '    %b用户态占大头 —— 是代理进程和加密，不是内核网络栈%b\n' "$DIM" "$RESET"
+  elif (( bsoft > buser )); then
+    printf '    %b软中断占大头 —— 是内核收发包路径，代理本身不是瓶颈%b\n' "$DIM" "$RESET"
+  fi
+  if (( bmax >= 85 )); then
+    if (( bcores > 1 )); then
+      warn "最忙的核 ${bmax}% —— 已经到顶，这台机器的转发能力就在这里"
+    else
+      warn "唯一的核 ${bmax}% —— 已经到顶，调 TCP 参数不会让它变快"
+    fi
+    printf '    %b这个天花板和 RTT 无关，缓冲和窗口怎么调都不动它。%b\n' "$DIM" "$RESET"
+  elif (( bmax >= 50 )); then
+    warn "最忙的核 ${bmax}% —— 用掉一半以上，单核机器上这是头号候选瓶颈"
+  else
+    return 0
+  fi
+  printf '    %b判定方法：同后端跑一次四线程。%b\n' "$BOLD" "$RESET"
+  printf '    %b  四线程明显更快、核没到顶 → 每流受限，不是 CPU%b\n' "$DIM" "$RESET"
+  printf '    %b  四线程也上不去、核接近 100%% → 就是 CPU，服务端调优到此为止%b\n' "$DIM" "$RESET"
+  return 0
+}
+
+# Everything the window actually moved, in Mbps. The denominator for any
+# per-throughput claim, and absent when nothing moved -- in which case no such
+# claim gets made.
+diag_total_mbps() {
+  local rows
+  rows="$(ss_throughput 2>/dev/null)" || return 1
+  awk -F'\t' '$4 == "ok" { t += $3 } END { if (t <= 0) exit 1; printf "%.1f", t }' <<< "$rows"
 }
 
 # Queue backlog, drops and overlimits over the window. `overlimits` is the one
@@ -3153,48 +3264,74 @@ render_nic_delta() {
 render_connections() {
   local rows listen moved
   rows="$(ss_metrics)" || { printf '\n  %b没有可用的 socket 样本（ss 缺失或窗口内没有连接）。%b\n' "$DIM" "$RESET"; return 0; }
-  [[ -n "$rows" ]] || { printf '\n  %b窗口内没有 ESTAB 连接。测速跑着的时候再看一次。%b\n' "$DIM" "$RESET"; return 0; }
-  # Measured bytes over the window, keyed by local<TAB>peer. A connection that
-  # is not in here moved nothing and has nothing to diagnose, whatever its
-  # delivery_rate still claims.
   moved="$(ss_throughput 2>/dev/null || true)"
   listen=" $(ss -tlnH 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | tr '\n' ' ')"
-  printf '\n  %b连接（%s 秒窗口内实际搬了数据的）%b\n' "$BOLD" "$DIAG_SECS" "$RESET"
-  printf '  %b中继有两段 TCP，它们回答的是不同的问题，所以分开列。%b\n' "$DIM" "$RESET"
-  local shown=0 lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing delivery \
-        rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv lport leg mbps inflight
+
+  # Every connection is accounted for. Not being able to find a sample is normal
+  # and fine; not being able to say WHY is the defect -- 0.24.0 had four silent
+  # `continue`s and one message that named two of them, so three diagnostics in
+  # a row reported "no connection moved data" with no way to tell what had been
+  # rejected or why.
+  local seen=0 shown=0 n_idle=0 n_one=0 n_slow=0 one_names='' slow_names=''
+  local lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing delivery \
+        rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv \
+        lport leg mbps status inflight judged body=''
   while IFS=$'\t' read -r lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing \
         delivery rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv; do
-    mbps="$(awk -F'\t' -v l="$lcl" -v p="$peer" '$1 == l && $2 == p {print $3; exit}' <<< "$moved")"
-    [[ -n "$mbps" ]] || continue
-    awk -v d="$mbps" -v f="$SAMPLE_MBPS_FLOOR" 'BEGIN {exit !(d >= f)}' || continue
-    # Two more gates. An Apple push socket sat at cwnd 1 x mss 128 -- 128 bytes
-    # in flight -- and the evidence block solemnly reported it was "at 100% of
-    # cwnd x mss". Below a real window there is no window to reason about, and
-    # below a real MSS the cwnd arithmetic is meaningless.
-    inflight=$(( unacked * mss ))
-    (( inflight >= DIAG_MIN_INFLIGHT )) || continue
-    (( mss >= DIAG_MIN_MSS )) || continue
+    [[ -n "$peer" ]] || continue
+    seen=$(( seen + 1 ))
+    IFS=$'\t' read -r _ _ mbps status <<< \
+      "$(awk -F'\t' -v l="$lcl" -v p="$peer" '$1 == l && $2 == p {print; exit}' <<< "$moved")"
+    case "${status:-onesample}" in
+      idle)      n_idle=$(( n_idle + 1 )); continue ;;
+      onesample) n_one=$(( n_one + 1 ))
+                 one_names="$one_names $peer"; continue ;;
+    esac
+    if ! awk -v d="$mbps" -v f="$DIAG_MIN_MBPS" 'BEGIN {exit !(d >= f)}'; then
+      n_slow=$(( n_slow + 1 ))
+      slow_names="$slow_names $peer($mbps)"
+      continue
+    fi
     lport="${lcl##*:}"
     # Who dialled whom, which is all the listen-port test can establish. Which
     # way the DATA flows is a separate fact and the byte counts state it.
-    if [[ "$listen" == *" $lport "* ]]; then
-      leg='入站：对方连进来'
+    if [[ "$listen" == *" $lport "* ]]; then leg='入站：对方连进来'; else leg='出站：本机拨出去'; fi
+    # Listing a connection and drawing conclusions about its windows are two
+    # different decisions. A connection with a tiny MSS or almost nothing in
+    # flight is still worth SHOWING if it is moving data; what it cannot support
+    # is cwnd arithmetic -- an Apple push socket at cwnd 1 x mss 128 was once
+    # reported as "at 100% of cwnd x mss".
+    inflight=$(( unacked * mss ))
+    judged=1
+    (( inflight >= DIAG_MIN_INFLIGHT )) || judged=0
+    (( mss >= DIAG_MIN_MSS )) || judged=0
+    body="$body$(printf '\n  %b[%s]%b  窗口内实测 %s Mbps｜累计发出 %s MB / 收到 %s MB\n' \
+      "$DIM" "$leg" "$RESET" "$mbps" "$(mb "$sent")" "$(mb "$recv")")"$'\n'
+    if (( judged == 1 )); then
+      body="$body$(render_conn_evidence "$peer" "$rtt" "$mss" "$cwnd" "$unacked" "$snd_wnd" \
+        "$rcv_space" "$pacing" "$mbps" "$rwndlim" "$sndlim" "$retr" \
+        "$rcvbuf" "$sndbuf" "$wmemq")"$'\n'
     else
-      leg='出站：本机拨出去'
+      body="$body$(printf '  %b%s  RTT %s ms｜mss %s｜在途 %s KB%b\n' \
+        "$BOLD" "$peer" "$rtt" "$mss" "$(( inflight / 1024 ))" "$RESET")"$'\n'
+      body="$body$(printf '    %b在途或 mss 太小，cwnd×mss 和窗口比例算不出有意义的数，不作判断。%b\n' \
+        "$DIM" "$RESET")"$'\n'
     fi
-    printf '\n  %b[%s]%b  窗口内实测 %s Mbps｜累计发出 %s MB / 收到 %s MB\n' \
-      "$DIM" "$leg" "$RESET" "$mbps" "$(mb "$sent")" "$(mb "$recv")"
-    render_conn_evidence "$peer" "$rtt" "$mss" "$cwnd" "$unacked" "$snd_wnd" \
-      "$rcv_space" "$pacing" "$mbps" "$rwndlim" "$sndlim" "$retr" \
-      "$rcvbuf" "$sndbuf" "$wmemq"
     shown=$(( shown + 1 ))
   done <<< "$rows"
+
+  printf '\n  %b连接：窗口内看到 %s 条 ESTAB，入选 %s 条%b\n' "$BOLD" "$seen" "$shown" "$RESET"
+  (( n_idle > 0 )) && printf '    %b%3s 条 窗口内字节数没变（空闲）%b\n' "$DIM" "$n_idle" "$RESET"
+  (( n_one > 0 ))  && printf '    %b%3s 条 只在一个采样点出现，算不出增量：%s%b\n' \
+    "$DIM" "$n_one" "$one_names" "$RESET"
+  (( n_slow > 0 )) && printf '    %b%3s 条 低于 %s Mbps：%s%b\n' \
+    "$DIM" "$n_slow" "$DIAG_MIN_MBPS" "$slow_names" "$RESET"
   if (( shown == 0 )); then
-    printf '  %b窗口内没有一条连接真的在搬数据（门槛 %s Mbps、在途 %s KB）。%b\n' \
-      "$DIM" "$SAMPLE_MBPS_FLOOR" "$(( DIAG_MIN_INFLIGHT / 1024 ))" "$RESET"
-    printf '  %b这些数字定位不了瓶颈。在测速跑到一半的时候再进来一次。%b\n' "$DIM" "$RESET"
+    printf '  %b没有可用来定位瓶颈的连接。在测速跑到一半的时候再进来一次。%b\n' "$DIM" "$RESET"
+    return 0
   fi
+  printf '  %b中继有两段 TCP，它们回答的是不同的问题，所以分开列。%b\n' "$DIM" "$RESET"
+  printf '%s' "$body"
   return 0
 }
 

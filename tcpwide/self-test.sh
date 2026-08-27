@@ -13,9 +13,11 @@ assert_eq() {
     printf 'FAIL: %s: expected [%s], got [%s]\n' "$label" "$expected" "$actual" >&2
     exit 1
   fi
+  PASS_COUNT=$(( PASS_COUNT + 1 ))
   printf 'PASS: %s\n' "$label"
 }
-pass() { printf 'PASS: %s\n' "$1"; }
+PASS_COUNT=0
+pass() { PASS_COUNT=$(( PASS_COUNT + 1 )); printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 # `unset -f` on a mock does not reveal the real function underneath -- it just
@@ -2155,39 +2157,128 @@ pass 'a machine that did take the change verifies clean'
 unset -f live_value tc
 
 
-# ── 0.24.0 诊断只看真的在搬数据的连接 ──────────────────────────────────────
-# delivery_rate is the kernel's max-filtered estimate, not the current rate: an
-# Apple push socket idle for minutes still reported 53 Mbps and sailed through
-# the 50 Mbps floor. Bytes moved across the window is a measurement.
+# ── 0.25.0 每秒一次采样，按连接自己的区间算 ────────────────────────────────
+# Two endpoint dumps only measure a connection present at BOTH. A speedtest runs
+# 8 seconds and the window is 8 seconds, so they cannot be aligned: any flow
+# that opened or closed mid-window failed to pair up and was dropped in silence.
+# Three consecutive diagnostics reported "no connection moved data" while the
+# box pushed 400 Mbps at 58% of its only core.
 restore_lib
 DIAG_DIR="$(mktemp -d)"
-{
-  printf 'ESTAB 0 0 10.0.0.5:41234 17.253.83.132:443\n'
-  printf '\t bbr rtt:151.7/4 mss:128 cwnd:1 unacked:1 bytes_sent:1000 bytes_received:71500000 delivery_rate 53Mbps\n'
-  printf 'ESTAB 0 0 10.0.0.5:443 58.38.51.162:61324\n'
-  printf '\t bbr rtt:128/4 mss:1448 cwnd:4872 unacked:1508 bytes_sent:16000000 bytes_received:1000 delivery_rate 149.7Mbps\n'
-} > "$DIAG_DIR/ss.a"
-{
-  printf 'ESTAB 0 0 10.0.0.5:41234 17.253.83.132:443\n'
-  printf '\t bbr rtt:151.7/4 mss:128 cwnd:1 unacked:1 bytes_sent:1000 bytes_received:71500000 delivery_rate 53Mbps\n'
-  printf 'ESTAB 0 0 10.0.0.5:443 58.38.51.162:61324\n'
-  printf '\t bbr rtt:128/4 mss:1448 cwnd:4872 unacked:1508 snd_wnd:10700000 bytes_sent:166000000 bytes_received:1000 delivery_rate 149.7Mbps\n'
-} > "$DIAG_DIR/ss.b"
-DIAG_SECS=8
+mk_conn() {  # lcl peer sent recv [extra]
+  printf 'ESTAB 0 0 %s %s\n' "$1" "$2"
+  printf '\t bbr rtt:150/4 mss:1448 cwnd:4872 unacked:1508 snd_wnd:10700000 bytes_sent:%s bytes_received:%s delivery_rate 400Mbps %s\n' \
+    "$3" "$4" "${5:-}"
+  printf '\t skmem:(r0,rb131072,t0,tb3355443,f0,w2200000,o0,bl0,d0)\n'
+}
+# Nine dumps. The transfer exists only in 3..6 -- neither starting nor ending
+# inside the window, which is the case that produced nothing at all.
+for i in 0 1 2 3 4 5 6 7 8; do
+  {
+    printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+    mk_conn 10.0.0.5:22 119.237.129.39:51000 $(( 1000 + i * 100 )) $(( 2000 + i * 100 ))
+    if (( i >= 3 && i <= 6 )); then
+      mk_conn 10.0.0.5:443 58.38.51.162:61324 $(( 100000000 + (i - 3) * 50000000 )) 1000
+    fi
+    (( i == 8 )) && mk_conn 10.0.0.5:41234 17.253.83.132:443 1000 71500000
+  } > "$DIAG_DIR/ss.$i"
+done
+DIAG_SS_LAST=8; DIAG_SECS=8
 moved="$(ss_throughput)"
-# Apple moved zero bytes across the window and must not appear at all.
-[[ "$moved" != *17.253.83.132* ]] || fail 'a connection that moved nothing must not be a sample'
-[[ "$moved" == *58.38.51.162* ]] || fail 'the connection that did move data must be'
-assert_eq '150.0' "$(awk -F'\t' '/58.38.51.162/ {print $3}' <<< "$moved")" \
-  'throughput is measured from the byte delta, not read off delivery_rate'
-pass 'the sample is chosen by bytes actually moved'
-# End to end: the idle socket must not reach the evidence block.
+# 150 MB over the three seconds it was actually alive -- not over the window's
+# eight, which would understate it by more than half.
+assert_eq '400.0' "$(awk -F'\t' '/58.38.51.162/ {print $3}' <<< "$moved")" \
+  'a mid-window transfer is measured over its own interval, not the window'
+assert_eq 'ok' "$(awk -F'\t' '/58.38.51.162/ {print $4}' <<< "$moved")" 'and is marked usable'
+# The rejects are EMITTED, with a reason. Dropping them is what made the
+# diagnostic unable to explain its own silence.
+assert_eq 'onesample' "$(awk -F'\t' '/17.253.83.132/ {print $4}' <<< "$moved")" \
+  'a connection seen once has no interval, and says so instead of vanishing'
+assert_eq '3' "$(grep -c '' <<< "$moved")" 'every connection seen is accounted for'
+pass 'throughput comes from each connection own first-and-last appearance'
+
+# ss_metrics must see connections that ended before the window closed, or a
+# measured transfer gets dropped at the next step for not being in one file.
+rows="$(ss_metrics)"
+[[ "$rows" == *58.38.51.162* ]] || fail 'a flow that ended mid-window must still be described'
+assert_eq '3' "$(grep -c '' <<< "$rows")" 'the metric rows are the union across the window'
+pass 'instantaneous fields come from where each connection was last seen'
+
+# Every connection is accounted for in the output, by category.
 ss() { [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }; }
 has() { [[ "$1" == ss ]]; }
 out="$(render_connections 2>&1)"
-[[ "$out" != *17.253.83.132* ]] || fail 'an idle socket must be filtered before the verdicts'
-[[ "$out" == *58.38.51.162* ]] || fail 'and the real transfer must survive the filter'
+[[ "$out" == *"看到 3 条 ESTAB，入选 1 条"* ]] || fail "the tally must be stated: [$out]"
+[[ "$out" == *"只在一个采样点出现"*17.253.83.132* ]] \
+  || fail 'a rejected connection must be named along with its reason'
+[[ "$out" == *"低于 5 Mbps"*119.237.129.39* ]] || fail 'and so must a too-slow one'
+[[ "$out" == *58.38.51.162* ]] || fail 'the real transfer must survive the filter'
 [[ "$out" == *"入站：对方连进来"* ]] || fail 'the leg is still identified by the listen port'
-pass 'only connections that moved data reach the evidence block'
-unset -f ss has
-rm -rf "$DIAG_DIR"; DIAG_DIR=""
+pass 'the diagnostic accounts for every connection it saw, rejects included'
+
+# Listing a connection and judging its windows are separate decisions. A tiny
+# MSS cannot support cwnd arithmetic, but that is no reason to hide a flow that
+# is genuinely moving data.
+for i in 0 1 2; do
+  {
+    printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+    printf 'ESTAB 0 0 10.0.0.5:9999 1.2.3.4:443\n'
+    printf '\t bbr rtt:20/4 mss:128 cwnd:1 unacked:1 bytes_sent:%s bytes_received:1000\n' \
+      $(( 50000000 * i ))
+  } > "$DIAG_DIR/ss.$i"
+done
+for i in 3 4 5 6 7 8; do rm -f "$DIAG_DIR/ss.$i"; done
+DIAG_SS_LAST=2
+out="$(render_connections 2>&1)"
+[[ "$out" == *"入选 1 条"* ]] || fail 'a small-MSS flow that is moving data is still listed'
+[[ "$out" == *"不作判断"* ]] || fail 'but must decline to reason about its windows'
+[[ "$out" != *"cwnd×mss 的 100%"* ]] || fail 'and must never claim 100% of a 128-byte window'
+pass 'showing a connection and judging its windows are separate decisions'
+unset -f ss has mk_conn
+rm -rf "$DIAG_DIR"; DIAG_DIR=""; DIAG_SS_LAST=0
+
+
+# ── 0.25.0 CPU 拆分与单核上限 ──────────────────────────────────────────────
+# A percentage on its own is not actionable. The old code only warned at >=85%,
+# so one core at 58% while the box pushed 405 Mbps said nothing -- and that was
+# the strongest signal in the sample.
+restore_lib
+IFS=$'\t' read -r c_max c_avg c_n c_steal c_user c_soft <<< \
+  "$(busiest_core_delta 'cpu0 1000 0 500 8000 0 10 200 0 0 0' \
+                        'cpu0 1460 0 620 8420 0 12 320 0 0 0')"
+assert_eq '63' "$c_max" 'the busiest core is measured'
+assert_eq '63' "$c_avg" 'and the mean, which on one core is the same number'
+assert_eq '1' "$c_n" 'and how many cores that mean covers'
+assert_eq '52' "$c_user" 'user plus system is broken out'
+assert_eq '11' "$c_soft" 'and irq plus softirq'
+assert_eq '0' "$c_steal" 'steal stays its own column'
+(( c_user + c_soft <= c_max + 1 )) || fail 'the split cannot exceed the total'
+pass 'the busiest core is split into proxy work and network stack'
+
+# The ceiling is throughput divided by utilisation, and it is only printed when
+# there IS throughput -- otherwise there is no denominator and no claim to make.
+diag_total_mbps() { printf '405\n'; }
+out="$(render_cpu_ceiling 58 46 12 1 2>&1)"
+[[ "$out" == *"单核上限约 698 Mbps"* ]] || fail "the implied ceiling must be stated: [$out]"
+[[ "$out" == *"头号候选瓶颈"* ]] || fail 'and 58% must warn, where the old 85% threshold was silent'
+[[ "$out" == *"四线程"* ]] || fail 'with the test that would settle it'
+pass 'a core utilisation figure is turned into the ceiling it implies'
+out="$(render_cpu_ceiling 90 70 20 1 2>&1)"
+[[ "$out" == *"已经到顶"* ]] || fail 'at 90% the wording must be stronger'
+pass 'a saturated core is called saturated'
+out="$(render_cpu_ceiling 20 15 5 1 2>&1)"
+[[ "$out" != *"候选瓶颈"* ]] || fail 'an idle core must not be blamed'
+pass 'a core with headroom raises nothing'
+# No measured throughput means no extrapolation.
+diag_total_mbps() { return 1; }
+out="$(render_cpu_ceiling 58 46 12 1 2>&1)"
+[[ "$out" != *"单核上限"* ]] || fail 'a ceiling cannot be computed without a denominator'
+pass 'no throughput measured means no ceiling claimed'
+unset -f diag_total_mbps
+
+# The old floor stays where the old code still needs it.
+assert_eq '50' "$SAMPLE_MBPS_FLOOR" 'the delivery_rate path keeps its protective floor'
+assert_eq '5' "$DIAG_MIN_MBPS" 'and the measured path uses a much lower one'
+
+
+printf '\n%s\n' "All tcpwide self-tests passed ($PASS_COUNT assertions)."

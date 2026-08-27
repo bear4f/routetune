@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.29.1"
+VERSION="0.30.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -184,6 +184,21 @@ FLOW_MAXRATE_MBPS=0
 # panel can say what changed rather than letting the operator wonder why their
 # numbers moved.
 MIGRATED_FROM_EGRESS=0
+
+# Pacing aggressiveness during slow start, as a percentage of the current rate
+# estimate. The kernel default is 200, i.e. send at twice the measured rate so
+# the estimate has room to grow.
+#
+# This is the knob that governs how fast the ramp CONTINUES. initcwnd only
+# decides the first round trip; on a 160 ms path a flow still needs four or five
+# more of them to climb from a 1 MiB start to the ~20 MB these paths carry, and
+# this ratio sets how big each of those steps is.
+#
+# 0 means "leave the kernel's value alone", and 0 is the default. It is offered
+# as a knob because it has never been measured here, and an unmeasured value
+# does not get to be a default -- that mistake shipped a borrowed constant that
+# survived four releases on this operator's machine.
+PACING_SS_RATIO=0
 # 0.26.0 wrote 128 KiB as if it were a generally safe throughput default. A
 # config-version marker lets 0.27.0 retire that inherited value once, while
 # preserving every value an operator explicitly chooses from this release on.
@@ -624,6 +639,13 @@ target_sysctl() {
     printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
       '未发送数据低水位（显式实验值）。它控制应用写入背压，不是带宽上限；值太小会让代理在调度抖动时喂空发送管道。填 0 会恢复 tcpwide 介入前的系统值'
   fi
+  # Only when the operator has chosen one. The kernel's 200 stands otherwise:
+  # this release froze the tuning defaults, and adding a fifth unmeasured
+  # constant to the set would be the opposite of that.
+  if is_uint "$PACING_SS_RATIO" && (( PACING_SS_RATIO > 0 )); then
+    printf 'net.ipv4.tcp_pacing_ss_ratio\t%s\texact\t%s\n' "$PACING_SS_RATIO" \
+      '慢启动期 pacing 倍率（内核默认 200 = 按估计速率的两倍发）。initcwnd 只管第一个 RTT，这个管后面每一个 RTT 爬多快。未实测，只做 A/B/A'
+  fi
   printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' "$(netdev_backlog)" \
     '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
   # netshape turns ECN off on purpose, and its reason is specific and
@@ -813,6 +835,9 @@ load_config() {
       FQ_INITIAL_QUANTUM) is_uint "$value" && (( value <= 1048576 )) && FQ_INITIAL_QUANTUM="$value" ;;
       FQ_FLOW_LIMIT) is_uint "$value" && (( value <= 100000 )) && FQ_FLOW_LIMIT="$value" ;;
       FQ_LIMIT)      is_uint "$value" && (( value <= 1000000 )) && FQ_LIMIT="$value" ;;
+      PACING_SS_RATIO) is_uint "$value" \
+                       && (( value == 0 || (value >= 100 && value <= 1000) )) \
+                       && PACING_SS_RATIO="$value" ;;
       BUF_DEFAULT)   is_uint "$value" \
                        && (( value == 0 || (value >= 4096 && value <= 16777216) )) \
                        && BUF_DEFAULT="$value" ;;
@@ -887,6 +912,7 @@ save_config() {
     printf 'FQ_FLOW_LIMIT=%s\n' "$FQ_FLOW_LIMIT"
     printf 'FQ_LIMIT=%s\n' "$FQ_LIMIT"
     printf 'BUF_DEFAULT=%s\n' "$BUF_DEFAULT"
+    printf 'PACING_SS_RATIO=%s\n' "$PACING_SS_RATIO"
     printf 'IFACE=%s\n'        "$IFACE"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
@@ -1502,10 +1528,135 @@ record_measurement() {
   is_uint "$threads" && (( threads > 0 )) || threads=1
   [[ "$rtt" =~ ^[0-9]+(\.[0-9]+)?$ ]] || rtt=0
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  # Padded to the full row shape even though a manual entry knows none of the
+  # extra columns. A short row is not a smaller row: tab is IFS whitespace, so
+  # every reader that takes a later field by position would read past the end of
+  # this one. Placeholders, never empty.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\n' \
     "$(date +%s)" "$mbps" "$(config_fingerprint)" "${note//$'\t'/ }" "$threads" "$rtt" \
     >> "$MEASURE_LOG"
   chmod 0600 "$MEASURE_LOG" 2>/dev/null || true
+}
+
+# The measurement log gained five columns in 0.30.0. Old rows have six fields
+# and stay readable: every reader takes what it needs by position and treats a
+# missing column as absent, never as empty -- tab is IFS whitespace, so an empty
+# field collapses and shifts every column after it left. That bug has already
+# produced one wrong panel line in this file.
+#
+#   1 ts  2 mbps  3 fingerprint  4 note  5 threads  6 rtt
+#   7 peer  8 peak  9 swing  10 retrans%  11 busiest-core%
+# shellcheck disable=SC2034 # documents the row shape for readers and tests
+MEASURE_FIELDS=11
+
+# One row per diagnostic that actually caught a transfer.
+#
+# Pressing `m` after a test cannot capture any of this -- the transfer is over,
+# and the peak, the swing, the retransmission and the core load only exist while
+# it runs. The diagnostic is already sampling all of it during the test, so the
+# recording happens there and the operator presses nothing.
+#
+# The peer address is the region: the speedtest node dials IN, so the inbound
+# leg identifies which backend was selected. No manual label to get wrong.
+record_diagnostic() {
+  local retrans="${1:--}" cpu="${2:--}"
+  [[ -n "$DIAG_PEER" ]] || return 1
+  awk -v m="$DIAG_MEDIAN" 'BEGIN {exit !(m > 0)}' || return 1
+  mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$DIAG_MEDIAN" "$(config_fingerprint)" '诊断自动记录' 1 \
+    "${DIAG_RTT:--}" "$DIAG_PEER" "${DIAG_PEAK:--}" "${DIAG_SWING:--}" \
+    "${retrans:--}" "${cpu:--}" >> "$MEASURE_LOG"
+  chmod 0600 "$MEASURE_LOG" 2>/dev/null || true
+  printf '\n  %b[记录]%b %s  中位 %s / 峰值 %s Mbps  已存入跨地区对比（按 t 查看）\n' \
+    "$GREEN" "$RESET" "$DIAG_PEER" "$DIAG_MEDIAN" "$DIAG_PEAK"
+  return 0
+}
+
+# ── 跨地区对比 ─────────────────────────────────────────────────────────────
+#
+# "各个地区综合都能保持一个高水平速度" cannot be optimised until it is a
+# number. It is two: the MEDIAN ACROSS REGIONS and the WORST REGION. A config
+# only wins when both improve -- one region going to 1.5 Gbps while another sits
+# at 120 is not an improvement, and eight rounds of single-screenshot comparison
+# could not see the difference.
+render_region_table() {
+  [[ -r "$MEASURE_LOG" ]] || { info "还没有记录。跑测速时中途按 8，诊断会自动记一行"; return 0; }
+  local out
+  out="$(awk -F'\t' '
+    NF >= 7 && $7 != "" && $7 != "-" && $2 + 0 > 0 {
+      fp = $3; peer = $7
+      k = fp "\x01" peer
+      if (!(k in seen)) { seen[k] = 1; peers[fp] = peers[fp] " " peer }
+      if (!(fp in fpseen)) { fpseen[fp] = 1; order[++nfp] = fp }
+      n[k]++
+      vals[k, n[k]] = $2 + 0
+      if (worst[k] == 0 || $2 + 0 < worst[k]) worst[k] = $2 + 0
+      rtt[k] = $6
+      if ($9 != "" && $9 != "-") { sw[k] += $9 + 0; swn[k]++ }
+    }
+    function median(k, c,   i, j, t, a) {
+      for (i = 1; i <= c; i++) a[i] = vals[k, i]
+      for (i = 1; i < c; i++) for (j = i + 1; j <= c; j++)
+        if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+      return (c % 2) ? a[(c + 1) / 2] : (a[c / 2] + a[c / 2 + 1]) / 2
+    }
+    END {
+      if (nfp < 1) exit 1
+      for (f = 1; f <= nfp; f++) {
+        fp = order[f]
+        np = split(peers[fp], plist, " ")
+        printf "FP\t%s\t%d\n", fp, np
+        delete meds; nm = 0; worstall = 0
+        swsum = 0; swcnt = 0
+        for (p = 1; p <= np; p++) {
+          peer = plist[p]; if (peer == "") continue
+          k = fp "\x01" peer
+          med = median(k, n[k])
+          meds[++nm] = med
+          if (worstall == 0 || worst[k] < worstall) worstall = worst[k]
+          avgsw = (swn[k] > 0) ? sw[k] / swn[k] : 0
+          if (swn[k] > 0) { swsum += avgsw; swcnt++ }
+          printf "R\t%s\t%d\t%.0f\t%.0f\t%s\t%s\n",
+            peer, n[k], med, worst[k], (avgsw > 0 ? sprintf("%.1f", avgsw) : "-"), rtt[k]
+        }
+        for (i = 1; i < nm; i++) for (j = i + 1; j <= nm; j++)
+          if (meds[j] < meds[i]) { t = meds[i]; meds[i] = meds[j]; meds[j] = t }
+        overall = (nm % 2) ? meds[(nm + 1) / 2] : (meds[nm / 2] + meds[nm / 2 + 1]) / 2
+        printf "S\t%d\t%.0f\t%.0f\t%s\n", nm, overall, worstall,
+          (swcnt > 0 ? sprintf("%.1f", swsum / swcnt) : "-")
+      }
+    }' "$MEASURE_LOG")" || { info "还没有带地区的记录。跑测速时中途按 8"; return 0; }
+
+  title 'tcpwide 跨地区对比'
+  printf '  %b一套配置只有「跨地区中位」和「最差地区」同时变好才算赢。%b\n' "$DIM" "$RESET"
+  printf '  %b单个地区变快而另一个掉下去，不是改进——前面八轮就是这么看丢的。%b\n\n' "$DIM" "$RESET"
+  local kind a b c d e f
+  while IFS=$'\t' read -r kind a b c d e f; do
+    case "$kind" in
+      FP) printf '  %b%s%b  %s 个地区\n' "$BOLD" "$a" "$RESET" "$b"
+          # panel_pad, not %-24s: printf pads by BYTES and a CJK character is
+          # three of them for two columns, so a header with Chinese in it does
+          # not line up with the ASCII rows underneath.
+          printf '    %b%s %s %s %s %s %s%b\n' "$DIM" \
+            "$(panel_pad '地区（对端地址）' 24)" "$(panel_rpad '样本' 5)" \
+            "$(panel_rpad '中位' 7)" "$(panel_rpad '最差' 7)" \
+            "$(panel_rpad '抖动' 7)" "$(panel_rpad 'RTT' 8)" "$RESET" ;;
+      R)  printf '    %-24s %5s %7s %7s %7s %8s\n' "$a" "$b" "$c" "$d" \
+            "$( [[ "$e" == - ]] && printf -- '-' || printf '%s×' "$e" )" \
+            "$( [[ "$f" == - || -z "$f" ]] && printf -- '-' || printf '%s ms' "$f" )" ;;
+      S)  if (( a < 2 )); then
+            printf '    %b只有 %s 个地区的样本，给不出跨地区结论%b\n\n' "$YELLOW" "$a" "$RESET"
+          else
+            printf '    %b%s%b\n' "$DIM" '────────────────────────────────────────────────────────────' "$RESET"
+            printf '    %b跨地区中位 %s   最差地区 %s   平均抖动 %s%b\n\n' \
+              "$BOLD" "$b" "$c" "$( [[ "$d" == - ]] && printf -- '-' || printf '%s×' "$d" )" "$RESET"
+          fi ;;
+    esac
+  done <<< "$out"
+  printf '  %b每个后端各测一次、中途按 8，四个地区凑齐再改一个旋钮，是最快的收敛路径。%b\n\n' \
+    "$DIM" "$RESET"
+  return 0
 }
 
 # ── 同窗口采样 ─────────────────────────────────────────────────────────────
@@ -3183,6 +3334,15 @@ panel_pad() {
   printf '%s%s' "$s" "$pad"
 }
 
+# panel_pad right-aligns instead of left, for headers that sit over columns of
+# right-aligned numbers.
+panel_rpad() {
+  local str="${1-}" want="${2:-0}" have i pad=''
+  have="$(panel_cols "$str")"
+  for (( i = have; i < want; i++ )); do pad="$pad "; done
+  printf '%s%s' "$pad" "$str"
+}
+
 panel_dashes() {
   local n="${1:-0}" i out=''
   for (( i = 0; i < n; i++ )); do out="$out─"; done
@@ -3311,10 +3471,11 @@ render_panel() {
   panel_rule '工具'
   panel_menu_row \
     "$(panel_item 8 '诊断')" "$(panel_item 9 '预演')" \
-    "$(panel_item m '记一次实测')" "$(panel_item a '重新应用')"
+    "$(panel_item t '跨地区对比')" "$(panel_item a '重新应用')"
   panel_menu_row \
     "$(panel_item p '持久化')" "$(panel_item r '完整还原')" \
-    "$(panel_item h '看说明')" "$(panel_item 0 '退出')"
+    "$(panel_item m '手工补录')" "$(panel_item h '看说明')"
+  panel_menu_row "$(panel_item 0 '退出')"
   panel_rule
 }
 
@@ -3337,9 +3498,11 @@ panel_help() {
   printf '    s 单流旋钮   fq 参数、缓冲起步值、单流上限。可单独回退做 A/B/A\n'
   printf '    l 队列布局   root 单个 fq（有实测支撑）或 mq 挂叶子\n\n'
   printf '  %b工具%b\n' "$BOLD" "$RESET"
-  printf '    8 诊断       同一个窗口内同时采重传/CPU/socket/队列。测速跑着的时候用\n'
+  printf '    8 诊断       同一个窗口内同时采重传/CPU/socket/队列，并自动记一行到跨地区表\n'
   printf '    9 预演       逐项列出 当前值 → 目标值 和理由，不写入\n'
-  printf '    m 记一次实测 跑完测速把数字填进来，和当前配置绑在一起\n'
+  printf '    t 跨地区对比 按配置×地区聚合已记录的样本。跨地区中位 + 最差地区\n'
+  printf '                 才是「各地区综合」的定义，单个截图看不出来\n'
+  printf '    m 手工补录   诊断已经自动记了；这个留给补录\n'
   printf '    a 重新应用   重启后或队列被别的东西覆盖时用\n'
   printf '    p 持久化     写 /etc/sysctl.d 和 systemd unit\n'
   printf '    r 完整还原   回到 tcpwide 介入之前\n'
@@ -3446,6 +3609,10 @@ panel_diagnose() {
   else
     log "没有检测到冲突的调优工具"
   fi
+  # Recorded here rather than behind a keypress: the peak, the swing, the
+  # retransmission and the core load only exist while the transfer runs, so a
+  # later `m` cannot capture any of them. The operator presses 8 and is done.
+  record_diagnostic "${pct:--}" "${bmax:--}" || true
   diag_cleanup
   printf '\n'
 }
@@ -3604,8 +3771,17 @@ summarise_peers() {
     }' <<< "${1:-}"
 }
 
+# What the diagnostic found, for the recorder and the leg correlation to read.
+# The INBOUND leg is the one that identifies the region: the speedtest node
+# dials in, so its address is the backend the operator picked. All empty when
+# nothing qualified -- a diagnostic that found nothing must not write a row.
+DIAG_PEER=''; DIAG_RTT=0; DIAG_MEDIAN=0; DIAG_PEAK=0; DIAG_SWING=0
+DIAG_IN_SERIES=''; DIAG_OUT_SERIES=''
+
 render_connections() {
   local rows listen moved
+  DIAG_PEER=''; DIAG_RTT=0; DIAG_MEDIAN=0; DIAG_PEAK=0; DIAG_SWING=0
+  DIAG_IN_SERIES=''; DIAG_OUT_SERIES=
   rows="$(ss_metrics)" || { printf '\n  %b没有可用的 socket 样本（ss 缺失或窗口内没有连接）。%b\n' "$DIM" "$RESET"; return 0; }
   moved="$(ss_throughput 2>/dev/null || true)"
   listen=" $(ss -tlnH 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | tr '\n' ' ')"
@@ -3663,6 +3839,18 @@ render_connections() {
       body="$body$(printf '    %b在途或 mss 太小，cwnd×mss 和窗口比例算不出有意义的数，不作判断。%b\n' \
         "$DIM" "$RESET")"$'\n'
     fi
+    # Keep the busiest leg in each direction. Downstream identifies the region
+    # and carries the number worth recording; upstream is what the correlation
+    # check needs to know whether the sender was ever given anything to send.
+    if [[ "$leg" == 入站* ]]; then
+      if awk -v a="$mbps" -v b="$DIAG_MEDIAN" 'BEGIN {exit !(a > b)}'; then
+        DIAG_PEER="${peer%:*}"; DIAG_RTT="$rtt"; DIAG_MEDIAN="$mbps"
+        DIAG_IN_SERIES="$series"
+        IFS=$'\t' read -r _ _ DIAG_PEAK <<< "$(series_spread "$series" || printf '0\t0\t0')"
+      fi
+    else
+      [[ -n "$DIAG_OUT_SERIES" ]] || DIAG_OUT_SERIES="$series"
+    fi
     shown=$(( shown + 1 ))
   done <<< "$rows"
 
@@ -3678,6 +3866,59 @@ render_connections() {
   fi
   printf '  %b中继有两段 TCP，它们回答的是不同的问题，所以分开列。%b\n' "$DIM" "$RESET"
   printf '%s' "$body"
+  local sp_lo sp_med sp_hi
+  # shellcheck disable=SC2034 # the median is read positionally, not used here
+  if IFS=$'\t' read -r sp_lo sp_med sp_hi <<< "$(series_spread "$DIAG_IN_SERIES")" \
+     && (( sp_lo > 0 )); then
+    DIAG_SWING="$(awk -v h="$sp_hi" -v l="$sp_lo" 'BEGIN {printf "%.1f", h / l}')"
+  fi
+  render_leg_correlation
+  return 0
+}
+
+# Do the two legs stall in the SAME seconds?
+#
+# A relay carries backend->box and box->client. Every knob this tool touches is
+# on the sending side, but if the upstream leg goes quiet the sender has nothing
+# to send and no amount of send-side tuning moves it. That question has never
+# been asked, and it rules out half the search space in one line.
+LEG_DIP_RATIO=3
+render_leg_correlation() {
+  local verdict
+  [[ -n "$DIAG_IN_SERIES" && -n "$DIAG_OUT_SERIES" ]] || return 0
+  verdict="$(awk -v a="$DIAG_IN_SERIES" -v b="$DIAG_OUT_SERIES" -v k="$LEG_DIP_RATIO" '
+    BEGIN {
+      na = split(a, dn, " "); nb = split(b, up, " ")
+      n = (na < nb) ? na : nb
+      if (n < 3) exit 1
+      # A "dip" is a second at less than 1/k of that leg own peak.
+      for (i = 1; i <= n; i++) { if (dn[i] + 0 > pd) pd = dn[i] + 0
+                                 if (up[i] + 0 > pu) pu = up[i] + 0 }
+      if (pd <= 0 || pu <= 0) exit 1
+      for (i = 1; i <= n; i++) {
+        d = (dn[i] + 0 < pd / k); u = (up[i] + 0 < pu / k)
+        if (d) { dips++; if (u) both++ }
+      }
+      if (dips < 1) { print "steady\t0\t0"; exit 0 }
+      printf "%s\t%d\t%d", (both * 2 >= dips) ? "upstream" : "local", dips, both
+    }')" || return 0
+  local kind dips both
+  IFS=$'\t' read -r kind dips both <<< "$verdict"
+  printf '\n  %b两段腿按秒对齐%b\n' "$BOLD" "$RESET"
+  printf '    上游 后端→本机  %s\n' "$DIAG_OUT_SERIES"
+  printf '    下游 本机→客户  %s\n' "$DIAG_IN_SERIES"
+  case "$kind" in
+    steady)
+      printf '    %b→ 下游没有明显掉速，这一窗口不存在「掉速」这个现象。%b\n' "$GREEN" "$RESET" ;;
+    upstream)
+      printf '    %b→ 下游掉的 %s 秒里有 %s 秒上游也在掉：是上游供给不足。%b\n' \
+        "$YELLOW" "$dips" "$both" "$RESET"
+      printf '      %b本机是在等数据，不是发不出去——发送侧的旋钮改不动它。%b\n' "$DIM" "$RESET" ;;
+    local)
+      printf '    %b→ 下游掉的 %s 秒里只有 %s 秒上游也在掉：上游有货，下游没发出去。%b\n' \
+        "$YELLOW" "$dips" "$both" "$RESET"
+      printf '      %b这一段才是本机能改的（发送侧、单核调度、pacing）。%b\n' "$DIM" "$RESET" ;;
+  esac
   return 0
 }
 
@@ -3703,6 +3944,11 @@ panel_single_flow() {
     "$FLOW_MAXRATE_MBPS" "$DIM" "$RESET"
   printf '       %b0.22.0 及以前，这个值是从端口速率自动推出来的，不整形档也照样写。%b\n' "$DIM" "$RESET"
   printf '       %b0.23.0 起默认 0——限单流是个决定，不该从端口速率里猜出来。%b\n' "$DIM" "$RESET"
+  printf '    %b6)%b 慢启动 pacing 倍率     当前 %s%b（0 = 用内核的 200）%b\n' "$BOLD" "$RESET" \
+    "$PACING_SS_RATIO" "$DIM" "$RESET"
+  printf '       %binitcwnd 只决定第一个 RTT 发多少；这个决定后面每一个 RTT 爬多快。%b\n' "$DIM" "$RESET"
+  printf '       %b160ms 路径上从 1 MiB 爬到 20 MB 还要 4–5 个 RTT，提到 300 大约省掉一到两个。%b\n' "$DIM" "$RESET"
+  printf '       %b未实测。改完四个后端各测一次、中途按 8，再按 t 看跨地区表。%b\n' "$DIM" "$RESET"
   printf '    %b0)%b 返回\n\n' "$BOLD" "$RESET"
   local pick value
   read -r -p '  请选择 [0]: ' pick || return 0
@@ -3725,6 +3971,14 @@ panel_single_flow() {
        else info "已取消"; fi ;;
     5) if value="$(prompt_uint '单流上限 Mbps（0=不限速）' "$FLOW_MAXRATE_MBPS" 0 100000)"; then
          FLOW_MAXRATE_MBPS="$value"; save_config; cmd_apply
+       else info "已取消"; fi ;;
+    6) if value="$(prompt_uint '慢启动 pacing 倍率（0=用内核的 200，试 300）' \
+           "$PACING_SS_RATIO" 0 1000)"; then
+         if (( value > 0 && value < 100 )); then
+           warn "低于 100 等于让慢启动比测得的速率还慢，没有意义"
+         else
+           PACING_SS_RATIO="$value"; save_config; cmd_apply
+         fi
        else info "已取消"; fi ;;
     *) return 0 ;;
   esac
@@ -3839,6 +4093,7 @@ menu() {
       8) run_action panel_diagnose ;;
       9) run_action cmd_plan ;;
       m|M) run_action panel_record ;;
+      t|T) run_action render_region_table ;;
       s|S) run_action panel_single_flow ;;
       l|L) run_action panel_toggle_layout ;;
       a|A) run_action panel_reapply ;;

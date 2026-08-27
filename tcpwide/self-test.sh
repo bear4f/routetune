@@ -678,7 +678,7 @@ assert_eq bbr3 "$(pick_cc 'reno cubic bbr bbr3')" 'and a kernel that offers bbr3
 # 1 2 3 5 is how an operator ends up pressing 4 and getting the wrong knob.
 submenu_keys="$(sed -n '/^panel_single_flow()/,/^}/p' "$ROOT/tcpwide.sh" \
   | grep -oE "%b[0-9]\)%b" | grep -oE '[0-9]' | sort -u | tr -d '\n')"
-assert_eq 012345 "$submenu_keys" 'the single-flow submenu is numbered 1-5 with no gap'
+assert_eq 0123456 "$submenu_keys" 'the single-flow submenu is numbered 1-6 with no gap'
 
 
 # ── 0.4.0 对端窗口决定的单流上限 ───────────────────────────────────────────
@@ -1159,7 +1159,7 @@ pass 'a non-numeric reading is refused rather than logged'
 assert_eq '3' "$(awk 'END {print NR}' "$MEASURE_LOG")" 'the refused reading did not reach the log'
 # A tab in the note would split the record into the wrong fields.
 FAKE_Q='fq maxrate 950mbit' record_measurement 100 "$(printf 'a\tb')"
-assert_eq '4' "$(awk -F'\t' 'NF == 6 {n++} END {print n + 0}' "$MEASURE_LOG")" \
+assert_eq '4' "$(awk -F'\t' -v w="$MEASURE_FIELDS" 'NF == w {n++} END {print n + 0}' "$MEASURE_LOG")" \
   'a tab in the note cannot break the record into extra fields'
 rm -rf "$STATE_DIR"
 unset -f live_value current_default_route canonical_qdisc
@@ -2539,5 +2539,159 @@ out="$(summarise_peers 'a:80 b:443 a:80 c:80 a:80 d:80 e:80 f:80 a:80')"
 assert_eq '5' "$(grep -oE '[a-f]:[0-9]+' <<< "$out" | grep -c '')" \
   'at most five addresses are listed'
 pass 'the reject list folds duplicates and truncates'
+
+
+# ── 0.30.0 新杠杆默认不动 ──────────────────────────────────────────────────
+# This release froze the tuning defaults. tcp_pacing_ss_ratio is offered as a
+# knob because it has never been measured here, and an unmeasured value does not
+# get to be a default -- that mistake shipped a constant borrowed from tcpfit
+# that survived four releases on the operator's machine.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+cpu_count() { printf '1\n'; }
+live_value() { printf '\n'; }
+PACING_SS_RATIO=0
+[[ "$(target_sysctl 2000 180)" != *pacing_ss_ratio* ]] \
+  || fail 'the pacing ratio must not be written unless it was chosen'
+pass 'the frozen defaults stay frozen: no pacing ratio by default'
+PACING_SS_RATIO=300
+tgt="$(target_sysctl 2000 180)"
+assert_eq '300' "$(awk -F'\t' '$1 == "net.ipv4.tcp_pacing_ss_ratio" {print $2}' <<< "$tgt")" \
+  'an explicitly chosen pacing ratio is written'
+assert_eq 'exact' "$(awk -F'\t' '$1 == "net.ipv4.tcp_pacing_ss_ratio" {print $3}' <<< "$tgt")" \
+  'and exactly, since it is a chosen value rather than a ceiling'
+PACING_SS_RATIO=0
+unset -f live_value
+
+
+# ── 0.30.0 诊断自动记录 ────────────────────────────────────────────────────
+# The peak, the swing, the retransmission and the core load only exist while the
+# transfer runs, so pressing `m` afterwards cannot capture any of them. The
+# diagnostic is already sampling all of it, so it records, and the operator
+# presses nothing. The peer address IS the region: the speedtest node dials in.
+restore_lib
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+config_fingerprint() { printf 'fq/初窗64/起步1M\n'; }
+DIAG_PEER=''; DIAG_MEDIAN=0
+if record_diagnostic 0.004 42 >/dev/null 2>&1; then
+  fail 'a diagnostic that found nothing must not write a row'
+fi
+[[ -s "$MEASURE_LOG" ]] && fail 'and must leave the log untouched'
+pass 'no qualifying transfer means no record'
+DIAG_PEER='58.38.51.162'; DIAG_RTT=141; DIAG_MEDIAN=214; DIAG_PEAK=322; DIAG_SWING=3.2
+record_diagnostic 0.0047 42 >/dev/null || fail 'a real transfer must be recorded'
+assert_eq "$MEASURE_FIELDS" "$(awk -F'\t' 'END {print NF}' "$MEASURE_LOG")" \
+  'the row carries every column'
+IFS=$'\t' read -r _ r_mbps _ _ _ r_rtt r_peer r_peak r_swing r_retr r_cpu \
+  < "$MEASURE_LOG"
+assert_eq '214' "$r_mbps" 'the median rate is recorded'
+assert_eq '58.38.51.162' "$r_peer" 'the peer address is recorded, which is the region'
+assert_eq '141' "$r_rtt" 'with its RTT'
+assert_eq '322' "$r_peak" 'the peak, which no post-hoc keystroke could recover'
+assert_eq '3.2' "$r_swing" 'the swing'
+assert_eq '0.0047' "$r_retr" 'the retransmission rate from the same window'
+assert_eq '42' "$r_cpu" 'and the busiest core from the same window'
+# Empty fields collapse under `IFS=$'\t' read` -- tab is IFS whitespace -- and
+# shift every column after them. That has already produced one wrong panel line.
+DIAG_RTT=''; DIAG_PEAK=''; DIAG_SWING=''
+record_diagnostic '' '' >/dev/null
+assert_eq "$MEASURE_FIELDS" "$(awk -F'\t' 'END {print NF}' "$MEASURE_LOG")" \
+  'a row with unknown values still has every column'
+[[ "$(awk -F'\t' 'END {print $6 $8 $10}' "$MEASURE_LOG")" == '---' ]] \
+  || fail 'unknown values must be placeholders, never empty'
+pass 'the diagnostic records everything it measured, with no empty fields'
+
+
+# ── 0.30.0 跨地区对比 ──────────────────────────────────────────────────────
+# "各个地区综合都能保持一个高水平速度" cannot be optimised until it is a number.
+# It is two: the median across regions and the worst region. A config only wins
+# when both improve -- one region reaching 1.5 Gbps while another sits at 120 is
+# not an improvement, and eight rounds of single-screenshot comparison could not
+# see the difference.
+: > "$MEASURE_LOG"
+mkrow() {  # fingerprint mbps peer peak rtt swing
+  printf '%s\t%s\t%s\t诊断自动记录\t1\t%s\t%s\t%s\t%s\t0.004\t42\n' \
+    "$(date +%s)" "$2" "$1" "$5" "$3" "$4" "$6" >> "$MEASURE_LOG"
+}
+mkrow A 214 58.38.51.162 322 141 3.2
+mkrow A 190 58.38.51.162 300 141 3.0
+mkrow A 122 183.63.1.10  427 169 4.8
+mkrow A 790 113.108.9.5 1590 166 2.1
+mkrow B 520 58.38.51.162 700 141 1.5
+mkrow B 380 183.63.1.10  520 169 1.7
+mkrow B 810 113.108.9.5 1400 166 1.4
+out="$(render_region_table 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+[[ "$out" == *"58.38.51.162"*"202"* ]] || fail "two samples must median, not sum: [$out]"
+# Config A: region medians 202 / 122 / 790 -> median 202, worst 122.
+[[ "$out" == *"跨地区中位 202   最差地区 122"* ]] \
+  || fail "config A cross-region figures are wrong: [$out]"
+# Config B: 520 / 380 / 810 -> median 520, worst 380. Both better: that is a win.
+[[ "$out" == *"跨地区中位 520   最差地区 380"* ]] \
+  || fail "config B cross-region figures are wrong: [$out]"
+pass 'the table reduces each config to a cross-region median and a worst region'
+
+# One region is not a cross-region result, and must not be presented as one.
+: > "$MEASURE_LOG"
+mkrow C 900 113.108.9.5 1400 166 1.2
+out="$(render_region_table 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+[[ "$out" == *"只有 1 个地区的样本"* ]] || fail 'a single region must say so'
+# The banner text mentions the phrase; what must be absent is the computed line.
+[[ ! "$out" =~ 跨地区中位\ [0-9] ]] || fail 'and must not compute a cross-region median'
+pass 'one region is reported as one region, not as a verdict'
+
+# Old six-field rows predate the peer column and simply do not participate.
+: > "$MEASURE_LOG"
+printf '1756000000\t580\t老指纹\t岳阳\t1\t201\n' >> "$MEASURE_LOG"
+render_region_table >/dev/null 2>&1 || fail 'legacy rows must not break the table'
+best_measurement >/dev/null || fail 'and must still be readable by the old readers'
+pass 'rows written before 0.30.0 stay readable and are skipped by the table'
+rm -rf "$STATE_DIR"
+unset -f config_fingerprint mkrow
+
+
+# ── 0.30.0 两段腿按秒对齐 ──────────────────────────────────────────────────
+# A relay carries backend->box and box->client. Every knob this tool touches is
+# on the sending side, but if the upstream leg goes quiet the sender has nothing
+# to send. That question had never been asked, and it rules out half the search
+# space in one line.
+restore_lib
+DIAG_OUT_SERIES='1420 1390 140 120 1400 1380 130 110'
+DIAG_IN_SERIES='1400 1380 130 110 1390 1370 120 100'
+out="$(render_leg_correlation 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+[[ "$out" == *"上游供给不足"* ]] || fail "synchronised dips are upstream starvation: [$out]"
+[[ "$out" == *"发送侧的旋钮改不动它"* ]] || fail 'and the send side must be ruled out'
+pass 'dips on both legs at the same seconds are named as upstream starvation'
+
+DIAG_OUT_SERIES='1420 1390 1400 1410 1400 1380 1390 1400'
+out="$(render_leg_correlation 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+[[ "$out" == *"上游有货，下游没发出去"* ]] || fail 'a dip on one leg only is local'
+[[ "$out" != *"上游供给不足"* ]] || fail 'and must not be blamed upstream'
+pass 'a dip the upstream did not share is named as this box own'
+
+DIAG_IN_SERIES='1390 1380 1400 1370 1390 1370 1380 1400'
+out="$(render_leg_correlation 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+[[ "$out" == *"不存在「掉速」这个现象"* ]] || fail 'a steady window has nothing to explain'
+pass 'a window with no dips claims no cause'
+
+# Only one leg sampled: no correlation is possible and none is claimed.
+DIAG_OUT_SERIES=''
+assert_eq '' "$(render_leg_correlation 2>&1)" 'one leg alone yields no correlation'
+DIAG_IN_SERIES=''; DIAG_OUT_SERIES=''
+
+# A manual entry knows none of the diagnostic columns, but it still writes the
+# full row shape. A short row is not a smaller row -- readers taking a later
+# field by position would read past the end of it.
+restore_lib
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+config_fingerprint() { printf 'fp\n'; }
+record_measurement 580 '手工' 1 201
+assert_eq "$MEASURE_FIELDS" "$(awk -F'\t' 'END {print NF}' "$MEASURE_LOG")" \
+  'a manual record has the same shape as an automatic one'
+assert_eq '-' "$(awk -F'\t' 'END {print $7}' "$MEASURE_LOG")" \
+  'with placeholders where it has nothing to say'
+render_region_table >/dev/null 2>&1 || fail 'and the table must tolerate it'
+rm -rf "$STATE_DIR"
+unset -f config_fingerprint
 
 printf '\n%s\n' "All tcpwide self-tests passed ($PASS_COUNT assertions)."

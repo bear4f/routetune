@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.27.0"
+VERSION="0.28.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -144,7 +144,8 @@ RETIRED_SYSCTL=(
 # tcp_rmem/tcp_wmem -- which autotuning grows from. It decides how long the ramp
 # takes; it is not a cwnd and it is not a throughput ceiling.
 #
-# 0 means "leave the kernel's own starting size alone", and 0 is the default.
+# 0 means "leave the kernel's own starting size alone". Stable/balanced use 0;
+# the explicit throughput profiles use 1 MiB to shorten high-BDP ramp-up.
 #
 # 0.20.0 shipped 1048576 here, taken from tcpfit's proxy role. That was a
 # borrowing error twice over. tcpfit calls 1 MB the CONSERVATIVE end of its own
@@ -153,8 +154,8 @@ RETIRED_SYSCTL=(
 # recommendation. And tcpfit's 2.2x figure bundles every change it makes, so
 # this knob has never been independently measured, here or there.
 #
-# It stays available as an experiment (panel s), which is what an unmeasured
-# value is allowed to be.
+# It also stays directly adjustable in panel s, so the profile choice can be
+# isolated with an A/B/A instead of being welded to the rest of the preset.
 BUF_DEFAULT=0
 
 # Three different numbers used to share one variable, and sharing it was a bug
@@ -186,8 +187,9 @@ MIGRATED_FROM_EGRESS=0
 # 0.26.0 wrote 128 KiB as if it were a generally safe throughput default. A
 # config-version marker lets 0.27.0 retire that inherited value once, while
 # preserving every value an operator explicitly chooses from this release on.
-CONFIG_VERSION=27
+CONFIG_VERSION=28
 MIGRATED_NOTSENT_LOWAT=0
+MIGRATED_FAST_START=0
 IFACE=""
 SHAPE=1
 # Persist by default. Without it every reboot silently reverts the machine to
@@ -721,17 +723,21 @@ self_source() {
 }
 PROFILE=balanced
 
-# Profiles move three numbers and nothing else. A preset that quietly swapped in
-# a different mechanism would make the panel a liar about what is running.
+# Throughput profiles also move the buffer starting size. This is deliberately
+# NOT global: tcp_[rw]mem's middle value is paid per active socket, so a proxy
+# optimised for a few bulk flows and a many-client fairness box should not share
+# the same default. 1 MiB cuts roughly four doubling rounds versus the stock
+# 16-128 KiB starts on a 150 ms path; initcwnd/initrwnd 64 cuts another one to
+# two RTTs. fq/CAKE pacing is already in front of the larger opening window.
 apply_profile() {
   case "${1:-balanced}" in
-    stable)   SHAPE_PCT=90; INITCWND=16; SHAPE=1; PROFILE=stable ;;
-    balanced) SHAPE_PCT=95; INITCWND=20; SHAPE=1; PROFILE=balanced ;;
-    speed)    SHAPE_PCT=98; INITCWND=32; SHAPE=1; PROFILE=speed ;;
+    stable)   SHAPE_PCT=90; INITCWND=16; BUF_DEFAULT=0;       SHAPE=1; PROFILE=stable ;;
+    balanced) SHAPE_PCT=95; INITCWND=20; BUF_DEFAULT=0;       SHAPE=1; PROFILE=balanced ;;
+    speed)    SHAPE_PCT=98; INITCWND=64; BUF_DEFAULT=1048576; SHAPE=1; PROFILE=speed ;;
     # SHAPE_PCT is meaningless without shaping, but it is still set so that
     # switching back to a shaping profile does not inherit whatever the last one
     # left behind. Since 0.23.0 it no longer reaches any per-flow limit.
-    noshape)  SHAPE_PCT=98; INITCWND=20; SHAPE=0; PROFILE=noshape ;;
+    noshape)  SHAPE_PCT=98; INITCWND=64; BUF_DEFAULT=1048576; SHAPE=0; PROFILE=noshape ;;
     *) return 1 ;;
   esac
   return 0
@@ -777,16 +783,36 @@ load_config() {
       FQ_INITIAL_QUANTUM) is_uint "$value" && (( value <= 1048576 )) && FQ_INITIAL_QUANTUM="$value" ;;
       FQ_FLOW_LIMIT) is_uint "$value" && (( value <= 100000 )) && FQ_FLOW_LIMIT="$value" ;;
       FQ_LIMIT)      is_uint "$value" && (( value <= 1000000 )) && FQ_LIMIT="$value" ;;
-      BUF_DEFAULT)   is_uint "$value" && (( value >= 4096 && value <= 16777216 )) && BUF_DEFAULT="$value" ;;
+      BUF_DEFAULT)   is_uint "$value" \
+                       && (( value == 0 || (value >= 4096 && value <= 16777216) )) \
+                       && BUF_DEFAULT="$value" ;;
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
   # 131072 was tcpwide's unconditional default through 0.26.0. Carrying it
   # forward would defeat the new neutral default on the very machines this fix
   # targets. A current-version config may still select 131072 deliberately.
-  if (( loaded_version < CONFIG_VERSION )) && [[ "$NOTSENT_LOWAT" == 131072 ]]; then
+  if (( loaded_version < 27 )) && [[ "$NOTSENT_LOWAT" == 131072 ]]; then
     NOTSENT_LOWAT=0
     MIGRATED_NOTSENT_LOWAT=1
+  fi
+  # 0.28.0 turns the two explicitly throughput-oriented profiles into a warm
+  # start rather than making every profile pay the memory cost. Migrate only
+  # their old preset values; custom profiles and already-tuned values remain
+  # untouched.
+  if (( loaded_version < 28 )); then
+    case "$PROFILE" in
+      speed)
+        if [[ "$INITCWND" == 32 && "$BUF_DEFAULT" == 0 ]]; then
+          INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
+        fi
+        ;;
+      noshape)
+        if [[ "$INITCWND" == 20 && "$BUF_DEFAULT" == 0 ]]; then
+          INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
+        fi
+        ;;
+    esac
   fi
   # A rejected value on the final line leaves the loop with a non-zero status,
   # which under errexit would take the whole script down instead of just
@@ -1398,13 +1424,16 @@ buffer_knee_ms() {
 # the configuration that produced it. Pasted next to a measurement, this line
 # makes attribution a lookup instead of an argument.
 config_fingerprint() {
-  local cc buf layout cwnd
+  local cc buf layout cwnd rstart wstart
   cc="$(live_value net.ipv4.tcp_congestion_control)"
   buf="$(live_value net.core.rmem_max)"
+  rstart="$(live_value net.ipv4.tcp_rmem | awk '{print $2}')"
+  wstart="$(live_value net.ipv4.tcp_wmem | awk '{print $2}')"
   layout="$(canonical_qdisc 2>/dev/null || printf '?')"
   cwnd="$(current_default_route | grep -o 'initcwnd [0-9]*' | awk '{print $2}')"
-  printf '%s %s ｜ %s ｜ rmem %s MB ｜ %s ｜ initcwnd %s ｜ cover %s ms\n' \
-    "$PROGRAM" "$VERSION" "${cc:-?}" "$(mb "${buf:-0}")" "$layout" \
+  printf '%s %s ｜ %s ｜ rmem %s MB ｜ start %s/%s MB ｜ %s ｜ initcwnd %s ｜ cover %s ms\n' \
+    "$PROGRAM" "$VERSION" "${cc:-?}" "$(mb "${buf:-0}")" \
+    "$(mb "${rstart:-0}")" "$(mb "${wstart:-0}")" "$layout" \
     "${cwnd:-内核默认}" "$COVER_RTT_MS"
 }
 
@@ -2634,7 +2663,7 @@ cmd_apply() {
   fi
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"
   migration_notice
-  if (( MIGRATED_FROM_EGRESS == 1 || MIGRATED_NOTSENT_LOWAT == 1 )); then
+  if (( MIGRATED_FROM_EGRESS == 1 || MIGRATED_NOTSENT_LOWAT == 1 || MIGRATED_FAST_START == 1 )); then
     save_config
   fi
   warn_manual_buffer "$rate" "$rtt"
@@ -2669,6 +2698,11 @@ migration_notice() {
   if (( MIGRATED_NOTSENT_LOWAT == 1 )); then
     warn '旧配置的 tcp_notsent_lowat=131072 是历史默认值，现已改为恢复系统原值'
     printf '  %b128 KiB 只给 1.4 Gbps 连接约 0.75 ms 的应用补充时间；它不再作为通用吞吐默认。%b\n' \
+      "$DIM" "$RESET"
+  fi
+  if (( MIGRATED_FAST_START == 1 )); then
+    warn "旧的 ${PROFILE} 档已迁移为暖启动：initcwnd/initrwnd=64，缓冲起步值=1 MiB"
+    printf '  %b只改变新连接爬升速度，不增加缓冲上限；稳定/均衡档仍使用系统起步值。%b\n' \
       "$DIM" "$RESET"
   fi
 }
@@ -3247,7 +3281,7 @@ panel_help() {
   printf '    7 首窗       initcwnd，内核默认 10\n'
   printf '    b 缓冲上限   接收缓冲上限。填 0 = 按端口和覆盖 RTT 自动推导\n'
   printf '    n 未发送上限 tcp_notsent_lowat。默认恢复系统值；非零只做 A/B/A\n'
-  printf '    s 单流旋钮   fq 参数、缓冲起步值、单流上限。都还没单独实测过\n'
+  printf '    s 单流旋钮   fq 参数、缓冲起步值、单流上限。可单独回退做 A/B/A\n'
   printf '    l 队列布局   root 单个 fq（有实测支撑）或 mq 挂叶子\n\n'
   printf '  %b工具%b\n' "$BOLD" "$RESET"
   printf '    8 诊断       同一个窗口内同时采重传/CPU/socket/队列。测速跑着的时候用\n'
@@ -3632,7 +3666,7 @@ panel_single_flow() {
            "$FQ_FLOW_LIMIT" 0 100000)"; then
          FQ_FLOW_LIMIT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
-    4) if value="$(prompt_uint '缓冲起步值 字节（0=用内核的；1048576 是 tcpfit 的代理档，未独立实测）' \
+    4) if value="$(prompt_uint '缓冲起步值 字节（0=系统值；高速档默认 1048576，可单独 A/B/A）' \
            "$BUF_DEFAULT" 0 16777216)"; then
          BUF_DEFAULT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
@@ -3820,10 +3854,10 @@ cmd_install() {
     local dflt=2 tight=0
     if cake_over_budget "$LINK_MBPS"; then dflt=4; tight=1; fi
     printf '\n  %b档位%b\n' "$BOLD" "$RESET"
-    printf '    1) 整形 90%%    首窗 16   丢包敏感、跨境线路\n'
-    printf '    2) 整形 95%%    首窗 20   多设备共享，要按设备公平\n'
-    printf '    3) 整形 98%%    首窗 32   几乎等于不整形，却付全额 CAKE 开销\n'
-    printf '    4) 不整形      首窗 20   只做 pacing；CPU 不够时这是最快的\n'
+    printf '    1) 整形 90%%    首窗 16   系统起步值｜丢包敏感、跨境线路\n'
+    printf '    2) 整形 95%%    首窗 20   系统起步值｜多设备共享、公平\n'
+    printf '    3) 整形 98%%    首窗 64   1MiB 暖启动｜仍付全额 CAKE 开销\n'
+    printf '    4) 不整形      首窗 64   1MiB 暖启动｜pacing、最高吞吐\n'
     if (( tight == 1 )); then
       printf '\n  %b[!] 这台机器 %s 核，整形 %s Mbps 超出 CAKE 的处理能力%b\n' \
         "$YELLOW" "$(cpu_count)" "$LINK_MBPS" "$RESET"
@@ -3916,7 +3950,7 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
 参数：
   --egress <Mbps>    出口带宽。整形必须知道这个数
   --cover-rtt <ms>   覆盖 RTT，默认 250。按你最远的客户端填，不是按你自己
-  --initcwnd <N>     默认路由首窗，默认 20（内核默认是 10）
+  --initcwnd <N>     默认路由首窗，随档位为 16/20/64（内核默认 10）
   --shape-pct <N>    整形到出口带宽的百分之多少，默认 95
   --iface <名字>     出口网卡，默认自动探测
   --profile <名字>   stable | balanced | speed | noshape

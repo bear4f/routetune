@@ -285,16 +285,26 @@ pass 'a rejected value on the final line does not abort under errexit'
 rm -rf "$tmp"
 
 # ── 0.2.0 档位 ─────────────────────────────────────────────────────────────
-# Profiles move three numbers and nothing else. A preset that quietly swapped in
-# a different mechanism would make the panel a liar about what is running.
+# Throughput profiles now own the warm-start value as well; assert every field
+# so switching profiles cannot accidentally retain a previous memory policy.
 apply_profile stable
-assert_eq '90|16|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the stable profile trades peak for headroom'
+assert_eq '90|16|0|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'the stable profile trades peak for headroom without warm-start memory'
 apply_profile balanced
-assert_eq '95|20|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the balanced profile is the documented middle'
+assert_eq '95|20|0|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'the balanced profile keeps the system buffer start'
 apply_profile speed
-assert_eq '98|32|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the speed profile shapes closer to the line rate'
+assert_eq '98|64|1048576|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'the high-throughput shaped profile gets a warm start'
+speed_tgt="$(target_sysctl 2000 150)"
+assert_eq '1048576' "$(awk -F'\t' '$1 == "net.ipv4.tcp_rmem" {split($2,v," "); print v[2]}' <<< "$speed_tgt")" \
+  'the warm receive start reaches the applied tuple'
+assert_eq '1048576' "$(awk -F'\t' '$1 == "net.ipv4.tcp_wmem" {split($2,v," "); print v[2]}' <<< "$speed_tgt")" \
+  'the warm send start reaches the applied tuple'
 apply_profile noshape
 assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
+assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'the no-shape profile warms both startup controls'
 [[ "$(target_qdisc 500 250)" == fq* && "$(target_qdisc 500 250)" != *maxrate* ]] \
   || fail 'the no-shape profile yields paced fq, not cake'
 pass 'the no-shape profile yields paced fq, not cake'
@@ -732,10 +742,12 @@ BUF_MB=0
 # things depending on what had been chosen before it.
 apply_profile speed
 apply_profile noshape
-assert_eq '98|20|0' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the no-shape profile sets every value it depends on'
+assert_eq '98|64|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'the no-shape profile sets every value it depends on'
 apply_profile stable
 apply_profile noshape
-assert_eq '98|20|0' "$SHAPE_PCT|$INITCWND|$SHAPE" 'and does so regardless of what preceded it'
+assert_eq '98|64|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'and does so regardless of what preceded it'
 apply_profile balanced
 
 
@@ -1040,12 +1052,14 @@ unset -f tc ip has
 live_value() { case "$1" in
   net.ipv4.tcp_congestion_control) printf 'bbr\n' ;;
   net.core.rmem_max) printf '45438293\n' ;;
+  net.ipv4.tcp_rmem) printf '4096 1048576 45438293\n' ;;
+  net.ipv4.tcp_wmem) printf '4096 1048576 45438293\n' ;;
 esac; }
 canonical_qdisc() { printf 'fq maxrate 980Mbit\n'; }
 current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 20\n'; }
 COVER_RTT_MS=176
 fp="$(config_fingerprint)"
-for want in "$VERSION" bbr 43.3 'fq maxrate 980Mbit' 'initcwnd 20' '176 ms'; do
+for want in "$VERSION" bbr 43.3 'start 1.0/1.0 MB' 'fq maxrate 980Mbit' 'initcwnd 20' '176 ms'; do
   [[ "$fp" == *"$want"* ]] || fail "the fingerprint must carry $want"
 done
 pass 'the fingerprint identifies version, cc, buffer, layout, initcwnd and coverage'
@@ -1865,9 +1879,34 @@ load_config
 assert_eq '131072' "$NOTSENT_LOWAT" 'a current explicit 128 KiB experiment is preserved'
 assert_eq '0' "$MIGRATED_NOTSENT_LOWAT" 'a current config is not migrated again'
 rm -f "$CONFIG_FILE"
+
+# 0.28.0 moves only the two throughput profiles to a warm start. The exact old
+# preset migrates once; a current schema carrying the same numbers is an
+# operator choice and must not be overwritten.
+CONFIG_FILE="$(mktemp)"
+printf 'CONFIG_VERSION=27\nPROFILE=noshape\nSHAPE=0\nINITCWND=20\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_FAST_START=0
+load_config
+assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'the old no-shape preset migrates to the warm start'
+assert_eq '1' "$MIGRATED_FAST_START" 'the warm-start migration is announced'
+printf 'CONFIG_VERSION=27\nPROFILE=speed\nSHAPE=1\nINITCWND=32\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_FAST_START=0
+load_config
+assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'the old high-throughput shaped preset migrates too'
+printf 'CONFIG_VERSION=28\nPROFILE=noshape\nSHAPE=0\nINITCWND=20\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=1; INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=0
+load_config
+assert_eq '20|0' "$INITCWND|$BUF_DEFAULT" \
+  'a current explicit cold start is preserved'
+assert_eq '0' "$MIGRATED_FAST_START" 'the current profile is not migrated twice'
+rm -f "$CONFIG_FILE"
 CONFIG_FILE="/etc/tcpwide.conf"
 MIGRATED_FROM_EGRESS=0
 MIGRATED_NOTSENT_LOWAT=0
+MIGRATED_FAST_START=0
+apply_profile balanced
 
 
 # ── 0.23.0 持久化复现实际布局 ──────────────────────────────────────────────

@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1585,7 +1585,20 @@ render_region_table() {
   local out
   out="$(awk -F'\t' '
     NF >= 7 && $7 != "" && $7 != "-" && $2 + 0 > 0 {
-      fp = $3; peer = $7
+      # Group by the CONFIGURATION, not by the version that wrote it.
+      #
+      # config_fingerprint leads with "tcpwide <version> ｜ ", so a version bump
+      # split the history of one configuration into two groups that could never sit
+      # in the same row -- even when the two versions produced byte-identical
+      # apply output. The table exists to answer "did this change help", and it
+      # was being blinded by its own version number: 0.30.0 and 1.0.0 samples
+      # never compared, though nothing between them touched the apply path.
+      #
+      # Stripping the prefix at read time fixes rows already on disk too, so no
+      # stored data has to be rewritten.
+      fp = $3
+      sub(/^[a-z]+ [0-9]+\.[0-9]+\.[0-9]+ ｜ /, "", fp)
+      peer = $7
       k = fp "\x01" peer
       if (!(k in seen)) { seen[k] = 1; peers[fp] = peers[fp] " " peer }
       if (!(fp in fpseen)) { fpseen[fp] = 1; order[++nfp] = fp }
@@ -3423,23 +3436,16 @@ render_panel() {
   printf '%b%s%b\n\n' "$DIM" "$RULE" "$RESET"
 
   cwnd_now="$(current_default_route 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}' || true)"
-  # A fresh install has no history, and printing "-" there tells a first-time
-  # operator nothing. Naming the key that fills it teaches the workflow instead:
-  # press 8 while a transfer is running and the diagnostic records everything.
-  local best_cell='按 8 记录'
+  local best_cell='-'
   local brow bm _bf _bn bw
   if brow="$(best_measurement)"; then
     IFS=$'\t' read -r bm _bf _bn bw <<< "$brow"
     best_cell="$bm Mbps"
     [[ "$bw" != - && -n "$bw" ]] && best_cell="$best_cell  ${bw%% *}"
   fi
-  # 0 means "leave the kernel's value alone", and a bare 0 in a panel reads as
-  # "this is set to zero" -- the opposite.
-  local notsent_cell="$NOTSENT_LOWAT"
-  [[ "$NOTSENT_LOWAT" == 0 ]] && notsent_cell='系统默认'
   panel_row '覆盖 RTT' "$COVER_RTT_MS ms" '缓冲上限' "$(mb "$show_buf") MB/socket"
   panel_row '首窗' "${cwnd_now:-内核默认}" '根队列' "$(short_qdisc "${live_q:-未知}" || true)"
-  panel_row '历史最好' "$best_cell" '未发送' "$notsent_cell"
+  panel_row '历史最好' "$best_cell" '未发送' "${NOTSENT_LOWAT}"
 
   # Alerts only exist when something is wrong, so they cost nothing when it is
   # not. These are the three that have actually mattered on live machines.
@@ -4144,6 +4150,17 @@ cmd_install() {
   resolve_iface
   printf '  出口网卡：%s\n' "$IFACE"
   printf '  内核拥塞控制：%s → 将选用 %s\n\n' "$(available_cc)" "$(pick_cc "$(available_cc)")"
+  # Re-running install IS the upgrade path, so it must not quietly change what
+  # is already configured. Every prompt defaults to the saved value; a live
+  # measurement is offered as a suggestion beside it, never in place of it.
+  #
+  # Before this, the coverage RTT defaulted to whatever suggest_cover_rtt
+  # happened to measure -- or to the constant 250 when it measured nothing --
+  # so an operator upgrading from a configured 180 and pressing Enter got 250
+  # without being told anything had changed.
+  local upgrade=0
+  [[ -r "$CONFIG_FILE" ]] && upgrade=1
+  (( upgrade == 1 )) && info "读到已有配置，下面每一项的默认值就是你现在的设置"
   local sug_rtt=250 row
   if (( interactive == 1 )); then
     drain_stdin
@@ -4152,7 +4169,12 @@ cmd_install() {
     LINK_MBPS="$value"
     printf '\n'
     explain_cover_rtt "$LINK_MBPS"
-    if row="$(suggest_cover_rtt)"; then sug_rtt="$(cut -f1 <<< "$row")"; fi
+    if row="$(suggest_cover_rtt)"; then
+      sug_rtt="$(cut -f1 <<< "$row")"
+      (( upgrade == 1 )) && printf '  %b实测建议 %s ms（当前配置是 %s ms，回车保持不变）%b\n' \
+        "$DIM" "$sug_rtt" "$COVER_RTT_MS" "$RESET"
+    fi
+    (( upgrade == 1 )) && sug_rtt="$COVER_RTT_MS"
     value="$(prompt_uint '覆盖 RTT（ms）' "$sug_rtt" 10 2000)" || die "已取消安装"
   else
     # Measured if there is traffic to measure, otherwise the documented default.
@@ -4168,6 +4190,13 @@ cmd_install() {
     # ended up on `cake bandwidth 980Mbit` at half the throughput `fq` gave it.
     local dflt=2 tight=0
     if cake_over_budget "$LINK_MBPS"; then dflt=4; tight=1; fi
+    # On an upgrade the saved profile wins over the machine heuristic, for the
+    # same reason: pressing Enter must keep what you already chose.
+    if (( upgrade == 1 )); then
+      case "$PROFILE" in
+        stable) dflt=1 ;; balanced) dflt=2 ;; speed) dflt=3 ;; noshape) dflt=4 ;;
+      esac
+    fi
     printf '\n  %b档位%b\n' "$BOLD" "$RESET"
     printf '    1) 整形 90%%    首窗 16   系统起步值｜丢包敏感、跨境线路\n'
     printf '    2) 整形 95%%    首窗 20   系统起步值｜多设备共享、公平\n'
@@ -4180,6 +4209,9 @@ cmd_install() {
         "$DIM" "$RESET"
       printf '  %b所以默认给 4。真要按设备公平，选 2——会自动加 no-split-gso 降开销。%b\n' \
         "$DIM" "$RESET"
+    fi
+    if (( upgrade == 1 )); then
+      printf '\n  %b当前是 %s，回车保持不变%b\n' "$DIM" "$(profile_label "$PROFILE")" "$RESET"
     fi
     read -r -p "  请选择 [$dflt]: " answer || answer="$dflt"
     case "${answer:-$dflt}" in

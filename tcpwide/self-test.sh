@@ -2803,4 +2803,74 @@ fi
 pass 'the version has exactly one source of truth'
 unset -f live_value
 
+
+# ── 1.0.1 分组按配置，不按版本号 ───────────────────────────────────────────
+# config_fingerprint leads with "tcpwide <version> ｜ ", and the cross-region
+# table grouped by the whole string. So a version bump split one configuration's
+# history into two groups that could never share a row -- even when the two
+# versions produced byte-identical apply output, which 0.30.0 and 1.0.0 did.
+#
+# The table exists to answer "did this change help". It was blinded by its own
+# version number, which is why the question had to be argued instead of looked
+# up.
+restore_lib
+STATE_DIR="$(mktemp -d)"; MEASURE_LOG="$STATE_DIR/measurements"
+cfg='bbr ｜ rmem 86.8 MB ｜ start 1.0/1.0 MB ｜ fq limit 10240p ｜ initcwnd 64 ｜ cover 180 ms'
+other='bbr ｜ rmem 43.3 MB ｜ start 0.0/0.0 MB ｜ fq ｜ initcwnd 20 ｜ cover 180 ms'
+row() {  # fingerprint mbps peer
+  printf '%s\t%s\t%s\t自动\t1\t133\t%s\t1400\t1.3\t0.004\t42\n' \
+    "$(date +%s)" "$2" "$1" "$3" >> "$MEASURE_LOG"
+}
+row "tcpwide 0.30.0 ｜ $cfg" 1080 58.38.51.162
+row "tcpwide 1.0.0 ｜ $cfg"   980 58.38.51.162
+row "tcpwide 1.0.0 ｜ $other"  400 58.38.51.162
+out="$(render_region_table 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+# Same configuration under two versions is ONE group of two samples.
+[[ "$out" == *"58.38.51.162"*"2"*"1030"* ]] \
+  || fail "two versions of one configuration must share a row: [$out]"
+pass 'a version bump no longer splits one configuration into two groups'
+# A genuinely different configuration still gets its own group.
+assert_eq '2' "$(grep -c '地区（对端地址）' <<< "$out")" \
+  'and a configuration that really differs stays separate'
+# The version must not survive into the group heading, or the split is back.
+[[ "$out" != *"tcpwide 0.30.0"* && "$out" != *"tcpwide 1.0.0"* ]] \
+  || fail 'the group heading must be the configuration, not the version'
+pass 'the grouping key is the configuration alone'
+rm -rf "$STATE_DIR"
+unset -f row
+
+# The fingerprint still CARRIES the version where it is displayed -- that is
+# what a screenshot needs in order to say which build produced it.
+live_value() { printf '\n'; }
+canonical_qdisc() { printf 'fq\n'; }
+current_default_route() { printf 'default via 10.0.0.1 dev eth0 initcwnd 64\n'; }
+[[ "$(config_fingerprint)" == "tcpwide $VERSION"* ]] \
+  || fail 'the displayed fingerprint must still name the version'
+pass 'the fingerprint still identifies the build it came from'
+unset -f live_value canonical_qdisc current_default_route
+
+
+# ── 1.0.1 升级不得静默改掉已有配置 ─────────────────────────────────────────
+# Re-running install IS the upgrade path. The coverage RTT used to default to
+# whatever suggest_cover_rtt measured, or to the constant 250 when it measured
+# nothing -- so upgrading from a configured 180 and pressing Enter silently
+# produced 250. The profile defaulted to a machine heuristic for the same
+# reason.
+restore_lib
+wizard="$(sed -n '/^cmd_install()/,/^}/p' "$ROOT/tcpwide.sh")"
+# shellcheck disable=SC2016 # matching source text literally, not expanding it
+[[ "$wizard" == *'[[ -r "$CONFIG_FILE" ]] && upgrade=1'* ]] \
+  || fail 'install must detect that it is upgrading an existing configuration'
+# shellcheck disable=SC2016 # likewise
+[[ "$wizard" == *'(( upgrade == 1 )) && sug_rtt="$COVER_RTT_MS"'* ]] \
+  || fail 'on upgrade the coverage RTT must default to the saved value'
+[[ "$wizard" == *'stable) dflt=1 ;; balanced) dflt=2 ;; speed) dflt=3 ;; noshape) dflt=4 ;;'* ]] \
+  || fail 'on upgrade the profile must default to the saved profile'
+pass 'the upgrade wizard defaults to what is already configured'
+# The measurement is still offered -- as a suggestion beside the default, not
+# in place of it.
+[[ "$wizard" == *'实测建议'* ]] || fail 'the measured suggestion must still be shown'
+[[ "$wizard" == *'回车保持不变'* ]] || fail 'and the operator told what Enter does'
+pass 'the live measurement is a suggestion, not a silent substitution'
+
 printf '\n%s\n' "All tcpwide self-tests passed ($PASS_COUNT assertions)."

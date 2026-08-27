@@ -2281,4 +2281,111 @@ assert_eq '50' "$SAMPLE_MBPS_FLOOR" 'the delivery_rate path keeps its protective
 assert_eq '5' "$DIAG_MIN_MBPS" 'and the measured path uses a much lower one'
 
 
+# ── 0.26.0 每秒序列：一个平均值描述不了不稳 ────────────────────────────────
+# A link bursting to 1.4 Gbps and stalling has the same eight-second average as
+# one running steadily at 750, and they are not the same problem. On the live
+# node the same connection was caught with in-flight at exactly 100% of the
+# peer's window -- instantaneously capable of 1432 Mbps -- while its
+# eight-second average read 426.
+restore_lib
+DIAG_DIR="$(mktemp -d)"
+series_fixture() {  # rates...
+  local i=0 by=0 r
+  for r in "$@"; do
+    {
+      printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+      printf 'ESTAB 0 0 10.0.0.5:443 [::ffff:58.38.51.162]:5602\n'
+      printf '\t bbr rtt:131.8/4 mss:1448 cwnd:46935 unacked:16308 snd_wnd:23592960'
+      printf ' bytes_sent:%s bytes_received:1000 pacing_rate 4112.7Mbps' "$by"
+      printf ' rwnd_limited:8000us(8.1%%) sndbuf_limited:24000us(24.0%%) retrans:0/0\n'
+      printf '\t skmem:(r0,rb131072,t0,tb90995370,f0,w20000000,o0,bl0,d0)\n'
+    } > "$DIAG_DIR/ss.$i"
+    by=$(( by + r * 125000 ))
+    i=$(( i + 1 ))
+  done
+  DIAG_SS_LAST=$(( i - 1 ))
+}
+series_fixture 1400 1400 120 100 1400 1400 110 90 0
+row="$(ss_throughput)"
+IFS=$'\t' read -r _ _ overall status series <<< "$row"
+assert_eq 'ok' "$status" 'the burst-stall connection is measurable'
+assert_eq '1400 1400 120 100 1400 1400 110 90' "$series" \
+  'the per-second series reproduces the shape the average hides'
+# The average is not wrong, it is answering a different question.
+assert_eq '752.5' "$overall" 'and the eight-second average is what it always was'
+IFS=$'\t' read -r sp_lo sp_med sp_hi <<< "$(series_spread "$series")"
+assert_eq '90' "$sp_lo" 'the floor of the swing is reported'
+assert_eq '760' "$sp_med" 'and the median, which is neither the peak nor the average'
+assert_eq '1400' "$sp_hi" 'and the peak'
+render_series_swing "$series" >/dev/null || fail 'a 15x swing must be called out'
+pass 'a swinging link is distinguished from a steady one at the same average'
+
+# A steady link must NOT be accused of swinging.
+series_fixture 700 720 690 710 700 705 695 700 0
+IFS=$'\t' read -r _ _ _ _ series <<< "$(ss_throughput)"
+if render_series_swing "$series" >/dev/null 2>&1; then
+  fail 'a link within a few percent of steady is not a swing'
+fi
+pass 'a steady link raises nothing'
+
+# The extrapolation has to rest on the median, not on a peak. One 1.4 Gbps
+# second inside a window whose core was 8% busy produced "单核上限约 9882 Mbps".
+series_fixture 1400 100 100 100 100 100 100 100 0
+total="$(diag_total_mbps)"
+awk -v t="$total" 'BEGIN {exit !(t < 200)}' \
+  || fail "the total must follow the median, not the peak: got $total"
+pass 'one burst cannot drag the single-core extrapolation up with it'
+rm -rf "$DIAG_DIR"; DIAG_DIR=""; DIAG_SS_LAST=0
+unset -f series_fixture
+
+
+# ── 0.26.0 对端窗口换算成 Mbps ─────────────────────────────────────────────
+# 22.5 MB is a number; 1432 Mbps is the ceiling it is. The live node measured a
+# 1400 Mbps peak against exactly this window, which is what settles where the
+# peak comes from -- and it is the client's rmem, not anything on this box.
+restore_lib
+live_value() { case "$1" in *notsent_lowat) printf '131072\n' ;; *) printf '\n' ;; esac; }
+out="$(render_conn_evidence 1.2.3.4:443 131.8 1448 46935 16308 23592960 14480 \
+  4112.7 426 8.1 0.0 0 131072 90995370 20000000 '' 90995370 2>&1)"
+[[ "$out" == *"1432 Mbps 的上限"* ]] || fail "the peer window must be stated as a rate: [$out]"
+[[ "$out" == *"指向对端接收窗口"* ]] || fail 'in-flight at the window is a peer ceiling'
+[[ "$out" == *"÷ RTT 131.8 ms = 1432 Mbps"* ]] || fail 'and the verdict must carry the arithmetic'
+[[ "$out" == *"客户端的 rmem"* ]] || fail 'and say whose it is'
+pass 'the peer window is reported as the rate ceiling it represents'
+
+
+# ── 0.26.0 sndbuf 已经顶到 wmem_max 时不能说「wmem 不够」 ──────────────────
+# The live node was told "wmem 不够" against an sndbuf of 86.8 MB -- which IS
+# wmem_max. That sends the operator to a knob that cannot move. When the buffer
+# is already at the ceiling the remaining candidate is how fast the application
+# refills it, and notsent_lowat is what governs that.
+out="$(render_conn_evidence 1.2.3.4:443 131.8 1448 46935 8000 23592960 14480 \
+  4112.7 426 0.0 24.0 0 131072 90995370 20000000 '' 90995370 2>&1)"
+[[ "$out" != *"wmem 不够"* ]] || fail 'wmem cannot be the fix when sndbuf is already wmem_max'
+[[ "$out" == *"已经贴着 wmem_max"* ]] || fail 'it must say the buffer is at its ceiling'
+[[ "$out" == *"notsent_lowat"* ]] || fail 'and name the knob that can still move'
+[[ "$out" == *ms* ]] || fail 'expressed as time, which is the unit that makes it decidable'
+pass 'a buffer at its ceiling points at the refill rate, not at the ceiling'
+
+# But a buffer with room left really is still growing, and says so.
+out="$(render_conn_evidence 1.2.3.4:443 131.8 1448 46935 8000 23592960 14480 \
+  4112.7 426 0.0 24.0 0 131072 4194304 20000000 '' 90995370 2>&1)"
+[[ "$out" == *"还没长到 wmem_max"* ]] || fail 'a growing buffer is described as growing'
+[[ "$out" != *"已经贴着"* ]] || fail 'and not as capped'
+pass 'a buffer with headroom is described differently from one without'
+unset -f live_value
+
+
+# ── 0.26.0 拒绝列表去重 ────────────────────────────────────────────────────
+# The raw list dumped sixteen addresses on one line with 184.28.121.22:80 four
+# times over. A list nobody reads is not accountability.
+restore_lib
+out="$(summarise_peers 'a:80 b:443 a:80 c:80 a:80 d:80 e:80 f:80 a:80')"
+[[ "$out" == *"a:80×4"* ]] || fail "duplicates must fold with a count: [$out]"
+[[ "$(grep -o 'a:80' <<< "$out" | grep -c '')" == 1 ]] || fail 'and appear once'
+[[ "$out" == *"还有 1 个地址"* ]] || fail 'and the tail must say how many were left out'
+assert_eq '5' "$(grep -oE '[a-f]:[0-9]+' <<< "$out" | grep -c '')" \
+  'at most five addresses are listed'
+pass 'the reject list folds duplicates and truncates'
+
 printf '\n%s\n' "All tcpwide self-tests passed ($PASS_COUNT assertions)."

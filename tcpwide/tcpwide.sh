@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.25.0"
+VERSION="0.26.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -1491,8 +1491,7 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # column after it, which has produced a wrong panel line twice in this file.
 # Throughput actually observed, per connection, from the window's ss dumps.
 #
-# Emits `local<TAB>peer<TAB>mbps<TAB>status`, one row per connection SEEN,
-# including the ones with no usable rate -- the status column says which:
+# Emits `local<TAB>peer<TAB>mbps<TAB>status<TAB>per-second series`:
 #
 #   ok        measured between its own first and last appearance
 #   onesample seen in exactly one dump, so there is no interval to divide by
@@ -1505,20 +1504,34 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # Each connection is measured over ITS OWN interval, not the window's: a flow
 # alive for three of eight seconds is a three-second measurement, and dividing
 # its bytes by eight would understate it by more than half.
+#
+# The fifth column is why 0.26.0 exists. One average over eight seconds cannot
+# describe a link that bursts to 1.4 Gbps and stalls: the same connection was
+# caught with its in-flight bytes at exactly 100% of the peer's window --
+# instantaneously capable of 1432 Mbps -- while its eight-second average read
+# 426. The average was not wrong, it was answering a different question than
+# the one being asked.
 ss_throughput() {
   local files
   files="$(diag_ss_files)" || return 1
   # shellcheck disable=SC2086 # deliberate word splitting on the newline list
   awk '
-    function flush(   k, tot) {
+    function flush(   k, tot, c) {
       if (peer == "") return
       k = lcl "\t" peer
       tot = sent + recv
-      if (!(k in firstidx)) { firstidx[k] = idx; firstb[k] = tot }
-      lastidx[k] = idx; lastb[k] = tot
+      if (!(k in cnt)) { cnt[k] = 0; order[++norder] = k }
+      c = ++cnt[k]
+      ix[k, c] = idx; by[k, c] = tot
       peer = ""
     }
     function num(tok,   p) { p = index(tok, ":"); return substr(tok, p + 1) + 0 }
+    function median(a, n,   i, j, t) {
+      for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+        if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+      if (n % 2) return a[(n + 1) / 2]
+      return (a[n / 2] + a[n / 2 + 1]) / 2
+    }
     FNR == 1 { flush(); idx++ }
     $1 == "ESTAB" && NF >= 5 {
       flush(); lcl = $4; peer = $5; sent = 0; recv = 0; next }
@@ -1530,14 +1543,43 @@ ss_throughput() {
     }
     END {
       flush()
-      for (k in firstidx) {
-        span = lastidx[k] - firstidx[k]
-        if (span <= 0) { printf "%s\t0\tonesample\n", k; continue }
-        d = lastb[k] - firstb[k]
-        if (d <= 0) { printf "%s\t0\tidle\n", k; continue }
-        printf "%s\t%.1f\tok\n", k, d * 8 / span / 1000000
+      for (o = 1; o <= norder; o++) {
+        k = order[o]; n = cnt[k]
+        if (n < 2) { printf "%s\t0\tonesample\t-\n", k; continue }
+        span = ix[k, n] - ix[k, 1]
+        total = by[k, n] - by[k, 1]
+        if (span <= 0 || total <= 0) { printf "%s\t0\tidle\t-\n", k; continue }
+        # One rate per pair of CONSECUTIVE APPEARANCES, divided by the gap
+        # between them -- a connection missing from a middle dump still gets an
+        # honest rate for the interval it spans.
+        series = ""; m = 0
+        for (i = 2; i <= n; i++) {
+          dt = ix[k, i] - ix[k, i - 1]
+          db = by[k, i] - by[k, i - 1]
+          if (dt <= 0) continue
+          r = (db > 0) ? db * 8 / dt / 1000000 : 0
+          rates[++m] = r
+          series = series (series == "" ? "" : " ") sprintf("%.0f", r)
+        }
+        printf "%s\t%.1f\tok\t%s\n", k, total * 8 / span / 1000000, series
+        delete rates
       }
     }' $files
+}
+
+# min<TAB>median<TAB>max of a per-second series, or nothing when the series is
+# too short to say anything about stability.
+series_spread() {
+  local series="${1:-}"
+  [[ -n "$series" && "$series" != - ]] || return 1
+  awk -v s="$series" 'BEGIN {
+    n = split(s, a, " ")
+    if (n < 3) exit 1
+    for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+      if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
+    med = (n % 2) ? a[(n + 1) / 2] : (a[int(n / 2)] + a[int(n / 2) + 1]) / 2
+    printf "%.0f\t%.0f\t%.0f", a[1], med, a[n]
+  }'
 }
 
 # shellcheck disable=SC2120 # the source file argument is optional by design
@@ -1652,22 +1694,80 @@ pct_or_nothing() {
   printf '%s\n' "$p"
 }
 
+# The per-second series, and what its spread says.
+#
+# A link that bursts to 1.4 Gbps and stalls has the same eight-second average as
+# one running steadily at 750 Mbps, and they are not the same problem. The
+# series is the only place the difference is visible.
+SERIES_SWING=4
+render_series() {
+  local series="${1:-}" spread lo med hi
+  [[ -n "$series" && "$series" != - ]] || return 0
+  printf '    每秒        %s Mbps\n' "$series"
+  spread="$(series_spread "$series")" || return 0
+  IFS=$'\t' read -r lo med hi <<< "$spread"
+  printf '    抖动        最低 %s / 中位 %s / 最高 %s Mbps\n' "$lo" "$med" "$hi"
+  return 0
+}
+
+# The swing verdict, printed with the other verdicts rather than in the middle
+# of the data. Succeeds only when there is a swing worth naming.
+render_series_swing() {
+  local series="${1:-}" spread lo med hi
+  spread="$(series_spread "$series")" || return 1
+  IFS=$'\t' read -r lo med hi <<< "$spread"
+  (( lo > 0 )) || lo=1
+  (( hi / lo >= SERIES_SWING )) || return 1
+  printf '    %b→ 不是「稳定在 %s」%b：窗口内在 %s 和 %s Mbps 之间来回跳，差 %s 倍。\n' \
+    "$YELLOW" "$med" "$RESET" "$hi" "$lo" "$(( hi / lo ))"
+  return 0
+}
+
+# notsent_lowat expressed as time rather than bytes, which is the unit that
+# makes it decidable: at 1.4 Gbps the default 131072 is 0.75 ms of data, and a
+# single-core box whose proxy misses that deadline hands the NIC an empty queue.
+render_notsent_hint() {
+  local mbps="${1:-0}" now ms
+  now="$(live_value net.ipv4.tcp_notsent_lowat || true)"
+  is_uint "${now:-}" && (( now > 0 )) || return 0
+  ms="$(awk -v b="$now" -v m="$mbps" 'BEGIN { if (m > 0) printf "%.2f", b * 8 / (m * 1000000) * 1000 }')"
+  [[ -n "$ms" ]] || return 0
+  printf '      %bnotsent_lowat 现在是 %s B —— %s Mbps 下只有 %s ms 的数据。%b\n' \
+    "$DIM" "$now" "$mbps" "$ms" "$RESET"
+  printf '      %b单核机器上代理一次调度抖动就能把管道抽空。按 n 试 %s。%b\n' \
+    "$DIM" "$(( now * 4 ))" "$RESET"
+  return 0
+}
+
 render_conn_evidence() {
   local peer="$1" rtt="$2" mss="$3" cwnd="$4" unacked="$5" snd_wnd="$6" \
         rcv_space="$7" pacing="$8" delivery="$9" rwndlim="${10}" sndlim="${11}" \
-        retr="${12}" rcvbuf="${13}" sndbuf="${14}" _wmemq="${15}"
-  local inflight cwndbytes
+        retr="${12}" rcvbuf="${13}" sndbuf="${14}" _wmemq="${15}" \
+        series="${16:-}" wmax="${17:-0}"
+  local inflight cwndbytes wndcap
   inflight=$(( unacked * mss ))
   cwndbytes=$(( cwnd * mss ))
+  # What the peer's window allows on this RTT. The raw byte count is not the
+  # useful form: on the live node snd_wnd 22.5 MB at 131.8 ms works out to 1432
+  # Mbps, and the measured peak was 1400 -- which turns "22.5 MB" from a number
+  # into the ceiling it is, and settles where the peak comes from.
+  wndcap="$(awk -v w="$snd_wnd" -v r="$rtt" 'BEGIN {
+    if (w > 0 && r > 0) printf "%.0f", w * 8 / (r / 1000) / 1000000 }')"
   printf '  %b%s%b  RTT %s ms\n' "$BOLD" "$peer" "$RESET" "$rtt"
   printf '    在途        %s MB（unacked %s × mss %s）\n' "$(mb "$inflight")" "$unacked" "$mss"
   printf '    拥塞窗口    %s MB（cwnd %s × mss）\n' "$(mb "$cwndbytes")" "$cwnd"
   if (( snd_wnd > 0 )); then
-    printf '    对端窗口    %s MB（snd_wnd）\n' "$(mb "$snd_wnd")"
+    if [[ -n "$wndcap" ]]; then
+      printf '    对端窗口    %s MB（snd_wnd）＝ %s ms 上 %s Mbps 的上限\n' \
+        "$(mb "$snd_wnd")" "$rtt" "$wndcap"
+    else
+      printf '    对端窗口    %s MB（snd_wnd）\n' "$(mb "$snd_wnd")"
+    fi
   else
     printf '    对端窗口    未知（这个内核的 ss 没报 snd_wnd）\n'
   fi
   printf '    速率        实测 %s Mbps｜pacing 上限 %s Mbps\n' "$delivery" "$pacing"
+  render_series "$series"
   printf '    受限占比    对端窗口 %s%%｜发送缓冲 %s%%｜累计重传 %s 段\n' \
     "$rwndlim" "$sndlim" "$retr"
   printf '    缓冲        rcvbuf %s MB｜sndbuf %s MB｜rcv_space %s MB\n' \
@@ -1690,6 +1790,9 @@ render_conn_evidence() {
   elif r="$(pct_or_nothing "$inflight" "$snd_wnd")" && (( r >= 90 )); then
     printf '    %b→ 指向对端接收窗口%b：在途已是 snd_wnd 的 %s%%，压在它上面。\n' \
       "$YELLOW" "$RESET" "$r"
+    [[ -n "$wndcap" ]] && printf '      %b对端窗口 %s MB ÷ RTT %s ms = %s Mbps，这就是这条流的硬顶。%b\n' \
+      "$DIM" "$(mb "$snd_wnd")" "$rtt" "$wndcap" "$RESET"
+    printf '      %b本机怎么调都拿不回来——那是客户端的 rmem。%b\n' "$DIM" "$RESET"
     said=1
   fi
   if (( said == 0 )) && r="$(pct_or_nothing "$inflight" "$cwndbytes")" && (( r >= 85 )); then
@@ -1706,10 +1809,33 @@ render_conn_evidence() {
     said=1
   fi
   if awk -v l="$sndlim" 'BEGIN {exit !(l >= 15)}'; then
-    printf '    %b→ 发送缓冲受限 %s%%%b：wmem 不够，或者应用写得比内核发得快。\n' \
-      "$YELLOW" "$sndlim" "$RESET"
+    # "wmem is not enough" is only ever true when sndbuf has room left to grow.
+    # On the live node it was reported against an sndbuf of 86.8 MB -- which IS
+    # wmem_max -- so it sent the operator toward a knob that could not move.
+    if (( wmax > 0 )) && awk -v b="$sndbuf" -v m="$wmax" 'BEGIN {exit !(b >= m * 0.9)}'; then
+      printf '    %b→ 发送缓冲受限 %s%%%b：sndbuf %s MB 已经贴着 wmem_max，调大 wmem 没有用。\n' \
+        "$YELLOW" "$sndlim" "$RESET" "$(mb "$sndbuf")"
+      render_notsent_hint "$delivery"
+    else
+      printf '    %b→ 发送缓冲受限 %s%%%b：sndbuf %s MB 还没长到 wmem_max %s MB，\n' \
+        "$YELLOW" "$sndlim" "$RESET" "$(mb "$sndbuf")" "$(mb "$wmax")"
+      printf '      %bautotuning 还在爬，或者应用写得比内核发得快。%b\n' "$DIM" "$RESET"
+    fi
     said=1
   fi
+  # A link that swings by four times inside eight seconds is unstable, and that
+  # is a separate finding from whatever its median is bounded by -- the two
+  # answers can and do coexist.
+  if render_series_swing "$series"; then
+    if awk -v p="$retr" 'BEGIN {exit !(p == 0)}'; then
+      printf '      %b重传为 0、队列无丢包，所以掉下去的那几秒不是丢包——%b\n' "$DIM" "$RESET"
+      printf '      %b是发送侧没喂上（notsent_lowat / 应用 / 单核调度）。%b\n' "$DIM" "$RESET"
+    else
+      printf '      %b同期有重传，先看路径丢包。%b\n' "$DIM" "$RESET"
+    fi
+    said=1
+  fi
+
   # Ruling two candidates OUT is a finding, not an absence of one. In-flight
   # well below both windows with no retransmission says the limit is neither the
   # peer's window nor congestion control -- which is most of the search space,
@@ -3204,10 +3330,25 @@ render_cpu_ceiling() {
 # Everything the window actually moved, in Mbps. The denominator for any
 # per-throughput claim, and absent when nothing moved -- in which case no such
 # claim gets made.
+# Everything the window actually moved, in Mbps: the sum over connections of
+# each one's MEDIAN per-second rate.
+#
+# The mean was wrong for this. A connection that bursts to 1.4 Gbps for one
+# second inside a window where the core was 8% busy produced "单核上限约 9882
+# Mbps" -- an extrapolation off a peak divided by an idle average. The median
+# describes the second this box actually spends most of its time in, which is
+# the one an extrapolation should be based on.
 diag_total_mbps() {
   local rows
   rows="$(ss_throughput 2>/dev/null)" || return 1
-  awk -F'\t' '$4 == "ok" { t += $3 } END { if (t <= 0) exit 1; printf "%.1f", t }' <<< "$rows"
+  awk -F'\t' '$4 == "ok" {
+      n = split($5, a, " ")
+      if (n < 1) next
+      for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+        if (a[j] + 0 < a[i] + 0) { tmp = a[i]; a[i] = a[j]; a[j] = tmp }
+      t += (n % 2) ? a[(n + 1) / 2] : (a[int(n / 2)] + a[int(n / 2) + 1]) / 2
+    }
+    END { if (t <= 0) exit 1; printf "%.1f", t }' <<< "$rows"
 }
 
 # Queue backlog, drops and overlimits over the window. `overlimits` is the one
@@ -3261,6 +3402,30 @@ render_nic_delta() {
 # the speedtest runner). Mixing them and reporting one verdict is how a
 # diagnosis ends up describing the SSH session instead of the transfer -- which
 # this file has already done once.
+# A reject list worth reading: duplicates folded with a count, busiest first,
+# and a tail that says how many were left out.
+#
+# The raw form dumped sixteen addresses on one line with 184.28.121.22:80
+# appearing four times. A list nobody reads is not accountability.
+DIAG_PEER_LIST=5
+summarise_peers() {
+  awk -v keep="$DIAG_PEER_LIST" '{
+      for (i = 1; i <= NF; i++) { if (!($i in c)) order[++n] = $i; c[$i]++ }
+    }
+    END {
+      # Busiest first, so the address that dominates the list leads it.
+      for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+        if (c[order[j]] > c[order[i]]) { t = order[i]; order[i] = order[j]; order[j] = t }
+      out = ""; shown = 0
+      for (i = 1; i <= n && i <= keep; i++) {
+        out = out " " order[i] (c[order[i]] > 1 ? "×" c[order[i]] : "")
+        shown++
+      }
+      if (n > shown) out = out sprintf(" …还有 %d 个地址", n - shown)
+      print out
+    }' <<< "${1:-}"
+}
+
 render_connections() {
   local rows listen moved
   rows="$(ss_metrics)" || { printf '\n  %b没有可用的 socket 样本（ss 缺失或窗口内没有连接）。%b\n' "$DIM" "$RESET"; return 0; }
@@ -3272,15 +3437,17 @@ render_connections() {
   # `continue`s and one message that named two of them, so three diagnostics in
   # a row reported "no connection moved data" with no way to tell what had been
   # rejected or why.
-  local seen=0 shown=0 n_idle=0 n_one=0 n_slow=0 one_names='' slow_names=''
+  local seen=0 shown=0 n_idle=0 n_one=0 n_slow=0 one_names='' slow_names='' wmax
+  wmax="$(live_value net.core.wmem_max || true)"
+  is_uint "${wmax:-}" || wmax=0
   local lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing delivery \
         rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv \
-        lport leg mbps status inflight judged body=''
+        lport leg mbps status series inflight judged body=''
   while IFS=$'\t' read -r lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing \
         delivery rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv; do
     [[ -n "$peer" ]] || continue
     seen=$(( seen + 1 ))
-    IFS=$'\t' read -r _ _ mbps status <<< \
+    IFS=$'\t' read -r _ _ mbps status series <<< \
       "$(awk -F'\t' -v l="$lcl" -v p="$peer" '$1 == l && $2 == p {print; exit}' <<< "$moved")"
     case "${status:-onesample}" in
       idle)      n_idle=$(( n_idle + 1 )); continue ;;
@@ -3310,10 +3477,11 @@ render_connections() {
     if (( judged == 1 )); then
       body="$body$(render_conn_evidence "$peer" "$rtt" "$mss" "$cwnd" "$unacked" "$snd_wnd" \
         "$rcv_space" "$pacing" "$mbps" "$rwndlim" "$sndlim" "$retr" \
-        "$rcvbuf" "$sndbuf" "$wmemq")"$'\n'
+        "$rcvbuf" "$sndbuf" "$wmemq" "$series" "$wmax")"$'\n'
     else
       body="$body$(printf '  %b%s  RTT %s ms｜mss %s｜在途 %s KB%b\n' \
         "$BOLD" "$peer" "$rtt" "$mss" "$(( inflight / 1024 ))" "$RESET")"$'\n'
+      body="$body$(render_series "$series")"$'\n'
       body="$body$(printf '    %b在途或 mss 太小，cwnd×mss 和窗口比例算不出有意义的数，不作判断。%b\n' \
         "$DIM" "$RESET")"$'\n'
     fi
@@ -3323,9 +3491,9 @@ render_connections() {
   printf '\n  %b连接：窗口内看到 %s 条 ESTAB，入选 %s 条%b\n' "$BOLD" "$seen" "$shown" "$RESET"
   (( n_idle > 0 )) && printf '    %b%3s 条 窗口内字节数没变（空闲）%b\n' "$DIM" "$n_idle" "$RESET"
   (( n_one > 0 ))  && printf '    %b%3s 条 只在一个采样点出现，算不出增量：%s%b\n' \
-    "$DIM" "$n_one" "$one_names" "$RESET"
+    "$DIM" "$n_one" "$(summarise_peers "$one_names")" "$RESET"
   (( n_slow > 0 )) && printf '    %b%3s 条 低于 %s Mbps：%s%b\n' \
-    "$DIM" "$n_slow" "$DIAG_MIN_MBPS" "$slow_names" "$RESET"
+    "$DIM" "$n_slow" "$DIAG_MIN_MBPS" "$(summarise_peers "$slow_names")" "$RESET"
   if (( shown == 0 )); then
     printf '  %b没有可用来定位瓶颈的连接。在测速跑到一半的时候再进来一次。%b\n' "$DIM" "$RESET"
     return 0

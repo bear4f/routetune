@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.26.0"
+VERSION="0.27.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -133,6 +133,11 @@ UNKNOWN_LINK_MBPS=200
 RETIRED_SYSCTL=(
   'net.ipv4.tcp_frto\t2'
   'net.ipv4.tcp_no_metrics_save\t0'
+  # This key is still available as an explicit experiment, but it is no longer
+  # a default. When it is absent from target_sysctl, restore the value from the
+  # first-apply snapshot (or the documented kernel default). Otherwise an old
+  # install keeps the 128 KiB cap forever even after the config says 0.
+  'net.ipv4.tcp_notsent_lowat\t4294967295'
 )
 
 # The starting size for a socket's buffers -- the middle field of
@@ -178,31 +183,32 @@ FLOW_MAXRATE_MBPS=0
 # panel can say what changed rather than letting the operator wonder why their
 # numbers moved.
 MIGRATED_FROM_EGRESS=0
+# 0.26.0 wrote 128 KiB as if it were a generally safe throughput default. A
+# config-version marker lets 0.27.0 retire that inherited value once, while
+# preserving every value an operator explicitly chooses from this release on.
+CONFIG_VERSION=27
+MIGRATED_NOTSENT_LOWAT=0
 IFACE=""
 SHAPE=1
 # Persist by default. Without it every reboot silently reverts the machine to
 # stock, and the next speedtest measures something nobody configured.
 PERSIST=1
 ASSUME_YES=0
-# 0 means "leave whatever is there alone".
+# 0 means "restore what was there before tcpwide" and is the default.
 #
-# The mechanism: at 400 Mbps a 16KB allowance is 0.33ms of data, so a userspace
-# proxy has to finish a whole wake/read/decrypt/write cycle inside it or the
-# pipe runs dry. netshape sets 16384 whenever RTT >= 120ms, which is right for
-# seek latency and backwards for throughput.
+# tcp_notsent_lowat is application backpressure, not a TCP throughput knob. At
+# 1.4 Gbps, 128 KiB is only 0.75 ms of unsent data; making every proxy socket
+# live inside that deadline is an aggressive latency trade, not a safe server
+# default. The kernel default is UINT_MAX and lets the ordinary send-buffer and
+# TCP Small Queues machinery decide how much may be queued.
 #
-# Measured on the live node with a bracketed A/B/A, which is the only structure
-# that reads anything on a path this unstable — the two 16384 runs 14 minutes
-# apart differed by 21% on average and 31% at the peak all by themselves.
-# Interpolating between them for the moment the 131072 run happened:
+# 128 KiB did beat 16 KiB on one path, but that only disproved the smaller cap;
+# it did not establish that either cap beats the kernel default. The later
+# 1.4 Gbps / 190 Mbps high-low-high-low sequence is consistent with a
+# sub-millisecond refill problem, but cannot prove one. Leave it alone by
+# default and keep explicit values only for controlled A/B/A tests.
 #
-#   16384 (interpolated)   avg 217.3   peak 298.1
-#   131072 (measured)      avg 257.4   peak 330.0     +18.4% / +10.7%
-#
-# One B sample and a two-point trend is weak evidence, but it points the way the
-# mechanism predicts and matches the usual server guidance of 128KB, so it is
-# the default rather than a claim. Set it to 0 to keep the system value.
-NOTSENT_LOWAT=131072
+NOTSENT_LOWAT=0
 
 # Which layout the pacer takes when not shaping.
 #
@@ -229,8 +235,10 @@ RECORD_THREADS=1
 # backend from a throttled one.
 RECORD_RTT=0
 
-# fq's queue limits. 0 means "leave the kernel's value alone"; anything else is
-# written into the qdisc spec.
+# fq's queue limits. 0 means "use tcpwide's RAM-derived throughput preset";
+# anything else is written literally. Use 10000 / 100 to A/B the kernel
+# defaults. Calling 0 "the kernel default" while emitting 10240 / 2048 made the
+# panel conceal the most important experimental variable on small machines.
 #
 # fq_queue_limits() supplies the default, taken from netshape-manager, whose
 # author reports it saturating a port on a single thread. It sets
@@ -585,7 +593,7 @@ target_sysctl() {
   # for why this is not decided here.
   if is_uint "$NOTSENT_LOWAT" && (( NOTSENT_LOWAT > 0 )); then
     printf 'net.ipv4.tcp_notsent_lowat\t%s\texact\t%s\n' "$NOTSENT_LOWAT" \
-      '未发送数据上限。400Mbps 下 16KB 只够 0.33ms，代理进程稍慢一下管道就空了。岳阳 201ms 上直接对照：131072 峰值 568，16384 只有 341，低 40%；而 131072 这一档 13 分钟内两次测得 580/568，稳定可复现。netshape 在高 RTT 上用 16384，在这条路径上被证伪。要极致低延迟可以调小，填 0 保持系统现值'
+      '未发送数据低水位（显式实验值）。它控制应用写入背压，不是带宽上限；值太小会让代理在调度抖动时喂空发送管道。填 0 会恢复 tcpwide 介入前的系统值'
   fi
   printf 'net.core.netdev_max_backlog\t%s\traise\t%s\n' "$(netdev_backlog)" \
     '网卡收包队列。高 pps 时太小会在进入协议栈之前就丢包，看起来像上游丢包'
@@ -744,9 +752,10 @@ profile_label() {
 
 load_config() {
   [[ -r "$CONFIG_FILE" ]] || return 0
-  local key value
+  local key value loaded_version=0
   while IFS='=' read -r key value; do
     case "$key" in
+      CONFIG_VERSION) is_uint "$value" && loaded_version="$value" ;;
       LINK_MBPS)  is_uint "$value" && (( value > 0 )) && LINK_MBPS="$value" ;;
       # Pre-0.23.0 config. That one number drove the port sizing AND fq's
       # per-flow maxrate, so it is migrated to LINK_MBPS -- the sizing half --
@@ -772,6 +781,13 @@ load_config() {
       IFACE)        [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
     esac
   done < "$CONFIG_FILE"
+  # 131072 was tcpwide's unconditional default through 0.26.0. Carrying it
+  # forward would defeat the new neutral default on the very machines this fix
+  # targets. A current-version config may still select 131072 deliberately.
+  if (( loaded_version < CONFIG_VERSION )) && [[ "$NOTSENT_LOWAT" == 131072 ]]; then
+    NOTSENT_LOWAT=0
+    MIGRATED_NOTSENT_LOWAT=1
+  fi
   # A rejected value on the final line leaves the loop with a non-zero status,
   # which under errexit would take the whole script down instead of just
   # ignoring that one key.
@@ -785,6 +801,7 @@ save_config() {
   chmod 0644 "$tmp"
   {
     printf '# tcpwide persistent configuration\n'
+    printf 'CONFIG_VERSION=%s\n' "$CONFIG_VERSION"
     printf 'LINK_MBPS=%s\n'  "$LINK_MBPS"
     printf 'SHAPER_MBPS=%s\n' "$SHAPER_MBPS"
     printf 'FLOW_MAXRATE_MBPS=%s\n' "$FLOW_MAXRATE_MBPS"
@@ -1203,10 +1220,20 @@ cmd_plan() {
 # Puts back every key tcpwide has withdrawn, preferring the value the machine
 # had before tcpwide ran and falling back to the kernel default. Prints how many
 # it wrote so the caller can count them.
+target_has_sysctl() {
+  local key="${1:-}" rate="${2:-0}" rtt="${3:-0}"
+  target_sysctl "$rate" "$rtt" | awk -F'\t' -v k="$key" '$1 == k {found = 1}
+    END {exit !found}'
+}
+
 restore_retired_sysctl() {
-  local entry k def want now n=0
+  local rate="${1:-0}" rtt="${2:-0}" entry k def want now n=0
   for entry in "${RETIRED_SYSCTL[@]}"; do
     IFS=$'\t' read -r k def <<< "$(printf '%b' "$entry")"
+    # tcp_notsent_lowat is optional rather than permanently retired. An
+    # explicit value remains a target; zero removes it from the target and
+    # takes this restoration path.
+    target_has_sysctl "$k" "$rate" "$rtt" && continue
     now="$(live_value "$k" || true)"
     [[ -n "$now" ]] || continue
     want="$(snapshot_value "$k" || printf '%s' "$def")"
@@ -1236,7 +1263,7 @@ apply_sysctl() {
       printf '  %b[跳过]%b %s —— 这个内核不接受该键\n' "$YELLOW" "$RESET" "$k"
     fi
   done < <(target_sysctl "$rate" "$rtt")
-  n=$(( n + $(restore_retired_sysctl) ))
+  n=$(( n + $(restore_retired_sysctl "$rate" "$rtt") ))
   # Snapshot only on the first apply: revert must return the machine to what it
   # was before tcpwide ever ran, not to what the previous apply left behind.
   if [[ -e "$SYSCTL_SNAP" ]]; then rm -f "$SYSCTL_SNAP.tmp"
@@ -1491,7 +1518,10 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # column after it, which has produced a wrong panel line twice in this file.
 # Throughput actually observed, per connection, from the window's ss dumps.
 #
-# Emits `local<TAB>peer<TAB>mbps<TAB>status<TAB>per-second series`:
+# Emits `local<TAB>peer<TAB>mbps<TAB>status<TAB>per-second series<TAB>direction`.
+# `direction` is send or recv, whichever carried more payload over the sampled
+# lifetime of this connection. ACK bytes and the reverse leg are not added to
+# the payload rate.
 #
 #   ok        measured between its own first and last appearance
 #   onesample seen in exactly one dump, so there is no interval to divide by
@@ -1512,17 +1542,18 @@ diag_cleanup() { [[ -n "$DIAG_DIR" && -d "$DIAG_DIR" ]] && rm -rf "$DIAG_DIR"; D
 # 426. The average was not wrong, it was answering a different question than
 # the one being asked.
 ss_throughput() {
-  local files
-  files="$(diag_ss_files)" || return 1
-  # shellcheck disable=SC2086 # deliberate word splitting on the newline list
+  local file files=()
+  while IFS= read -r file; do
+    [[ -n "$file" ]] && files+=("$file")
+  done < <(diag_ss_files)
+  (( ${#files[@]} > 0 )) || return 1
   awk '
-    function flush(   k, tot, c) {
+    function flush(   k, c) {
       if (peer == "") return
       k = lcl "\t" peer
-      tot = sent + recv
       if (!(k in cnt)) { cnt[k] = 0; order[++norder] = k }
       c = ++cnt[k]
-      ix[k, c] = idx; by[k, c] = tot
+      ix[k, c] = idx; tx[k, c] = sent; rx[k, c] = recv
       peer = ""
     }
     function num(tok,   p) { p = index(tok, ":"); return substr(tok, p + 1) + 0 }
@@ -1545,26 +1576,29 @@ ss_throughput() {
       flush()
       for (o = 1; o <= norder; o++) {
         k = order[o]; n = cnt[k]
-        if (n < 2) { printf "%s\t0\tonesample\t-\n", k; continue }
+        if (n < 2) { printf "%s\t0\tonesample\t-\tunknown\n", k; continue }
         span = ix[k, n] - ix[k, 1]
-        total = by[k, n] - by[k, 1]
-        if (span <= 0 || total <= 0) { printf "%s\t0\tidle\t-\n", k; continue }
+        dtx = tx[k, n] - tx[k, 1]
+        drx = rx[k, n] - rx[k, 1]
+        dir = (dtx >= drx) ? "send" : "recv"
+        total = (dir == "send") ? dtx : drx
+        if (span <= 0 || total <= 0) { printf "%s\t0\tidle\t-\t%s\n", k, dir; continue }
         # One rate per pair of CONSECUTIVE APPEARANCES, divided by the gap
         # between them -- a connection missing from a middle dump still gets an
         # honest rate for the interval it spans.
         series = ""; m = 0
         for (i = 2; i <= n; i++) {
           dt = ix[k, i] - ix[k, i - 1]
-          db = by[k, i] - by[k, i - 1]
+          db = (dir == "send") ? tx[k, i] - tx[k, i - 1] : rx[k, i] - rx[k, i - 1]
           if (dt <= 0) continue
           r = (db > 0) ? db * 8 / dt / 1000000 : 0
           rates[++m] = r
           series = series (series == "" ? "" : " ") sprintf("%.0f", r)
         }
-        printf "%s\t%.1f\tok\t%s\n", k, total * 8 / span / 1000000, series
+        printf "%s\t%.1f\tok\t%s\t%s\n", k, total * 8 / span / 1000000, series, dir
         delete rates
       }
-    }' $files
+    }' "${files[@]}"
 }
 
 # min<TAB>median<TAB>max of a per-second series, or nothing when the series is
@@ -1595,9 +1629,11 @@ ss_metrics() {
   # window.
   local src=( "$@" )
   if (( ${#src[@]} == 0 )); then
-    local list; list="$(diag_ss_files)" || return 1
-    # shellcheck disable=SC2206 # the list is one path per line, no globbing
-    src=( $list )
+    local file
+    while IFS= read -r file; do
+      [[ -n "$file" ]] && src+=("$file")
+    done < <(diag_ss_files)
+    (( ${#src[@]} > 0 )) || return 1
   fi
   awk '
     function tomb(v,   n) {
@@ -1724,18 +1760,23 @@ render_series_swing() {
 }
 
 # notsent_lowat expressed as time rather than bytes, which is the unit that
-# makes it decidable: at 1.4 Gbps the default 131072 is 0.75 ms of data, and a
-# single-core box whose proxy misses that deadline hands the NIC an empty queue.
+# makes it testable: at 1.4 Gbps the former 131072 setting is 0.75 ms of data.
+# Missing that refill interval is a candidate for an empty queue, not a verdict.
 render_notsent_hint() {
   local mbps="${1:-0}" now ms
   now="$(live_value net.ipv4.tcp_notsent_lowat || true)"
   is_uint "${now:-}" && (( now > 0 )) || return 0
+  if (( now >= 2147483647 )); then
+    printf '      %bnotsent_lowat 是系统默认的 UINT_MAX，没有在这里施加应用背压。%b\n' \
+      "$DIM" "$RESET"
+    return 0
+  fi
   ms="$(awk -v b="$now" -v m="$mbps" 'BEGIN { if (m > 0) printf "%.2f", b * 8 / (m * 1000000) * 1000 }')"
   [[ -n "$ms" ]] || return 0
   printf '      %bnotsent_lowat 现在是 %s B —— %s Mbps 下只有 %s ms 的数据。%b\n' \
     "$DIM" "$now" "$mbps" "$ms" "$RESET"
-  printf '      %b单核机器上代理一次调度抖动就能把管道抽空。按 n 试 %s。%b\n' \
-    "$DIM" "$(( now * 4 ))" "$RESET"
+  printf '      %b这只是候选：先与系统默认做 A/B/A，不要从一次掉速直接归因。%b\n' \
+    "$DIM" "$RESET"
   return 0
 }
 
@@ -1743,7 +1784,7 @@ render_conn_evidence() {
   local peer="$1" rtt="$2" mss="$3" cwnd="$4" unacked="$5" snd_wnd="$6" \
         rcv_space="$7" pacing="$8" delivery="$9" rwndlim="${10}" sndlim="${11}" \
         retr="${12}" rcvbuf="${13}" sndbuf="${14}" _wmemq="${15}" \
-        series="${16:-}" wmax="${17:-0}"
+        series="${16:-}" wmax="${17:-0}" direction="${18:-send}"
   local inflight cwndbytes wndcap
   inflight=$(( unacked * mss ))
   cwndbytes=$(( cwnd * mss ))
@@ -1754,6 +1795,21 @@ render_conn_evidence() {
   wndcap="$(awk -v w="$snd_wnd" -v r="$rtt" 'BEGIN {
     if (w > 0 && r > 0) printf "%.0f", w * 8 / (r / 1000) / 1000000 }')"
   printf '  %b%s%b  RTT %s ms\n' "$BOLD" "$peer" "$RESET" "$rtt"
+  if [[ "$direction" == recv ]]; then
+    printf '    主数据方向  接收｜窗口内实测 %s Mbps\n' "$delivery"
+    render_series "$series"
+    printf '    接收缓冲    rcvbuf %s MB｜rcv_space %s MB\n' \
+      "$(mb "$rcvbuf")" "$(mb "$rcv_space")"
+    printf '    %b→ 这是接收为主的连接；本机 snd_wnd、cwnd、pacing_rate 和 retrans%b\n' \
+      "$DIM" "$RESET"
+    printf '      %b描述的是反向小流，不能拿来解释这条接收流为什么掉速。%b\n' "$DIM" "$RESET"
+    if render_series_swing "$series"; then
+      printf '      %b只能结合远端发送腿、同窗口 nstat 和队列增量继续定位，不在这里猜。%b\n' \
+        "$DIM" "$RESET"
+    fi
+    return 0
+  fi
+  printf '    主数据方向  发送｜窗口内实测 %s Mbps\n' "$delivery"
   printf '    在途        %s MB（unacked %s × mss %s）\n' "$(mb "$inflight")" "$unacked" "$mss"
   printf '    拥塞窗口    %s MB（cwnd %s × mss）\n' "$(mb "$cwndbytes")" "$cwnd"
   if (( snd_wnd > 0 )); then
@@ -1766,7 +1822,7 @@ render_conn_evidence() {
   else
     printf '    对端窗口    未知（这个内核的 ss 没报 snd_wnd）\n'
   fi
-  printf '    速率        实测 %s Mbps｜pacing 上限 %s Mbps\n' "$delivery" "$pacing"
+  printf '    速率        实测 %s Mbps｜pacing 上限 %s Mbps（末次快照）\n' "$delivery" "$pacing"
   render_series "$series"
   printf '    受限占比    对端窗口 %s%%｜发送缓冲 %s%%｜累计重传 %s 段\n' \
     "$rwndlim" "$sndlim" "$retr"
@@ -1827,12 +1883,10 @@ render_conn_evidence() {
   # is a separate finding from whatever its median is bounded by -- the two
   # answers can and do coexist.
   if render_series_swing "$series"; then
-    if awk -v p="$retr" 'BEGIN {exit !(p == 0)}'; then
-      printf '      %b重传为 0、队列无丢包，所以掉下去的那几秒不是丢包——%b\n' "$DIM" "$RESET"
-      printf '      %b是发送侧没喂上（notsent_lowat / 应用 / 单核调度）。%b\n' "$DIM" "$RESET"
-    else
-      printf '      %b同期有重传，先看路径丢包。%b\n' "$DIM" "$RESET"
-    fi
+    printf '      %b上面的 retrans 是连接累计值，窗口字段是末次快照；两者不能证明%b\n' \
+      "$DIM" "$RESET"
+    printf '      %b某个低速秒是丢包还是应用断粮。以同窗口 nstat / qdisc 增量为准。%b\n' \
+      "$DIM" "$RESET"
     said=1
   fi
 
@@ -1916,12 +1970,20 @@ throughput_verdict() {
 # which is where the panel's "历史最好 580 Mbps (, 08-26 01:14)" came from.
 best_measurement() {
   [[ -r "$MEASURE_LOG" ]] || return 1
-  awk -F'\t' 'NF >= 3 && $2 + 0 > best + 0 { best = $2; line = $0 }
+  local raw mbps fingerprint note epoch when
+  raw="$(awk -F'\t' 'NF >= 3 && $2 + 0 > best + 0 { best = $2; line = $0 }
     END { if (line == "") exit 1
       split(line, f, "\t")
-      printf "%s\t%s\t%s\t%s", f[2], f[3], (f[4] == "" ? "-" : f[4]),
-             strftime("%m-%d %H:%M", f[1]) }' \
-    "$MEASURE_LOG"
+      printf "%s\t%s\t%s\t%s", f[2], f[3], (f[4] == "" ? "-" : f[4]), f[1] }' \
+    "$MEASURE_LOG")" || return 1
+  IFS=$'\t' read -r mbps fingerprint note epoch <<< "$raw"
+  # POSIX awk has no strftime (notably the BSD awk shipped by macOS). GNU date
+  # uses -d @EPOCH, BSD date uses -r EPOCH; support both so the test suite and
+  # operator tooling do not depend on one awk implementation.
+  when="$(date -d "@$epoch" '+%m-%d %H:%M' 2>/dev/null \
+       || date -r "$epoch" '+%m-%d %H:%M' 2>/dev/null \
+       || printf '%s' "$epoch")"
+  printf '%s\t%s\t%s\t%s' "$mbps" "$fingerprint" "$note" "$when"
 }
 
 cmd_record() {
@@ -2217,7 +2279,7 @@ warn_manual_buffer() {
 # advertise, which is the only thing separating "our buffer is the limit" from
 # "the buffer has headroom and the limit is somewhere else".
 render_window_report() {
-  local rows peak=0 note rtt mbps mbytes pct
+  local rows peak=0 note rtt mbps mbytes pct notsent
   rows="$(window_utilisation)" || return 0
   printf '\n  %b各后端实际用掉了本机窗口的多少%b\n' "$BOLD" "$RESET"
   printf '  %b后端            RTT      实测       在途    占本机窗口%b\n' "$DIM" "$RESET"
@@ -2247,8 +2309,13 @@ render_window_report() {
   else
     printf '  %b→ 最高才用到 %s%%，本机缓冲还有余量。%b\n' "$GREEN" "$peak" "$RESET"
     printf '  %b  剩下的杠杆，按性价比：%b\n' "$BOLD" "$RESET"
-    printf '  %b   1. 把 notsent_lowat 往【更大】试（面板 n，262144 / 524288）——%b\n' "$DIM" "$RESET"
-    printf '  %b      131072 已经实测胜过 16384 四成，方向明确是越大越好，但上界没找到。%b\n' "$DIM" "$RESET"
+    notsent="$(live_value net.ipv4.tcp_notsent_lowat || true)"
+    if is_uint "${notsent:-}" && (( notsent < 2147483647 )); then
+      printf '  %b   1. 当前 notsent_lowat=%s 是显式背压；先与面板 n=0 的系统值做 A/B/A。%b\n' \
+        "$DIM" "$notsent" "$RESET"
+    else
+      printf '  %b   1. notsent_lowat 没有施加低阈值，别再围着发送缓冲打转。%b\n' "$DIM" "$RESET"
+    fi
     printf '  %b   2. 换后端 —— 同一时刻不同后端差 20%%+ 且与 RTT 无关时，差的那块%b\n' "$DIM" "$RESET"
     printf '  %b      在对端或路径上，本机怎么调都拿不回来。%b\n' "$DIM" "$RESET"
   fi
@@ -2567,6 +2634,9 @@ cmd_apply() {
   fi
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"
   migration_notice
+  if (( MIGRATED_FROM_EGRESS == 1 || MIGRATED_NOTSENT_LOWAT == 1 )); then
+    save_config
+  fi
   warn_manual_buffer "$rate" "$rtt"
   apply_sysctl "$rate" "$rtt"; n="$SYSCTL_WROTE"
   apply_link "$rate" "$rtt"
@@ -2589,12 +2659,18 @@ cmd_apply() {
 # set is gone -- and their numbers moving without explanation is exactly how the
 # last several rounds of analysis went wrong.
 migration_notice() {
-  (( MIGRATED_FROM_EGRESS == 1 )) || return 0
-  warn "读到旧配置 EGRESS_MBPS=$LINK_MBPS，已迁移为 LINK_MBPS（端口容量）"
-  printf '  %b旧版本会把这个数当成 fq 的单流上限（%s Mbit）。单流上限现在默认没有，%b\n' \
-    "$DIM" "$(( LINK_MBPS * SHAPE_PCT / 100 ))" "$RESET"
-  printf '  %b要重新加上就去 s) 填 FLOW_MAXRATE。这一改会影响测速结果，别和旧数据直接比。%b\n' \
-    "$DIM" "$RESET"
+  if (( MIGRATED_FROM_EGRESS == 1 )); then
+    warn "读到旧配置 EGRESS_MBPS=${LINK_MBPS}，已迁移为 LINK_MBPS（端口容量）"
+    printf '  %b旧版本会把这个数当成 fq 的单流上限（%s Mbit）。单流上限现在默认没有，%b\n' \
+      "$DIM" "$(( LINK_MBPS * SHAPE_PCT / 100 ))" "$RESET"
+    printf '  %b要重新加上就去 s) 填 FLOW_MAXRATE。这一改会影响测速结果，别和旧数据直接比。%b\n' \
+      "$DIM" "$RESET"
+  fi
+  if (( MIGRATED_NOTSENT_LOWAT == 1 )); then
+    warn '旧配置的 tcp_notsent_lowat=131072 是历史默认值，现已改为恢复系统原值'
+    printf '  %b128 KiB 只给 1.4 Gbps 连接约 0.75 ms 的应用补充时间；它不再作为通用吞吐默认。%b\n' \
+      "$DIM" "$RESET"
+  fi
 }
 
 cmd_apply_link() {
@@ -2633,6 +2709,7 @@ verify_applied() {
   local entry rk rdef rwant
   for entry in "${RETIRED_SYSCTL[@]}"; do
     IFS=$'\t' read -r rk rdef <<< "$(printf '%b' "$entry")"
+    target_has_sysctl "$rk" "$rate" "$rtt" && continue
     now="$(live_value "$rk" || true)"
     [[ -n "$now" ]] || continue
     rwant="$(snapshot_value "$rk" || printf '%s' "$rdef")"
@@ -3169,7 +3246,7 @@ panel_help() {
   printf '    6 覆盖 RTT   填「最远那个客户端」的延迟，不是你自己的\n'
   printf '    7 首窗       initcwnd，内核默认 10\n'
   printf '    b 缓冲上限   接收缓冲上限。填 0 = 按端口和覆盖 RTT 自动推导\n'
-  printf '    n 未发送上限 tcp_notsent_lowat。131072 实测胜 16384 四成\n'
+  printf '    n 未发送上限 tcp_notsent_lowat。默认恢复系统值；非零只做 A/B/A\n'
   printf '    s 单流旋钮   fq 参数、缓冲起步值、单流上限。都还没单独实测过\n'
   printf '    l 队列布局   root 单个 fq（有实测支撑）或 mq 挂叶子\n\n'
   printf '  %b工具%b\n' "$BOLD" "$RESET"
@@ -3330,8 +3407,11 @@ render_cpu_ceiling() {
 # Everything the window actually moved, in Mbps. The denominator for any
 # per-throughput claim, and absent when nothing moved -- in which case no such
 # claim gets made.
-# Everything the window actually moved, in Mbps: the sum over connections of
-# each one's MEDIAN per-second rate.
+# Estimated application payload in Mbps. A relay carries the same bytes once on
+# its receive leg and once on its send leg, so adding every socket counts the
+# transfer twice. Sum medians by dominant direction and take the larger side;
+# that remains correct for a direct sender/receiver and for the common one-way
+# proxy workload.
 #
 # The mean was wrong for this. A connection that bursts to 1.4 Gbps for one
 # second inside a window where the core was 8% busy produced "单核上限约 9882
@@ -3346,38 +3426,49 @@ diag_total_mbps() {
       if (n < 1) next
       for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
         if (a[j] + 0 < a[i] + 0) { tmp = a[i]; a[i] = a[j]; a[j] = tmp }
-      t += (n % 2) ? a[(n + 1) / 2] : (a[int(n / 2)] + a[int(n / 2) + 1]) / 2
+      med = (n % 2) ? a[(n + 1) / 2] : (a[int(n / 2)] + a[int(n / 2) + 1]) / 2
+      if ($6 == "recv") recv += med; else send += med
     }
-    END { if (t <= 0) exit 1; printf "%.1f", t }' <<< "$rows"
+    END { t = (send > recv) ? send : recv
+      if (t <= 0) exit 1; printf "%.1f", t }' <<< "$rows"
 }
 
 # Queue backlog, drops and overlimits over the window. `overlimits` is the one
 # that answers "did a shaper hold this back", and no amount of socket-level
 # reading substitutes for it.
-# Totals from one `tc -s -d qdisc` dump: dropped, overlimits, requeues, backlog.
+# Totals from one `tc -s -d qdisc` dump:
+# dropped, overlimits, requeues, backlog, fq flows_plimit.
 qdisc_totals() {
   local f="${1:-}"
   [[ -r "$f" ]] || return 1
-  awk '{ for (i = 1; i <= NF; i++) {
-           if ($i == "dropped")    d += $(i+1) + 0
-           if ($i == "overlimits") o += $(i+1) + 0
-           if ($i == "requeues")   q += $(i+1) + 0
-           if ($i == "backlog")    bl = $(i+1) } }
-       END { printf "%d\t%d\t%d\t%s", d, o, q, (bl == "" ? "0b" : bl) }' "$f"
+  awk '$1 == "Sent" { for (i = 1; i <= NF; i++) {
+           key = $i; val = $(i+1); gsub(/[(),]/, "", key); gsub(/[(),]/, "", val)
+           if (key == "dropped")    d += val + 0
+           if (key == "overlimits") o += val + 0
+           if (key == "requeues")   q += val + 0 } }
+       { for (i = 1; i <= NF; i++) {
+           if ($i == "flows_plimit") f += $(i+1) + 0
+           if ($i == "backlog")      bl = $(i+1) } }
+       END { printf "%d\t%d\t%d\t%s\t%d", d, o, q,
+             (bl == "" ? "0b" : bl), f }' "$f"
 }
 
 render_qdisc_delta() {
-  local ra rb da oa qa _bla db ob qb blb
+  local ra rb da oa qa _bla fa db ob qb blb fb
   ra="$(qdisc_totals "$DIAG_DIR/qdisc.a")" || return 0
   rb="$(qdisc_totals "$DIAG_DIR/qdisc.b")" || return 0
-  IFS=$'\t' read -r da oa qa _bla <<< "$ra"
-  IFS=$'\t' read -r db ob qb blb  <<< "$rb"
-  printf '  队列（窗口增量）:  丢包 %s｜overlimits %s｜requeues %s｜当前 backlog %s\n' \
-    "$(( db - da ))" "$(( ob - oa ))" "$(( qb - qa ))" "$blb"
-  if (( ob - oa > 0 )); then
-    printf '    %b→ overlimits 非零：有整形器把包压住了。不整形档下这不该出现——%b\n' \
+  IFS=$'\t' read -r da oa qa _bla fa <<< "$ra"
+  IFS=$'\t' read -r db ob qb blb fb  <<< "$rb"
+  printf '  队列（窗口增量）:  丢包 %s｜overlimits %s｜requeues %s｜flows_plimit %s｜backlog %s\n' \
+    "$(( db - da ))" "$(( ob - oa ))" "$(( qb - qa ))" "$(( fb - fa ))" "$blb"
+  if (( fb - fa > 0 )); then
+    printf '    %b→ fq 的每流队列真的撞到了 flow_limit；这才是调大它的直接证据。%b\n' \
       "$YELLOW" "$RESET"
-    printf '    %b  看根队列上有没有 maxrate/bandwidth，以及 s) 里的单流上限。%b\n' \
+  fi
+  if (( ob - oa > 0 )); then
+    printf '    %b→ overlimits 不是丢包计数；它只说明队列执行过限速/调度判断。%b\n' \
+      "$DIM" "$RESET"
+    printf '    %b  是否存在硬顶仍要看实际 maxrate/bandwidth，不能只凭这个数归因。%b\n' \
       "$DIM" "$RESET"
   fi
   return 0
@@ -3442,12 +3533,12 @@ render_connections() {
   is_uint "${wmax:-}" || wmax=0
   local lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing delivery \
         rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv \
-        lport leg mbps status series inflight judged body=''
+        lport leg mbps status series direction inflight judged body=''
   while IFS=$'\t' read -r lcl peer rtt mss cwnd unacked snd_wnd rcv_space pacing \
         delivery rwndlim sndlim retr rcvbuf sndbuf wmemq sent recv; do
     [[ -n "$peer" ]] || continue
     seen=$(( seen + 1 ))
-    IFS=$'\t' read -r _ _ mbps status series <<< \
+    IFS=$'\t' read -r _ _ mbps status series direction <<< \
       "$(awk -F'\t' -v l="$lcl" -v p="$peer" '$1 == l && $2 == p {print; exit}' <<< "$moved")"
     case "${status:-onesample}" in
       idle)      n_idle=$(( n_idle + 1 )); continue ;;
@@ -3477,7 +3568,7 @@ render_connections() {
     if (( judged == 1 )); then
       body="$body$(render_conn_evidence "$peer" "$rtt" "$mss" "$cwnd" "$unacked" "$snd_wnd" \
         "$rcv_space" "$pacing" "$mbps" "$rwndlim" "$sndlim" "$retr" \
-        "$rcvbuf" "$sndbuf" "$wmemq" "$series" "$wmax")"$'\n'
+        "$rcvbuf" "$sndbuf" "$wmemq" "$series" "$wmax" "$direction")"$'\n'
     else
       body="$body$(printf '  %b%s  RTT %s ms｜mss %s｜在途 %s KB%b\n' \
         "$BOLD" "$peer" "$rtt" "$mss" "$(( inflight / 1024 ))" "$RESET")"$'\n'
@@ -3507,20 +3598,16 @@ render_connections() {
 # rather than a reinstall. All three are hypotheses: the panel says so, and
 # `record` is what settles them.
 panel_single_flow() {
-  title '单流旋钮（都还没测过）'
+  title '单流旋钮（一次只测一个）'
   printf '  %b多线程已经能跑满端口时，下面这些是单流仅剩的几个杠杆。%b\n' "$DIM" "$RESET"
   printf '  %b每改一个就 A/B/A 测一次并 record，别一次改两个。%b\n\n' "$DIM" "$RESET"
   printf '    %b1)%b tcp_notsent_lowat   当前 %s\n' "$BOLD" "$RESET" \
     "$(live_value net.ipv4.tcp_notsent_lowat)"
-  printf '       %b558 Mbps 下 128KB 只有 1.8ms 的数据。单核机器上代理的调度抖动%b\n' "$DIM" "$RESET"
-  printf '       %b一旦超过这个数就会饿死网卡。岳阳 201ms 直接对照：131072 峰值 568，%b\n' "$DIM" "$RESET"
-  printf '       %b16384 只有 341（低 40%%）。方向明确是越大越好，但上界还没找到——%b\n' "$DIM" "$RESET"
-  printf '       %b下一个该试的是 262144 和 524288。%b\n' "$DIM" "$RESET"
-  printf '       %bnetshape 在 RTT≥120ms 时反而用 16384。那条建议在这条路径上已被证伪：%b\n' "$DIM" "$RESET"
-  printf '       %b131072 这一档 13 分钟内两次测得 580/568，16384 比两次都低四成。%b\n' "$DIM" "$RESET"
+  printf '       %b0 = 恢复 tcpwide 介入前的系统值。128KB 在 1.4Gbps 下只有 0.75ms，%b\n' "$DIM" "$RESET"
+  printf '       %b不能根据一次掉速就认定是它；只允许用同后端 A/B/A 裁决。%b\n' "$DIM" "$RESET"
   printf '    %b2)%b fq initial_quantum  当前 %s%b（0 = 用内核的 15140b）%b\n' "$BOLD" "$RESET" \
     "$FQ_INITIAL_QUANTUM" "$DIM" "$RESET"
-  printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 用内核的 100p，约 3ms 数据）%b\n' "$BOLD" "$RESET" \
+  printf '    %b3)%b fq flow_limit       当前 %s%b（0 = 自动档；内核默认请填 100）%b\n' "$BOLD" "$RESET" \
     "$FQ_FLOW_LIMIT" "$DIM" "$RESET"
   printf '    %b4)%b 缓冲起步值           当前 %s MB%b（tcp_[rw]mem 中间值，决定爬升快慢）%b\n' \
     "$BOLD" "$RESET" "$(mb "$BUF_DEFAULT")" "$DIM" "$RESET"
@@ -3533,7 +3620,7 @@ panel_single_flow() {
   local pick value
   read -r -p '  请选择 [0]: ' pick || return 0
   case "${pick:-0}" in
-    1) if value="$(prompt_uint 'tcp_notsent_lowat（0=不动，试 262144 / 524288）' \
+    1) if value="$(prompt_uint 'tcp_notsent_lowat（0=恢复系统值）' \
            "$NOTSENT_LOWAT" 0 16777216)"; then
          NOTSENT_LOWAT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
@@ -3541,7 +3628,7 @@ panel_single_flow() {
            "$FQ_INITIAL_QUANTUM" 0 1048576)"; then
          FQ_INITIAL_QUANTUM="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
-    3) if value="$(prompt_uint 'flow_limit 包数（0=用内核的，试 500）' \
+    3) if value="$(prompt_uint 'flow_limit 包数（0=自动档；100=内核默认）' \
            "$FQ_FLOW_LIMIT" 0 100000)"; then
          FQ_FLOW_LIMIT="$value"; save_config; cmd_apply
        else info "已取消"; fi ;;
@@ -3637,10 +3724,10 @@ menu() {
         else info "已取消"; continue; fi
         ;;
       n|N)
-        printf '  %b小=低延迟（seek 更跟手），大=给代理进程更多喂数据的余量。%b\n' "$DIM" "$RESET"
-        printf '  %b真机 A/B/A 夹逼对照：131072 比 16384 高 18%%（均）/11%%（峰）。%b\n' "$DIM" "$RESET"
-        printf '  %b131072 已实测胜 16384 四成，往下调只会更慢。填 0 = 保持系统现值。%b\n' "$DIM" "$RESET"
-        if value="$(prompt_uint 'notsent_lowat 字节（0=不改，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
+        printf '  %b这是应用写入背压，不是 TCP 窗口。小值降低排队，也缩短代理补数据的时间。%b\n' "$DIM" "$RESET"
+        printf '  %b128KB 在 1.4Gbps 下只有 0.75ms；稳定性优先默认恢复系统值。%b\n' "$DIM" "$RESET"
+        printf '  %b填 0 = 恢复 tcpwide 首次应用前的值；非零值只用于单变量 A/B/A。%b\n' "$DIM" "$RESET"
+        if value="$(prompt_uint 'notsent_lowat 字节（0=恢复系统值，q 返回）' "$NOTSENT_LOWAT" 0 16777216)"; then
           NOTSENT_LOWAT="$value"; save_config; run_action cmd_apply
         else info "已取消"; continue; fi
         ;;
@@ -3816,8 +3903,9 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   tcpwide uninstall                    还原并卸载
   tcpwide check                        看内核支不支持、有没有冲突的工具
   tcpwide plan --egress 500            预演，什么都不改
-  tcpwide apply --egress 500           应用（先快照，可完整还原）
-  tcpwide apply --egress 500 --persist 应用并持久化（重启仍在）
+  tcpwide apply --egress 500           应用并持久化（先快照，可完整还原）
+  tcpwide apply --egress 500 --no-persist
+                                       只应用到本次启动，重启失效
   tcpwide status                       当前状态
   tcpwide record <Mbps> [备注] [--threads N] [--rtt MS]
                                        记下一次实测，和当前配置绑在一起
@@ -3834,7 +3922,8 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
   --profile <名字>   stable | balanced | speed | noshape
   --buf-mb <N>       缓冲上限 MB，0=自动
   --no-shape         不接管根队列，只做 pacing。放弃按设备公平和 AQM
-  --persist          写 /etc/sysctl.d 和 systemd unit
+  --persist          写 /etc/sysctl.d 和 systemd unit（默认）
+  --no-persist       不写持久化文件，重启后失效
   --yes              检测到冲突工具时仍然继续
 
 为什么必须整形才能拿到公平和 AQM：VPS 的出口通常被运营商限速，队列堆在他们那边，

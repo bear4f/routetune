@@ -139,22 +139,14 @@ pass 'the global TCP page budget is set alongside the per-socket ceiling'
 # cross-border middleboxes blackhole ECN negotiation, and these are exactly
 # cross-border paths. That beats the theory that passive mode is inherently safe.
 assert_eq '0' "$(key net.ipv4.tcp_ecn)" 'ECN stays off on cross-border paths'
-# At 400 Mbps a 16KB allowance is 0.33ms of data, so a userspace proxy has to
-# finish a whole wake/read/decrypt/write cycle inside it. A bracketed A/B/A on
-# the live node — the only structure that reads anything on a path where the
-# same config drifted 21% in 14 minutes — put 131072 at +18% average and +11%
-# peak against the interpolated 16384 baseline.
-assert_eq '131072' "$(key net.ipv4.tcp_notsent_lowat)" \
-  'the measured unsent allowance is the default'
-# It stays a knob, because one B sample and a two-point trend is weak evidence
-# and the latency direction is a legitimate choice.
-NOTSENT_LOWAT=0; tgt="$(target_sysctl 500 250)"
 assert_eq '' "$(key net.ipv4.tcp_notsent_lowat)" \
-  'zero means leave the system value alone'
+  'the default does not impose application backpressure'
+# It stays an explicit experiment. 128 KiB beat 16 KiB, but neither was tested
+# against the kernel default, and 128 KiB is only 0.75 ms at 1.4 Gbps.
 NOTSENT_LOWAT=262144; tgt="$(target_sysctl 500 250)"
 assert_eq '262144' "$(key net.ipv4.tcp_notsent_lowat)" \
   'an explicitly chosen allowance is applied exactly'
-NOTSENT_LOWAT=131072; tgt="$(target_sysctl 500 250)"
+NOTSENT_LOWAT=0; tgt="$(target_sysctl 500 250)"
 while IFS=$'\t' read -r k v dir why; do
   [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "key $k is missing a value or a rationale"
   # A direction is one word, or one word per field for a tuple like tcp_rmem
@@ -514,7 +506,10 @@ total_ram_bytes() { printf '%s\n' $((958 * 1024 * 1024)); }
 # space-separated thresholds as one field.
 IFS=' ' read -r tm_low tm_pres tm_max <<< "$(target_tcp_mem)"
 # 1/16, 1/8, 1/4 of RAM in pages, following tcpfit.
-assert_eq "$((958 * 1024 * 1024 / 4096 / 4))" "$tm_max" \
+test_page_size="$(getconf PAGESIZE 2>/dev/null || printf 4096)"
+expected_tm_max=$((958 * 1024 * 1024 / test_page_size / 4))
+(( expected_tm_max < 16384 )) && expected_tm_max=16384
+assert_eq "$expected_tm_max" "$tm_max" \
   'the global budget cap is a quarter of RAM in pages'
 [[ "$tm_low" -lt "$tm_pres" && "$tm_pres" -lt "$tm_max" ]] \
   || fail 'the three tcp_mem thresholds must be ordered'
@@ -525,7 +520,7 @@ pass 'the tcp_mem thresholds are ordered low < pressure < max'
 # extra headroom measured identically on the box it was meant to help, so
 # handing one connection half the budget on a 520 MB box bought nothing.
 buf="$(buffer_ceiling 500 250)"
-(( buf * 4 <= tm_max * 4096 )) \
+(( buf * 4 <= tm_max * test_page_size )) \
   || fail 'the ceiling must leave room for four flows inside the global budget'
 pass 'four flows at the ceiling fit inside the global budget'
 
@@ -1124,10 +1119,10 @@ assert_eq '上海 不整形' "$b_note" 'and the note that identifies the test'
 # A reading that is not a number must not silently land in the log.
 if record_measurement 'fast' 'nope' 2>/dev/null; then fail 'a non-numeric reading must be refused'; fi
 pass 'a non-numeric reading is refused rather than logged'
-assert_eq '3' "$(wc -l < "$MEASURE_LOG")" 'the refused reading did not reach the log'
+assert_eq '3' "$(awk 'END {print NR}' "$MEASURE_LOG")" 'the refused reading did not reach the log'
 # A tab in the note would split the record into the wrong fields.
 FAKE_Q='fq maxrate 950mbit' record_measurement 100 "$(printf 'a\tb')"
-assert_eq '4' "$(awk -F'\t' 'NF == 6' "$MEASURE_LOG" | wc -l)" \
+assert_eq '4' "$(awk -F'\t' 'NF == 6 {n++} END {print n + 0}' "$MEASURE_LOG")" \
   'a tab in the note cannot break the record into extra fields'
 rm -rf "$STATE_DIR"
 unset -f live_value current_default_route canonical_qdisc
@@ -1344,7 +1339,7 @@ record_measurement 638.9 '上海移动' 1 148
 record_measurement 581.1 '北京电信' 1 168
 record_measurement 558.7 '广东电信' 1 174
 record_measurement 549.0 '广东移动' 1 174
-assert_eq '6' "$(window_utilisation | wc -l)" 'only the readings carrying an RTT are analysed'
+assert_eq '6' "$(window_utilisation | awk 'END {print NR}')" 'only the readings carrying an RTT are analysed'
 IFS=$'\t' read -r _ _ _ _ wu_pct <<< "$(window_utilisation | sed -n 1p)"
 # These readings sit near half the advertised window, and the experiment that
 # settles it was run on this very box: rmem_max was doubled from 43.4 to 86.8 MB
@@ -1373,7 +1368,7 @@ pass 'an end-to-end reading is not mistaken for a receive-window measurement'
 # Multi-thread readings are excluded: their in-flight is spread over N flows, so
 # dividing by one window would overstate what a single flow reached.
 record_measurement 917.4 '多线程' 4 175
-assert_eq '7' "$(window_utilisation | wc -l)" 'a multi-thread reading stays out of the per-flow analysis'
+assert_eq '7' "$(window_utilisation | awk 'END {print NR}')" 'a multi-thread reading stays out of the per-flow analysis'
 # A buffer with genuine headroom is still cleared, and the levers ranked.
 : > "$MEASURE_LOG"
 record_measurement 400 '慢后端' 1 150
@@ -1398,36 +1393,20 @@ rm -rf "$STATE_DIR"
 unset -f live_value canonical_qdisc current_default_route
 
 
-# ── 0.15.1 notsent_lowat 的争议已被实测裁决 ────────────────────────────────
-# netshape sets tcp_notsent_lowat to 16384 above 120ms RTT; tcpwide kept
-# 131072. Measured head to head on 岳阳 at ~200ms, 55 seconds apart:
-#   131072  201ms  avg 458.46  max 568.42
-#   16384   198ms  avg 282.13  max 341.16   -40% peak, -38% average
-# And the 131072 arm reproduced: 580.54 at 09:12 and 568.42 at 09:25, 2.1%
-# apart across 13 minutes, with 16384 sitting 40% below both. Two A readings
-# around one B is an A/B/A in everything but name.
+# ── 0.27.0 notsent_lowat 回到系统值 ───────────────────────────────────────
+# 128 KiB beat 16 KiB, but that comparison only proved 16 KiB was worse. It did
+# not compare either cap with the kernel default. The later high-low-high-low
+# sequence reached 1.4 Gbps and 190 Mbps at the same RTT; at the peak 128 KiB is
+# only 0.75 ms of refill slack, so it cannot remain an unqualified default.
 restore_lib
 available_cc() { printf 'reno cubic bbr\n'; }
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
-NOTSENT_LOWAT=131072
-why="$(target_sysctl 1000 200 | awk -F'\t' '$1 == "net.ipv4.tcp_notsent_lowat" {print $4}')"
-[[ "$why" == *"568"* && "$why" == *"341"* ]] \
-  || fail 'the rationale must carry the measurement that settled it'
-[[ "$why" != *"证据不算强"* ]] || fail 'the weak-evidence caveat is obsolete'
-pass 'the notsent_lowat rationale cites the measurement that settled it'
-# The surviving claim is directional, not final: bigger beat smaller by 40%, and
-# nothing above 131072 has been tried. Saying "settled" would stop the search at
-# a value that was only ever the larger of two.
-grep -q '262144 和 524288' "$ROOT/tcpwide.sh" \
-  || fail 'the panel must name the untried larger values as the next test'
-pass 'the next test is named rather than the question being closed'
-# Every place that called this unresolved has to stop saying so, or the tool
-# sends the operator to re-run a test that already has an answer.
-for stale in '没有可靠依据' '只能靠你这条路径裁决' '唯一还没测过的便宜项'; do
-  grep -q "$stale" "$ROOT/tcpwide.sh" && fail "stale claim still ships: $stale"
-done
-pass 'no surface still calls the notsent_lowat question open'
-NOTSENT_LOWAT=131072
+assert_eq '0' "$NOTSENT_LOWAT" 'notsent_lowat is neutral by default'
+[[ -z "$(target_sysctl 1000 200 | awk -F'\t' '$1 == "net.ipv4.tcp_notsent_lowat" {print $2}')" ]] \
+  || fail 'the neutral default must not be emitted as a target'
+grep -q '0=恢复系统值' "$ROOT/tcpwide.sh" \
+  || fail 'the panel must state that zero restores the pre-tcpwide value'
+pass 'notsent_lowat is an explicit A/B knob rather than a hidden default'
 
 
 # ── 0.16.0 持久化默认开、手动上限告警、窗口比例诊断 ────────────────────────
@@ -1581,7 +1560,7 @@ ss() {
   printf '\t skmem:(r131072,rb25165824,t0,tb87040,f0,w0,o0,bl0,d0) rtt:150/4 snd_wnd:262144 bytes_sent:90000 bytes_received:800000000 delivery_rate 620.0Mbps\n'
 }
 rows="$(window_ratio)"
-assert_eq '2' "$(wc -l <<< "$rows")" 'both directions produce a sample, and the idle shell neither'
+assert_eq '2' "$(awk 'END {print NR}' <<< "$rows")" 'both directions produce a sample, and the idle shell neither'
 IFS=$'\t' read -r k_s id_s dir_s _ rate_s _ _ _ wnd_s <<< "$(grep '^send' <<< "$rows")"
 assert_eq 'send' "$k_s" 'the sending sample is labelled as such'
 assert_eq '157.255.228.103:443' "$id_s" 'and is the loaded outbound sender'
@@ -1870,8 +1849,25 @@ assert_eq '1' "$MIGRATED_FROM_EGRESS" 'the migration is flagged so it can be ann
   || fail 'the migration must say what changed'
 pass 'an old config migrates without inheriting its hidden rate limit'
 rm -f "$CONFIG_FILE"
+
+# 0.26.0 also stored 128 KiB unconditionally. It must be retired from an old
+# config, but the same number remains a valid explicit experiment after the
+# new schema marker has made that intent distinguishable.
+CONFIG_FILE="$(mktemp)"
+printf 'NOTSENT_LOWAT=131072\n' > "$CONFIG_FILE"
+NOTSENT_LOWAT=0; MIGRATED_NOTSENT_LOWAT=0
+load_config
+assert_eq '0' "$NOTSENT_LOWAT" 'the inherited 128 KiB application cap is retired'
+assert_eq '1' "$MIGRATED_NOTSENT_LOWAT" 'the notsent migration is announced'
+printf 'CONFIG_VERSION=27\nNOTSENT_LOWAT=131072\n' > "$CONFIG_FILE"
+NOTSENT_LOWAT=0; MIGRATED_NOTSENT_LOWAT=0
+load_config
+assert_eq '131072' "$NOTSENT_LOWAT" 'a current explicit 128 KiB experiment is preserved'
+assert_eq '0' "$MIGRATED_NOTSENT_LOWAT" 'a current config is not migrated again'
+rm -f "$CONFIG_FILE"
 CONFIG_FILE="/etc/tcpwide.conf"
 MIGRATED_FROM_EGRESS=0
+MIGRATED_NOTSENT_LOWAT=0
 
 
 # ── 0.23.0 持久化复现实际布局 ──────────────────────────────────────────────
@@ -1916,6 +1912,22 @@ b="$(printf 'TcpRetransSegs 1010 0\nTcpOutSegs 200000 0\n')"
 assert_eq '1.0000' "$(retrans_delta "$a" "$b")" 'retransmission is computed from two snapshots'
 rc=0; retrans_delta "$a" "$a" >/dev/null 2>&1 || rc=$?
 assert_eq '2' "$rc" 'and too few segments is still refused rather than guessed at'
+
+# fq exposes the exact counter that settles whether flow_limit was binding.
+# Generic drops/overlimits cannot substitute for it.
+qa="$(mktemp)"; qb="$(mktemp)"
+printf 'qdisc fq 8001: root\n Sent 100 bytes 10 pkt (dropped 1, overlimits 2 requeues 3)\n backlog 0b 0p requeues 3\n flows 1 (inactive 0 throttled 0)\n gc 0 highprio 0 throttled 0 flows_plimit 4\n' > "$qa"
+printf 'qdisc fq 8001: root\n Sent 200 bytes 20 pkt (dropped 2, overlimits 5 requeues 4)\n backlog 1200b 1p requeues 4\n flows 1 (inactive 0 throttled 0)\n gc 0 highprio 0 throttled 0 flows_plimit 9\n' > "$qb"
+assert_eq $'1\t2\t3\t0b\t4' "$(qdisc_totals "$qa")" \
+  'qdisc totals retain the fq per-flow-limit counter'
+DIAG_DIR="$(mktemp -d)"; cp "$qa" "$DIAG_DIR/qdisc.a"; cp "$qb" "$DIAG_DIR/qdisc.b"
+out="$(render_qdisc_delta 2>&1)"
+[[ "$out" == *"flows_plimit 5"* && "$out" == *"真的撞到了 flow_limit"* ]] \
+  || fail 'the queue report must name an observed per-flow limit hit'
+[[ "$out" != *"overlimits 非零：有整形器"* ]] \
+  || fail 'generic overlimits must not be called proof of a shaper'
+pass 'fq flow_limit is judged by its own counter'
+rm -f "$qa" "$qb"; rm -rf "$DIAG_DIR"; DIAG_DIR=""
 
 
 # ── 0.23.0 ss 指标：区分四种天花板 ─────────────────────────────────────────
@@ -2073,32 +2085,52 @@ unset -f live_value
 # they were still 0 and 1 after the upgrade.
 restore_lib
 SYSCTL_SNAP="$(mktemp)"
-printf 'net.ipv4.tcp_frto\t2\nnet.ipv4.tcp_no_metrics_save\t0\n' > "$SYSCTL_SNAP"
+printf 'net.ipv4.tcp_frto\t2\nnet.ipv4.tcp_no_metrics_save\t0\nnet.ipv4.tcp_notsent_lowat\t4294967295\n' > "$SYSCTL_SNAP"
 live_value() {
   case "$1" in
     net.ipv4.tcp_frto) printf '0\n' ;;
     net.ipv4.tcp_no_metrics_save) printf '1\n' ;;
+    net.ipv4.tcp_notsent_lowat) printf '131072\n' ;;
     *) printf '\n' ;;
   esac
 }
 sysctl_log="$(mktemp)"
 sysctl() { [[ "$1" == -qw ]] && printf '%s\n' "$2" >> "$sysctl_log"; return 0; }
-assert_eq '2' "$(restore_retired_sysctl 2>/dev/null)" 'both withdrawn keys are put back'
+assert_eq '3' "$(restore_retired_sysctl 1000 190 2>/dev/null)" \
+  'withdrawn and neutral optional keys are put back'
 grep -qx 'net.ipv4.tcp_frto=2' "$sysctl_log" || fail 'tcp_frto must be restored from the snapshot'
 grep -qx 'net.ipv4.tcp_no_metrics_save=0' "$sysctl_log" \
   || fail 'tcp_no_metrics_save must be restored from the snapshot'
+grep -qx 'net.ipv4.tcp_notsent_lowat=4294967295' "$sysctl_log" \
+  || fail 'the old 128 KiB default must be restored from the snapshot'
 pass 'a withdrawn key is restored, not merely left alone'
 # Already correct: nothing to do, and it must not churn.
 : > "$sysctl_log"
-live_value() { case "$1" in net.ipv4.tcp_frto) printf '2\n' ;; *) printf '0\n' ;; esac; }
-assert_eq '0' "$(restore_retired_sysctl 2>/dev/null)" 'a key already at its target is left alone'
+live_value() { case "$1" in
+  net.ipv4.tcp_frto) printf '2\n' ;;
+  net.ipv4.tcp_notsent_lowat) printf '4294967295\n' ;;
+  *) printf '0\n' ;;
+esac; }
+assert_eq '0' "$(restore_retired_sysctl 1000 190 2>/dev/null)" 'a key already at its target is left alone'
 # No snapshot: fall back to the documented kernel default rather than guessing.
 rm -f "$SYSCTL_SNAP"; SYSCTL_SNAP="/nonexistent/snapshot"
 : > "$sysctl_log"
 live_value() { case "$1" in net.ipv4.tcp_frto) printf '0\n' ;; *) printf '1\n' ;; esac; }
-restore_retired_sysctl >/dev/null 2>&1
+restore_retired_sysctl 1000 190 >/dev/null 2>&1
 grep -qx 'net.ipv4.tcp_frto=2' "$sysctl_log" || fail 'without a snapshot the kernel default is used'
+grep -qx 'net.ipv4.tcp_notsent_lowat=4294967295' "$sysctl_log" \
+  || fail 'notsent_lowat also falls back to the documented kernel default'
 pass 'the kernel default is the fallback when there is no snapshot'
+# An explicit experiment remains managed and must not be immediately restored.
+: > "$sysctl_log"
+NOTSENT_LOWAT=262144
+live_value() { case "$1" in net.ipv4.tcp_notsent_lowat) printf '131072\n' ;; *) printf '0\n' ;; esac; }
+restore_retired_sysctl 1000 190 >/dev/null 2>&1
+if grep -q '^net.ipv4.tcp_notsent_lowat=' "$sysctl_log"; then
+  fail 'an explicit notsent target must not fight the optional restoration path'
+fi
+pass 'an explicit notsent_lowat remains a real target'
+NOTSENT_LOWAT=0
 rm -f "$sysctl_log"
 unset -f live_value sysctl
 
@@ -2190,6 +2222,8 @@ moved="$(ss_throughput)"
 assert_eq '400.0' "$(awk -F'\t' '/58.38.51.162/ {print $3}' <<< "$moved")" \
   'a mid-window transfer is measured over its own interval, not the window'
 assert_eq 'ok' "$(awk -F'\t' '/58.38.51.162/ {print $4}' <<< "$moved")" 'and is marked usable'
+assert_eq 'send' "$(awk -F'\t' '/58.38.51.162/ {print $6}' <<< "$moved")" \
+  'the payload direction is kept separate from ACK bytes'
 # The rejects are EMITTED, with a reason. Dropping them is what made the
 # diagnostic unable to explain its own silence.
 assert_eq 'onesample' "$(awk -F'\t' '/17.253.83.132/ {print $4}' <<< "$moved")" \
@@ -2307,8 +2341,9 @@ series_fixture() {  # rates...
 }
 series_fixture 1400 1400 120 100 1400 1400 110 90 0
 row="$(ss_throughput)"
-IFS=$'\t' read -r _ _ overall status series <<< "$row"
+IFS=$'\t' read -r _ _ overall status series direction <<< "$row"
 assert_eq 'ok' "$status" 'the burst-stall connection is measurable'
+assert_eq 'send' "$direction" 'a send-heavy sample is labelled as send'
 assert_eq '1400 1400 120 100 1400 1400 110 90' "$series" \
   'the per-second series reproduces the shape the average hides'
 # The average is not wrong, it is answering a different question.
@@ -2322,11 +2357,33 @@ pass 'a swinging link is distinguished from a steady one at the same average'
 
 # A steady link must NOT be accused of swinging.
 series_fixture 700 720 690 710 700 705 695 700 0
-IFS=$'\t' read -r _ _ _ _ series <<< "$(ss_throughput)"
+IFS=$'\t' read -r _ _ _ _ series _ <<< "$(ss_throughput)"
 if render_series_swing "$series" >/dev/null 2>&1; then
   fail 'a link within a few percent of steady is not a swing'
 fi
 pass 'a steady link raises nothing'
+
+# A proxy sees the same payload on its receive leg and its send leg. The old
+# sum counted both and doubled the throughput used for the CPU extrapolation.
+for i in 0 1 2; do
+  {
+    printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+    printf 'ESTAB 0 0 10.0.0.5:50000 203.0.113.10:443\n'
+    printf '\t bytes_sent:1000 bytes_received:%s\n' $(( 1000 + i * 12500000 ))
+    printf 'ESTAB 0 0 10.0.0.5:443 198.51.100.20:60000\n'
+    printf '\t bytes_sent:%s bytes_received:1000\n' $(( 1000 + i * 12500000 ))
+  } > "$DIAG_DIR/ss.$i"
+done
+for i in 3 4 5 6 7 8; do rm -f "$DIAG_DIR/ss.$i"; done
+DIAG_SS_LAST=2
+rows="$(ss_throughput)"
+assert_eq 'recv' "$(awk -F'\t' '/203.0.113.10/ {print $6}' <<< "$rows")" \
+  'the upstream relay leg is receive-heavy'
+assert_eq 'send' "$(awk -F'\t' '/198.51.100.20/ {print $6}' <<< "$rows")" \
+  'the downstream relay leg is send-heavy'
+assert_eq '100.0' "$(diag_total_mbps)" \
+  'one 100 Mbps relayed payload is not reported as 200 Mbps'
+pass 'relay legs are separated instead of double-counted'
 
 # The extrapolation has to rest on the median, not on a peak. One 1.4 Gbps
 # second inside a window whose core was 8% busy produced "单核上限约 9882 Mbps".
@@ -2352,6 +2409,19 @@ out="$(render_conn_evidence 1.2.3.4:443 131.8 1448 46935 16308 23592960 14480 \
 [[ "$out" == *"÷ RTT 131.8 ms = 1432 Mbps"* ]] || fail 'and the verdict must carry the arithmetic'
 [[ "$out" == *"客户端的 rmem"* ]] || fail 'and say whose it is'
 pass 'the peer window is reported as the rate ceiling it represents'
+
+# On a receive-heavy leg those fields describe the tiny reverse/ACK direction.
+# Treating local retrans=0 as proof the remote sender saw no loss was the exact
+# category error that made 0.26.0 blame every swing on application refill.
+out="$(render_conn_evidence 1.2.3.4:443 131.8 1448 46935 16308 23592960 14480 \
+  4112.7 426 8.1 0.0 0 131072 90995370 20000000 '1400 100 1400 100' 90995370 recv 2>&1)"
+[[ "$out" == *"主数据方向  接收"* ]] || fail 'a receive-heavy leg must be labelled'
+[[ "$out" == *"反向小流"* ]] || fail 'local sender metrics must be scoped to their real direction'
+[[ "$out" != *"所以掉下去的那几秒不是丢包"* ]] \
+  || fail 'local retrans=0 cannot clear loss on a remote sender'
+[[ "$out" != *"指向对端接收窗口"* ]] \
+  || fail 'snd_wnd on the ACK direction cannot cap the received payload'
+pass 'receive-heavy legs do not inherit send-side verdicts'
 
 
 # ── 0.26.0 sndbuf 已经顶到 wmem_max 时不能说「wmem 不够」 ──────────────────

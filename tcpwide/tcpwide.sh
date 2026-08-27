@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.29.0"
+VERSION="0.29.1"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -187,10 +187,10 @@ MIGRATED_FROM_EGRESS=0
 # 0.26.0 wrote 128 KiB as if it were a generally safe throughput default. A
 # config-version marker lets 0.27.0 retire that inherited value once, while
 # preserving every value an operator explicitly chooses from this release on.
-CONFIG_VERSION=29
+CONFIG_VERSION=30
 MIGRATED_NOTSENT_LOWAT=0
 MIGRATED_FAST_START=0
-MIGRATED_REGIONAL_START=0
+MIGRATED_RESTORED_START=0
 IFACE=""
 SHAPE=1
 # Persist by default. Without it every reboot silently reverts the machine to
@@ -432,6 +432,32 @@ buffer_ceiling() {
   fi
   (( buf < BUF_FLOOR )) && buf="$BUF_FLOOR"
   printf '%s\n' "$buf"
+}
+
+# The ceiling that will actually remain after apply's raise-only policy. The
+# derived figure is a minimum target, not a request to lower an existing value.
+# 0.29.0's wizard compared capacity against that minimum while the live box
+# retained 86.8 MiB, then announced a fictional 43.4 MiB / 1011 Mbps ceiling.
+# Use the smallest post-apply ceiling across both directions and both the core
+# and TCP tuples, because that is the only conservative common figure.
+effective_buffer_ceiling() {
+  local rate="${1:-0}" rtt="${2:-0}" target effective=0 key now post
+  target="$(buffer_ceiling "$rate" "$rtt")"
+  for key in net.core.rmem_max net.core.wmem_max; do
+    now="$(live_value "$key" || true)"
+    post="$target"
+    is_uint "${now:-}" && (( now > post )) && post="$now"
+    (( effective == 0 || post < effective )) && effective="$post"
+  done
+  for key in net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+    now="$(live_value "$key" || true)"
+    now="$(awk '{print $3}' <<< "$now")"
+    post="$target"
+    is_uint "${now:-}" && (( now > post )) && post="$now"
+    (( effective == 0 || post < effective )) && effective="$post"
+  done
+  (( effective > 0 )) || effective="$target"
+  printf '%s\n' "$effective"
 }
 
 # CAKE's aggregate rate: the operator's explicit SHAPER_MBPS when set,
@@ -728,20 +754,20 @@ PROFILE=balanced
 # NOT global: tcp_[rw]mem's middle value is paid per active socket, so a proxy
 # optimised for a few bulk flows and a many-client fairness box should not share
 # the same default. 1 MiB cuts roughly four doubling rounds versus the stock
-# 16-128 KiB starts on a 150 ms path; initcwnd/initrwnd 32 cuts several more
-# RTTs without repeating 0.28.0's mistake of treating every region as a clean
-# 64-packet path. fq/CAKE pacing remains in front of the larger-than-stock
-# opening window, and its initial_quantum stays at the kernel's IW10-sized
-# default instead of turning the whole window into one initial burst.
+# 16-128 KiB starts on a 150 ms path; initcwnd/initrwnd 64 removes another one
+# to two RTTs. 0.29.0 cut it to 32 from cross-sectional regional screenshots,
+# without an A/B/A on the same backend, and every measured region regressed.
+# Restore the last live-tested preset. fq/CAKE pacing remains in front of the
+# opening window; initial_quantum stays at the kernel's IW10-sized default.
 apply_profile() {
   case "${1:-balanced}" in
     stable)   SHAPE_PCT=90; INITCWND=16; BUF_DEFAULT=0;       SHAPE=1; PROFILE=stable ;;
     balanced) SHAPE_PCT=95; INITCWND=20; BUF_DEFAULT=0;       SHAPE=1; PROFILE=balanced ;;
-    speed)    SHAPE_PCT=98; INITCWND=32; BUF_DEFAULT=1048576; SHAPE=1; PROFILE=speed ;;
+    speed)    SHAPE_PCT=98; INITCWND=64; BUF_DEFAULT=1048576; SHAPE=1; PROFILE=speed ;;
     # SHAPE_PCT is meaningless without shaping, but it is still set so that
     # switching back to a shaping profile does not inherit whatever the last one
     # left behind. Since 0.23.0 it no longer reaches any per-flow limit.
-    noshape)  SHAPE_PCT=98; INITCWND=32; BUF_DEFAULT=1048576; SHAPE=0; PROFILE=noshape ;;
+    noshape)  SHAPE_PCT=98; INITCWND=64; BUF_DEFAULT=1048576; SHAPE=0; PROFILE=noshape ;;
     *) return 1 ;;
   esac
   return 0
@@ -808,27 +834,25 @@ load_config() {
     case "$PROFILE" in
       speed)
         if [[ "$INITCWND" == 32 && "$BUF_DEFAULT" == 0 ]]; then
-          INITCWND=32; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
+          INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
         fi
         ;;
       noshape)
         if [[ "$INITCWND" == 20 && "$BUF_DEFAULT" == 0 ]]; then
-          INITCWND=32; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
+          INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=1
         fi
         ;;
     esac
   fi
-  # 0.28.x made the global high-throughput presets too aggressive for a mixed
-  # population: the clean Shanghai path could absorb initcwnd/initrwnd 64,
-  # while lower-capacity regional policers paid for the same opening window in
-  # early loss and a longer recovery. Keep the independently useful 1 MiB
-  # autotuning start, but migrate the exact 0.28.x preset back to 32 once.
-  # Custom and already-edited values remain untouched.
-  if (( loaded_version < 29 )); then
+  # 0.29.0 changed the exact high-throughput presets from 64 to 32 without a
+  # same-path A/B/A. The subsequent four-region run regressed everywhere. Undo
+  # only that release's exact preset; a current-schema 32 remains an explicit
+  # experiment and configs from other versions are not guessed at.
+  if (( loaded_version == 29 )); then
     case "$PROFILE" in
       speed|noshape)
-        if [[ "$INITCWND" == 64 && "$BUF_DEFAULT" == 1048576 ]]; then
-          INITCWND=32; MIGRATED_REGIONAL_START=1
+        if [[ "$INITCWND" == 32 && "$BUF_DEFAULT" == 1048576 ]]; then
+          INITCWND=64; MIGRATED_RESTORED_START=1
         fi
         ;;
     esac
@@ -2720,15 +2744,13 @@ migration_notice() {
       "$DIM" "$RESET"
   fi
   if (( MIGRATED_FAST_START == 1 )); then
-    warn "旧的 ${PROFILE} 档已迁移为暖启动：initcwnd/initrwnd=32，缓冲起步值=1 MiB"
+    warn "旧的 ${PROFILE} 档已迁移为暖启动：initcwnd/initrwnd=64，缓冲起步值=1 MiB"
     printf '  %b只改变新连接爬升速度，不增加缓冲上限；稳定/均衡档仍使用系统起步值。%b\n' \
       "$DIM" "$RESET"
   fi
-  if (( MIGRATED_REGIONAL_START == 1 )); then
-    warn "0.28.x 的 ${PROFILE} 首窗 64 已收回到 32，保留 1 MiB 缓冲暖启动"
-    printf '  %b64 对干净路径峰值有利，但对低容量/有 policer 的地区会放大起步突发和早期重传；%b\n' \
-      "$DIM" "$RESET"
-    printf '  %b32 仍比内核常见的 10 起得快，并让 fq 按默认 IW10 额度把后续数据 pacing 出去。%b\n' \
+  if (( MIGRATED_RESTORED_START == 1 )); then
+    warn "0.29.0 的 ${PROFILE} 首窗 32 已恢复为最后一个实测良好的 64"
+    printf '  %b上一版没有同后端 A/B/A 就从地区横向差异推断首窗因果，证据不足；本次只撤回该改动。%b\n' \
       "$DIM" "$RESET"
   fi
 }
@@ -2935,25 +2957,30 @@ explain_cover_rtt() {
     # rather than leaving the operator to notice the numbers repeat.
     if (( ram > 0 && rate > 0 )); then
       if knee="$(buffer_knee_ms "$rate")"; then
-        printf '\n  %b这台机器 %s MB 内存，单 socket 上限最多长到 %s MB%b\n' \
+        printf '\n  %b这台机器 %s MB 内存，新计算的单 socket 自动目标最多是 %s MB%b\n' \
           "$DIM" "$(( ram / 1048576 ))" "$(mb "$clamp")" "$RESET"
         printf '  %b（全局 TCP 预算的 1/4；预算本身会跟着需求从内存的 1/4 长到 1/3）。%b\n' "$DIM" "$RESET"
-        printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲了。%b\n' "$DIM" "$knee" "$RESET"
+        printf '  %b所以覆盖 RTT 填超过 %s ms 不会再增加缓冲自动目标。%b\n' "$DIM" "$knee" "$RESET"
         # The honest version of "capped": say what the link would need, what
         # memory allows, and what single-flow rate that leaves. On a small box
         # with a fast port these genuinely cannot both be satisfied, and
         # silently capping is how that becomes a mystery instead of a choice.
-        local need cap_rate
+        local need effective cap_rate
         need=$(( $(bdp_bytes "$rate" "$COVER_RTT_MS") * BDP_MULTIPLIER + BUF_SLACK ))
-        cap_rate="$(awk -v c="$clamp" -v r="$COVER_RTT_MS" \
+        effective="$(effective_buffer_ceiling "$rate" "$COVER_RTT_MS")"
+        if (( effective > clamp )); then
+          printf '  %b当前四项收发缓冲安装后至少保留 %s MB（只升不降），不会被降到 %s MB。%b\n' \
+            "$GREEN" "$(mb "$effective")" "$(mb "$clamp")" "$RESET"
+        fi
+        cap_rate="$(awk -v c="$effective" -v r="$COVER_RTT_MS" \
           -v d="$BDP_MULTIPLIER" 'BEGIN {printf "%.0f", c / d * 8 / (r / 1000) / 1e6}')"
         # Being clamped is not the same as being short. The ceiling carries a
         # 2xBDP + 2MiB margin, so it can be trimmed and still support more than
         # the port sells — announcing a shortfall there tells the operator their
         # machine cannot do something it comfortably can. Only a real gap talks.
-        if (( need > clamp )) && (( cap_rate < rate * 85 / 100 )); then
-          printf '\n  %b[!] %s Mbps × %s ms 本该要 %s MB 的上限，内存只给得起 %s MB。%b\n' \
-            "$YELLOW" "$rate" "$COVER_RTT_MS" "$(mb "$need")" "$(mb "$clamp")" "$RESET"
+        if (( need > effective )) && (( cap_rate < rate * 85 / 100 )); then
+          printf '\n  %b[!] %s Mbps × %s ms 本该要 %s MB 的上限，安装后实际只有 %s MB。%b\n' \
+            "$YELLOW" "$rate" "$COVER_RTT_MS" "$(mb "$need")" "$(mb "$effective")" "$RESET"
           printf '  %b单流因此封顶在约 %s Mbps。内存不够是物理事实，不是配置错误——%b\n' \
             "$DIM" "$cap_rate" "$RESET"
           printf '  %b这台机器上「单流跑满 %s Mbps」和「多条大流并发」二选一。%b\n' \
@@ -3882,8 +3909,8 @@ cmd_install() {
     printf '\n  %b档位%b\n' "$BOLD" "$RESET"
     printf '    1) 整形 90%%    首窗 16   系统起步值｜丢包敏感、跨境线路\n'
     printf '    2) 整形 95%%    首窗 20   系统起步值｜多设备共享、公平\n'
-    printf '    3) 整形 98%%    首窗 32   1MiB 暖启动｜跨区快速、仍付 CAKE 开销\n'
-    printf '    4) 不整形      首窗 32   1MiB 暖启动｜pacing、跨区高吞吐\n'
+    printf '    3) 整形 98%%    首窗 64   1MiB 暖启动｜仍付全额 CAKE 开销\n'
+    printf '    4) 不整形      首窗 64   1MiB 暖启动｜pacing、最高吞吐\n'
     if (( tight == 1 )); then
       printf '\n  %b[!] 这台机器 %s 核，整形 %s Mbps 超出 CAKE 的处理能力%b\n' \
         "$YELLOW" "$(cpu_count)" "$LINK_MBPS" "$RESET"
@@ -3976,7 +4003,7 @@ tcpwide - 面向多地区、多设备客户端的一套 TCP 配置（SSH 面板�
 参数：
   --egress <Mbps>    出口带宽。整形必须知道这个数
   --cover-rtt <ms>   覆盖 RTT，默认 250。按你最远的客户端填，不是按你自己
-  --initcwnd <N>     默认路由首窗，随档位为 16/20/32（内核默认常见为 10）
+  --initcwnd <N>     默认路由首窗，随档位为 16/20/64（内核默认常见为 10）
   --shape-pct <N>    整形到出口带宽的百分之多少，默认 95
   --iface <名字>     出口网卡，默认自动探测
   --profile <名字>   stable | balanced | speed | noshape

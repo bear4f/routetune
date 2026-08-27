@@ -2,24 +2,20 @@
 
 面向**多地区、多设备**客户端的一套 TCP 配置。一个脚本，直接落地，可完整还原。
 
-**当前版本：`0.28.1`**
+**当前版本：`0.28.2`**
 
-你的机器（2 Gbps 端口、覆盖 RTT 180 ms、不整形高速档）一键安装或升级：
+**一键安装或升级（进入交互向导）**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh | sudo bash -s -- install --egress 2000 --cover-rtt 180 --profile noshape --yes
+curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh -o /tmp/tcpwide.sh && sudo bash /tmp/tcpwide.sh install
 ```
+
+向导会依次询问端口速率、覆盖 RTT 和调优档位，不会预先写死参数。已经安装过也运行同一条命令升级。
 
 安装后确认版本：
 
 ```bash
 sudo tcpwide version
-```
-
-**一键安装（进向导）**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/routetune/main/tcpwide/tcpwide.sh -o /tmp/tcpwide.sh && sudo bash /tmp/tcpwide.sh install
 ```
 
 **一键安装（不进向导，直接给参数）**
@@ -53,7 +49,7 @@ sudo tcpwide
 
 ```
 ──────────────────────────────────────────────────────────────────────
-  tcpwide 0.28.1   整形 95% · bbr · 已持久化 · 500 Mbps 口
+  tcpwide 0.28.2   整形 95% · bbr · 已持久化 · 500 Mbps 口
 ──────────────────────────────────────────────────────────────────────
 
    覆盖 RTT  250 ms             缓冲上限  29.8 MB/socket

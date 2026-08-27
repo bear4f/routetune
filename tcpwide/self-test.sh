@@ -110,13 +110,22 @@ assert_eq '0' "$(key net.ipv4.tcp_slow_start_after_idle)" 'cwnd is not reset bet
 # leaves a pessimistic value behind, and the next connection starts from it and
 # leaves slow start early. On a variable link that is a direct cause of a slow
 # ramp, so this must always be part of the set.
-assert_eq '1' "$(key net.ipv4.tcp_no_metrics_save)" 'a bad moment is not cached into the next connection'
+# tcp_no_metrics_save and tcp_frto are NOT written any more. The narrow knob for
+# a cached pessimistic ssthresh is tcp_no_ssthresh_metrics_save, which has
+# defaulted to 1 since Linux 5.6 -- so forcing tcp_no_metrics_save=1 threw away
+# the whole destination cache (RTT, RTTVAR, cwnd, reordering) to fix something
+# the kernel already fixed. F-RTO is a sender-side algorithm and needs no
+# cooperation from a middlebox, so the justification for zeroing it was wrong.
+[[ -z "$(key net.ipv4.tcp_no_metrics_save)" ]] \
+  || fail 'tcp_no_metrics_save must be left at the kernel default'
+[[ -z "$(key net.ipv4.tcp_frto)" ]] || fail 'tcp_frto must be left at the kernel default'
+pass 'the two sysctls with no evidence behind them are left alone'
 assert_eq bbr "$(key net.ipv4.tcp_congestion_control)" 'the chosen congestion control lands in the set'
 assert_eq "$(buffer_ceiling 500 250)" "$(key net.core.rmem_max)" 'the ceiling follows the coverage envelope'
 # Every ceiling above is computed as twice the BDP, which is only right when the
 # application gets half of the receive buffer. At 2 it gets a quarter and all of
 # them are wrong by a factor of two, so the assumption is stated, not assumed.
-assert_eq '1' "$(key net.ipv4.tcp_adv_win_scale)" 'the half-of-buffer assumption is asserted, not assumed'
+assert_eq '1' "$(key net.ipv4.tcp_adv_win_scale)" 'the window share is still set where the kernel honours it'
 # Without autotuning the ceiling is decorative: connections never leave the
 # default and never grow toward it.
 assert_eq '1' "$(key net.ipv4.tcp_moderate_rcvbuf)" 'receive autotuning is required for a ceiling to mean anything'
@@ -146,7 +155,10 @@ assert_eq '262144' "$(key net.ipv4.tcp_notsent_lowat)" \
 NOTSENT_LOWAT=131072; tgt="$(target_sysctl 500 250)"
 while IFS=$'\t' read -r k v dir why; do
   [[ -n "$k" && -n "$v" && -n "$why" ]] || fail "key $k is missing a value or a rationale"
-  [[ "$dir" =~ ^(exact|raise|lower)$ ]] || fail "key $k has no safe direction"
+  # A direction is one word, or one word per field for a tuple like tcp_rmem
+  # whose fields are not the same kind of thing.
+  [[ "$dir" =~ ^(exact|raise|lower)(,(exact|raise|lower))*$ ]] \
+    || fail "key $k has no safe direction: [$dir]"
 done <<< "$tgt"
 pass 'every key carries a value, a direction and a rationale'
 
@@ -172,7 +184,7 @@ SHAPE=0
 # keeps producing them. netshape puts this under its shaper; shaping the
 # aggregate is not a substitute for pacing the individual flow.
 spec="$(target_qdisc 500 250)"
-[[ "$spec" == 'fq maxrate 475mbit'* ]] \
+[[ "$spec" == fq* && "$spec" != *maxrate* ]] \
   || fail 'unshaped still paces each flow at the line rate'
 pass 'unshaped still paces each flow at the line rate'
 # The queue limits come from netshape-manager, whose author reports it
@@ -181,14 +193,14 @@ pass 'unshaped still paces each flow at the line rate'
 # kernel default cannot hold back an aggregate transfer while it can hold back
 # a single one. That is the exact shape of 558 Mbps on one thread against 917
 # on several, same backend, seconds apart.
-assert_eq 'fq maxrate 475mbit limit 40960 flow_limit 8192' "$spec" \
+assert_eq 'fq limit 40960 flow_limit 8192' "$spec" \
   'the fq queue limits follow netshape rather than the kernel default'
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
-assert_eq 'fq maxrate 475mbit limit 10240 flow_limit 2048' "$(target_qdisc 500 250)" \
+assert_eq 'fq limit 10240 flow_limit 2048' "$(target_qdisc 500 250)" \
   'a box under 1 GB gets the smaller rung of that ladder'
 # Still overridable, so it can be A/B'd back to the kernel values.
 FQ_LIMIT=10000; FQ_FLOW_LIMIT=100
-assert_eq 'fq maxrate 475mbit limit 10000 flow_limit 100' "$(target_qdisc 500 250)" \
+assert_eq 'fq limit 10000 flow_limit 100' "$(target_qdisc 500 250)" \
   'the ladder can be overridden back to the kernel defaults'
 FQ_LIMIT=0; FQ_FLOW_LIMIT=0
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
@@ -240,12 +252,12 @@ if conflicting_tool >/dev/null 2>&1; then pass 'a conflicting tool is reported w
 else pass 'no conflicting tool on this host'; fi
 
 # ── 整形必须知道带宽 ───────────────────────────────────────────────────────
-EGRESS_MBPS=""
+LINK_MBPS=""
 if ( SHAPE=1; require_egress ) 2>/dev/null; then
   fail 'shaping without a bandwidth figure must be refused'
 fi
 pass 'shaping refuses to guess the line rate'
-if ! ( SHAPE=0; EGRESS_MBPS=""; target_qdisc 200 250 >/dev/null ) 2>/dev/null; then
+if ! ( SHAPE=0; LINK_MBPS=""; target_qdisc 200 250 >/dev/null ) 2>/dev/null; then
   fail 'no-shape mode must work without a bandwidth figure'
 fi
 pass 'no-shape mode needs no bandwidth figure'
@@ -253,13 +265,13 @@ pass 'no-shape mode needs no bandwidth figure'
 
 # ── 0.2.0 配置持久化 ───────────────────────────────────────────────────────
 tmp="$(mktemp -d)"; CONFIG_FILE="$tmp/tcpwide.conf"
-EGRESS_MBPS=750; COVER_RTT_MS=300; INITCWND=32; SHAPE_PCT=90
+LINK_MBPS=750; COVER_RTT_MS=300; INITCWND=32; SHAPE_PCT=90
 SHAPE=1; PERSIST=1; PROFILE=stable; IFACE=ens3
 save_config
-EGRESS_MBPS=1; COVER_RTT_MS=10; INITCWND=1; SHAPE_PCT=50
+LINK_MBPS=1; COVER_RTT_MS=10; INITCWND=1; SHAPE_PCT=50
 SHAPE=0; PERSIST=0; PROFILE=balanced; IFACE=lo
 load_config
-assert_eq '750'    "$EGRESS_MBPS"  'egress survives a config round trip'
+assert_eq '750'    "$LINK_MBPS"  'the port speed survives a config round trip'
 assert_eq '300'    "$COVER_RTT_MS" 'coverage RTT survives a config round trip'
 assert_eq '32'     "$INITCWND"     'initcwnd survives a config round trip'
 assert_eq '90'     "$SHAPE_PCT"    'shaping percentage survives a config round trip'
@@ -289,7 +301,7 @@ apply_profile speed
 assert_eq '98|32|1' "$SHAPE_PCT|$INITCWND|$SHAPE" 'the speed profile shapes closer to the line rate'
 apply_profile noshape
 assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
-[[ "$(target_qdisc 500 250)" == 'fq maxrate 490mbit'* ]] \
+[[ "$(target_qdisc 500 250)" == fq* && "$(target_qdisc 500 250)" != *maxrate* ]] \
   || fail 'the no-shape profile yields paced fq, not cake'
 pass 'the no-shape profile yields paced fq, not cake'
 if apply_profile nonsense 2>/dev/null; then fail 'an unknown profile must be rejected'; fi
@@ -309,7 +321,7 @@ assert_eq "$(buffer_ceiling 500 250)" \
 # ── 0.2.0 队列漂移 ─────────────────────────────────────────────────────────
 # A box that rebooted, or that another tool touched, is the normal case. A panel
 # that cannot see the difference reports a configuration that is not running.
-IFACE=eth0; EGRESS_MBPS=500; COVER_RTT_MS=250; SHAPE=1
+IFACE=eth0; LINK_MBPS=500; COVER_RTT_MS=250; SHAPE=1
 tc() { printf 'qdisc mq 0: root \n'; }
 assert_eq 'mq' "$(qdisc_drift)" 'a live mq root against a cake config reports drift'
 tc() { printf 'qdisc cake 8001: root refcnt 2 bandwidth 475Mbit\n'; }
@@ -627,12 +639,11 @@ pass 'no kernel-version archaeology and no kernel-swap instructions'
 assert_eq bbr "$(pick_cc 'reno cubic bbr')" 'a stock kernel still gets bbr'
 assert_eq bbr3 "$(pick_cc 'reno cubic bbr bbr3')" 'and a kernel that offers bbr3 still gets it'
 
-# The single-flow submenu lost its BBRv3 entry, so its numbering has to close
-# up. A menu that reads 1 2 3 5 is how an operator ends up pressing 4 and
-# getting the wrong knob.
+# The single-flow submenu's numbering has to stay contiguous. A menu that reads
+# 1 2 3 5 is how an operator ends up pressing 4 and getting the wrong knob.
 submenu_keys="$(sed -n '/^panel_single_flow()/,/^}/p' "$ROOT/tcpwide.sh" \
   | grep -oE "%b[0-9]\)%b" | grep -oE '[0-9]' | sort -u | tr -d '\n')"
-assert_eq 01234 "$submenu_keys" 'the single-flow submenu is numbered 1-4 with no gap'
+assert_eq 012345 "$submenu_keys" 'the single-flow submenu is numbered 1-5 with no gap'
 
 
 # ── 0.4.0 对端窗口决定的单流上限 ───────────────────────────────────────────
@@ -773,7 +784,7 @@ rm -rf "$tmp"
 
 # Piped into bash, stdin IS the script: a prompt would read the next line of
 # source as the operator's answer, so every value has to come from flags.
-EGRESS_MBPS=""
+LINK_MBPS=""
 out="$( ( need_root() { :; }; cmd_install ) < /dev/null 2>&1 )" || true
 [[ "$out" == *"非交互安装需要 --egress"* ]] \
   || fail 'a non-interactive install without an egress figure must say so'
@@ -783,7 +794,7 @@ out="$( ( need_root() { :; }; cmd_install ) < /dev/null 2>&1 )" || true
 [[ "$out" == *"-o /tmp/tcpwide.sh"* ]] || fail 'and must name a wizard form that works under sudo'
 [[ "$out" != *"bash <(curl"* ]] || fail 'must not suggest a form sudo breaks'
 pass 'a non-interactive install demands its parameters and names the wizard form'
-EGRESS_MBPS=500
+LINK_MBPS=500
 
 
 # ── 0.9.0 内存不够时要明说，不能默默封顶 ───────────────────────────────────
@@ -918,7 +929,7 @@ assert_eq '2' "$(mq_leaves_with fq)" 'leaves carrying the pacer are counted'
 if mq_leaves_with cake >/dev/null 2>&1; then fail 'a kind no leaf carries must not match'; fi
 pass 'a qdisc kind absent from the leaves does not match'
 # And that layout is the intended one, so the panel must not nag about drift.
-SHAPE=0; EGRESS_MBPS=1000; COVER_RTT_MS=250; QDISC_LAYOUT=mq-leaves
+SHAPE=0; LINK_MBPS=1000; COVER_RTT_MS=250; QDISC_LAYOUT=mq-leaves
 if qdisc_drift >/dev/null 2>&1; then fail 'mq carrying fq leaves is the intended layout, not drift'; fi
 pass 'mq with fq leaves does not read as drift'
 # Shaping is the one case that still has to take the root: CAKE can only shape
@@ -1184,10 +1195,10 @@ unset -f live_value canonical_qdisc current_default_route
 # gets to promote it.
 SHAPE=0; SHAPE_PCT=98; FQ_INITIAL_QUANTUM=0; FQ_FLOW_LIMIT=0; FQ_LIMIT=0
 total_ram_bytes() { printf '%s\n' $((8 * 1024 * 1024 * 1024)); }
-assert_eq 'fq maxrate 980mbit limit 40960 flow_limit 8192' "$(target_qdisc 1000 200)" \
+assert_eq 'fq limit 40960 flow_limit 8192' "$(target_qdisc 1000 200)" \
   'an untouched initial_quantum adds nothing to the spec'
 FQ_INITIAL_QUANTUM=65536
-assert_eq 'fq maxrate 980mbit limit 40960 flow_limit 8192 initial_quantum 65536' \
+assert_eq 'fq limit 40960 flow_limit 8192 initial_quantum 65536' \
   "$(target_qdisc 1000 200)" 'a set burst allowance reaches the spec'
 FQ_INITIAL_QUANTUM=0
 
@@ -1258,7 +1269,7 @@ unset -f nstat sleep has
 # The advice has to match the profile that is running: telling someone on the
 # no-shape profile to check the queue is really cake sends them to undo the
 # setting that is correct for their machine.
-grep -q 'fq maxrate 已经在给每条流限速' "$ROOT/tcpwide.sh" \
+grep -q '本机 fq 只做 pacing，不限速' "$ROOT/tcpwide.sh" \
   || fail 'the no-shape path needs its own retransmission advice'
 pass 'the retransmission advice branches on the running profile'
 
@@ -1423,7 +1434,7 @@ restore_lib
 IFACE=eth0
 RMEM=45497685; live_value() { printf '%s\n' "$RMEM"; }   # rmem_max 43.4 MB
 has() { [[ "$1" == ss ]]; }
-EGRESS_MBPS=1000; SHAPE_PCT=98
+LINK_MBPS=1000; SHAPE_PCT=98
 # The exact shape that fooled it: a real remote RTT, a trivial rate.
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
@@ -1524,7 +1535,7 @@ restore_lib
 IFACE=eth0
 has() { [[ "$1" == ss ]]; }
 RMEM=90995370; live_value() { printf '%s\n' "$RMEM"; }
-EGRESS_MBPS=1000; SHAPE_PCT=98
+LINK_MBPS=1000; SHAPE_PCT=98
 # A mixed speedtest: idle inbound SSH, a loaded outbound sender, a loaded
 # outbound receiver. All three are what a real run looks like.
 ss() {
@@ -1585,18 +1596,31 @@ pass 'a peer window on a power-of-two boundary settles the hedge'
 
 # Our own pacer is the other thing that caps a sender, and unlike the peer it is
 # ours to change. DMIT sat at 95% of its own fq maxrate.
-EGRESS_MBPS=520
+#
+# Since 0.23.0 the ceiling is READ from the running queue rather than derived
+# from LINK_MBPS: there is no per-flow cap unless the operator set one, so
+# inferring it from the port speed would report a limit that is not installed.
+LINK_MBPS=520
+IFACE=eth0
+tc() { printf 'qdisc fq 8005: root refcnt 2 limit 10240p flow_limit 2048p maxrate 509Mbit\n'; }
+has() { [[ "$1" == ss || "$1" == tc ]]; }
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:41234 180.97.50.130:443\n'
   printf '\t skmem:(r0,rb131072,t0,tb4194304,f0,w1048576,o0,bl0,d0) rtt:146/4 snd_wnd:16672358 bytes_sent:900000000 bytes_received:120000 delivery_rate 483.8Mbps\n'
 }
 out="$(render_window_ratio 2>&1)"
-[[ "$out" == *"顶在自己设的出口带宽上"* ]] || fail 'a sender at its own maxrate must be told so'
+[[ "$out" == *"顶在自己设的单流上限上"* ]] || fail 'a sender at its own maxrate must be told so'
 [[ "$out" != *"对端配置的 rmem_max"* ]] || fail 'and must not be blamed on the peer'
 pass 'a sender at its own pacer is distinguished from a peer ceiling'
-EGRESS_MBPS=1000
-unset -f ss has live_value
+# And with no maxrate installed, the same reading must NOT be blamed on a pacer.
+tc() { printf 'qdisc fq 8005: root refcnt 2 limit 10240p flow_limit 2048p\n'; }
+out="$(render_window_ratio 2>&1)"
+[[ "$out" != *"顶在自己设的单流上限上"* ]] \
+  || fail 'a limit that is not installed must not be reported'
+pass 'no maxrate on the queue means no pacer verdict'
+LINK_MBPS=1000
+unset -f ss has live_value tc
 
 # observed_client_rtt must NOT follow: it sizes the coverage RTT from the client
 # population, and an outbound connection to a speedtest node is not a client.
@@ -1645,30 +1669,53 @@ rm -rf "$STATE_DIR"
 unset -f live_value canonical_qdisc current_default_route
 
 
-# ── 0.20.0 缓冲起步值：借自 tcpfit，只影响爬升 ─────────────────────────────
+# ── 0.23.0 缓冲起步值：降级回实验值 ────────────────────────────────────────
 # tcp_[rw]mem's middle value is where autotuning starts, not a cap -- only the
-# third value caps. At 150ms a 64KB send buffer carries 3.5 Mbps through the
-# first round trip and needs about eight doublings to reach the ~12 MB these
-# paths use. From 1 MB it is four. tcpfit uses 1 MB for its proxy role.
+# third value caps, and neither is a cwnd.
+#
+# 0.20.0 made 1 MB the default, taken from tcpfit's proxy role. That was a
+# borrowing error: tcpfit calls 1 MB the CONSERVATIVE end of its own scale
+# (bulk goes to 8 MB) and its comment names the per-socket cost out loud, so it
+# is a relative choice on tcpfit's scale rather than an absolute recommendation.
+# tcpfit's 2.2x figure also bundles every change it makes, so this knob has
+# never been measured on its own -- here or there. Default 0 = whatever the
+# kernel already starts sockets at.
 restore_lib
 available_cc() { printf 'reno cubic bbr\n'; }
 total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+live_value() {
+  case "$1" in
+    net.ipv4.tcp_rmem) printf '4096 131072 6291456\n' ;;
+    net.ipv4.tcp_wmem) printf '4096 16384 4194304\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+BUF_DEFAULT=0
 tgt="$(target_sysctl 1000 190)"
 mid() { awk -F'\t' -v k="$1" '$1 == k {split($2, f, " "); print f[2]}' <<< "$tgt"; }
-assert_eq '1048576' "$(mid net.ipv4.tcp_rmem)" 'the receive buffer starts at the tuned default'
-assert_eq '1048576' "$(mid net.ipv4.tcp_wmem)" 'and so does the send buffer'
+assert_eq '131072' "$(mid net.ipv4.tcp_rmem)" \
+  'BUF_DEFAULT=0 keeps the kernel receive starting size'
+assert_eq '16384' "$(mid net.ipv4.tcp_wmem)" \
+  'and the kernel send starting size'
+# The direction on that field must be `exact`, not `raise`. As `raise` it
+# ratcheted: a machine that once wrote 1 MB computed max(16384, 1048576) and
+# reported "already at or better than target", so neither apply nor a reboot
+# could walk it back.
+dirof() { awk -F'\t' -v k="$1" '$1 == k {print $3}' <<< "$tgt"; }
+assert_eq 'raise,exact,raise' "$(dirof net.ipv4.tcp_wmem)" \
+  'the starting size can move both ways while the ceiling only rises'
+assert_eq 'raise,exact,raise' "$(dirof net.ipv4.tcp_rmem)" 'same on the receive side'
+BUF_DEFAULT=1048576
+tgt="$(target_sysctl 1000 190)"
+assert_eq '1048576' "$(mid net.ipv4.tcp_wmem)" 'the experiment is one setting away'
 # The ceiling is still the third value, and the starting size must never exceed
 # it -- a start above the cap would be a configuration the kernel rejects.
 top() { awk -F'\t' -v k="$1" '$1 == k {split($2, f, " "); print f[3]}' <<< "$tgt"; }
 (( $(mid net.ipv4.tcp_wmem) < $(top net.ipv4.tcp_wmem) )) \
   || fail 'the starting size must sit below the ceiling'
 pass 'the starting size sits below the ceiling it grows toward'
-# It stays a knob, because tcpfit reports 2.2x overall and that bundles every
-# change it makes -- this one is not independently measured.
-BUF_DEFAULT=65536
-tgt="$(target_sysctl 1000 190)"
-assert_eq '65536' "$(mid net.ipv4.tcp_wmem)" 'the previous value is one setting away'
-BUF_DEFAULT=1048576
+BUF_DEFAULT=0
+unset -f live_value
 
 # What is deliberately NOT taken from tcpfit: netdev_budget. Its own comments
 # record 600 against the kernel's 300 at 3751 vs 3745 Mbps, n=5, 0% coefficient
@@ -1687,7 +1734,7 @@ restore_lib
 IFACE=eth0
 has() { [[ "$1" == ss ]]; }
 RMEM=90995370; live_value() { printf '%s\n' "$RMEM"; }
-EGRESS_MBPS=2000; SHAPE_PCT=98
+LINK_MBPS=2000; SHAPE_PCT=98
 ss() {
   [[ "$1" == -tlnH ]] && { printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'; return 0; }
   printf 'ESTAB 0 0 10.0.0.5:41234 36.151.164.132:443\n'
@@ -1724,3 +1771,218 @@ out="$(render_window_ratio 2>&1)"
 [[ "$out" == *"长连接"* ]] || fail 'and what a sustained transfer actually gets'
 pass 'hitting the peer window explains the gap to the reported average'
 unset -f ss has live_value
+
+
+# ── 0.23.0 端口速率不是限速 ────────────────────────────────────────────────
+# Until 0.23.0 one variable meant three things: the port capacity, CAKE's
+# aggregate shaping rate, and fq's PER-FLOW maxrate. So "my port is 2 Gbps"
+# silently became "no single connection may exceed 1.9 Gbps", and on the
+# no-shape profile -- whose entire point is not to rate-limit anything -- it
+# became a rate limit the panel could not turn off. Every single-flow
+# measurement taken before 0.23.0 was taken with that cap installed.
+restore_lib
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+cpu_count() { printf '1\n'; }
+SHAPE=0; PROFILE=noshape; FLOW_MAXRATE_MBPS=0; SHAPER_MBPS=''
+for link in 1000 2000; do
+  spec="$(LINK_MBPS=$link target_qdisc "$link" 180)"
+  [[ "$spec" != *maxrate* ]] \
+    || fail "LINK_MBPS=$link must not become a per-flow limit: [$spec]"
+done
+pass 'the port speed never becomes a single-flow rate limit'
+
+# The silent fallback was the same bug wearing a smaller number: with no port
+# speed configured, `${EGRESS_MBPS:-200}` reached the queue builder and became
+# `fq maxrate 190mbit` on a machine whose operator had configured nothing.
+LINK_MBPS=''
+spec="$(target_qdisc "$(sizing_mbps)" 180)"
+[[ "$spec" != *maxrate* ]] || fail "an unset port speed must not produce a rate: [$spec]"
+[[ "$spec" != *190* ]] || fail 'the sizing fallback must not reach the queue at all'
+pass 'no port speed configured means no queue rate limit'
+# It still has to size buffers off something, and that something is stated.
+assert_eq "$UNKNOWN_LINK_MBPS" "$(sizing_mbps)" 'sizing falls back to a named constant'
+LINK_MBPS=1000
+assert_eq '1000' "$(sizing_mbps)" 'and uses the real port speed once it is known'
+
+# A per-flow ceiling is available, but only because someone chose it.
+FLOW_MAXRATE_MBPS=900
+spec="$(target_qdisc 2000 180)"
+[[ "$spec" == *"maxrate 900mbit"* ]] || fail "an explicit flow cap must be written: [$spec]"
+pass 'an explicitly chosen single-flow limit is honoured'
+FLOW_MAXRATE_MBPS=0
+
+# CAKE's aggregate rate is a separate number and stays separate.
+SHAPE=1; SHAPE_PCT=95
+[[ "$(target_qdisc 2000 180)" == *"bandwidth 1900000kbit"* ]] \
+  || fail 'the shaper still derives from the port speed by default'
+SHAPER_MBPS=800
+[[ "$(target_qdisc 2000 180)" == *"bandwidth 800000kbit"* ]] \
+  || fail 'an explicit shaper rate overrides the derivation'
+SHAPER_MBPS=''; SHAPE=0; PROFILE=noshape
+pass 'the shaping rate and the port speed are separate numbers'
+
+
+# ── 0.23.0 旧配置迁移 ──────────────────────────────────────────────────────
+# A pre-0.23.0 config carries EGRESS_MBPS. Migrating it to LINK_MBPS is right;
+# carrying it into FLOW_MAXRATE_MBPS would keep the exact rate limit this
+# release exists to remove, and would do it silently.
+CONFIG_FILE="$(mktemp)"
+printf 'EGRESS_MBPS=2000\nCOVER_RTT_MS=180\nPROFILE=noshape\nSHAPE=0\n' > "$CONFIG_FILE"
+LINK_MBPS=''; FLOW_MAXRATE_MBPS=0; MIGRATED_FROM_EGRESS=0
+load_config
+assert_eq '2000' "$LINK_MBPS" 'an old EGRESS_MBPS migrates to the port speed'
+assert_eq '0' "$FLOW_MAXRATE_MBPS" 'and is NOT inherited as a single-flow limit'
+assert_eq '1' "$MIGRATED_FROM_EGRESS" 'the migration is flagged so it can be announced'
+[[ "$(migration_notice 2>&1)" == *"单流上限现在默认没有"* ]] \
+  || fail 'the migration must say what changed'
+pass 'an old config migrates without inheriting its hidden rate limit'
+rm -f "$CONFIG_FILE"
+CONFIG_FILE="/etc/tcpwide.conf"
+MIGRATED_FROM_EGRESS=0
+
+
+# ── 0.23.0 持久化复现实际布局 ──────────────────────────────────────────────
+# The unit used to bake in `tc qdisc replace ... root <spec>`, so a machine on
+# the mq-leaves layout came back after a reboot as a single root fq -- a
+# different structure from the one apply built, which the drift check then
+# reported as someone overwriting the queue. The unit now runs the same code
+# path apply runs, so it cannot drift from apply.
+IFACE=eth0; INSTALL_PATH=/usr/local/lib/tcpwide/tcpwide.sh
+for layout in root mq-leaves; do
+  line="$(QDISC_LAYOUT=$layout persist_qdisc_exec 2000 180)"
+  [[ "$line" == *"apply-link"* ]] \
+    || fail "the $layout unit must replay through apply-link: [$line]"
+  [[ "$line" != *"qdisc replace"* ]] \
+    || fail "the $layout unit must not hand-write tc: [$line]"
+done
+pass 'both queue layouts persist through the same code path apply uses'
+grep -q 'apply-link) cmd_apply_link' "$ROOT/tcpwide.sh" \
+  || fail 'apply-link must be dispatchable, or the unit fails at boot'
+pass 'apply-link is a real command'
+
+
+# ── 0.23.0 同窗口采样 ──────────────────────────────────────────────────────
+# The old diagnostic slept 5s for retransmission, THEN 5s for CPU, THEN read
+# ss -- three readings from three disjoint windows, over a speedtest lasting
+# 7-9 seconds. Telling a CPU ceiling from a window ceiling is a question about
+# what was true AT THE SAME TIME, so disjoint windows cannot answer it.
+diag_body="$(sed -n '/^panel_diagnose() {/,/^}/p' "$ROOT/tcpwide.sh")"
+[[ "$diag_body" != *"retrans_rate "* ]] \
+  || fail 'the diagnostic must not re-open its own sampling window for retransmission'
+[[ "$diag_body" != *"busiest_core_pct "* ]] \
+  || fail 'nor a second one for CPU'
+[[ "$diag_body" == *"diag_sample"* ]] || fail 'it must take one shared window'
+for reader in retrans_delta busiest_core_delta render_qdisc_delta render_nic_delta render_connections; do
+  [[ "$diag_body" == *"$reader"* ]] || fail "$reader must read from the shared window"
+done
+pass 'every diagnostic reading comes from one sampling window'
+
+# And the readers still compute the same numbers from snapshots handed to them.
+a="$(printf 'TcpRetransSegs 10 0\nTcpOutSegs 100000 0\n')"
+b="$(printf 'TcpRetransSegs 1010 0\nTcpOutSegs 200000 0\n')"
+assert_eq '1.0000' "$(retrans_delta "$a" "$b")" 'retransmission is computed from two snapshots'
+rc=0; retrans_delta "$a" "$a" >/dev/null 2>&1 || rc=$?
+assert_eq '2' "$rc" 'and too few segments is still refused rather than guessed at'
+
+
+# ── 0.23.0 ss 指标：区分四种天花板 ─────────────────────────────────────────
+# Peer window, congestion window, our own pacer and CPU are four different
+# ceilings, and each has one field that settles it. Before 0.23.0 the parser
+# read rtt/delivery_rate/snd_wnd/skmem only, so cwnd-limited and rwnd-limited
+# were indistinguishable -- and the panel guessed, wrongly, twice.
+ss_fixture="$(mktemp)"
+{
+  printf 'ESTAB 0 0 10.0.0.5:41234 36.151.164.132:443\n'
+  printf '\t bbr rtt:142.2/4.1 mss:1448 cwnd:8400 bytes_sent:9000000000 bytes_received:120000'
+  printf ' pacing_rate 977Mbps delivery_rate 958.3Mbps rwnd_limited:1200us(0.0%%)'
+  printf ' sndbuf_limited:44000us(0.5%%) unacked:8380 retrans:0/840 rcv_space:14480'
+  printf ' snd_wnd:16777216\n'
+  printf '\t skmem:(r0,rb131072,t0,tb90995370,f4096,w13946880,o0,bl0,d0)\n'
+} > "$ss_fixture"
+row="$(ss_metrics "$ss_fixture")"
+IFS=$'\t' read -r m_lcl m_peer m_rtt m_mss m_cwnd m_unacked m_wnd m_rcvsp \
+  m_pace m_dlv m_rwnd m_snd m_retr m_rb m_tb m_wq m_sent m_recv <<< "$row"
+# The whole point of the record is that it has eighteen columns and none of them
+# shift, so assert the shape before picking fields out of it.
+assert_eq '18' "$(awk -F'\t' '{print NF}' <<< "$row")" 'the metric row has every column'
+assert_eq '142.2' "$m_rtt" 'rtt is parsed'
+assert_eq '14480' "$m_rcvsp" 'rcv_space is parsed'
+assert_eq '131072' "$m_rb" 'the receive buffer is parsed out of skmem'
+assert_eq '13946880' "$m_wq" 'and wmem_queued'
+assert_eq '9000000000' "$m_sent" 'bytes_sent survives'
+assert_eq '120000' "$m_recv" 'and bytes_received, which is what tells the legs apart'
+assert_eq '10.0.0.5:41234' "$m_lcl" 'the local address is captured, so the two legs can be told apart'
+assert_eq '36.151.164.132:443' "$m_peer" 'and the peer'
+assert_eq '1448' "$m_mss" 'mss is parsed'
+assert_eq '8400' "$m_cwnd" 'cwnd is parsed'
+assert_eq '8380' "$m_unacked" 'unacked is parsed, which is what gives bytes in flight'
+assert_eq '16777216' "$m_wnd" 'snd_wnd is parsed'
+assert_eq '977.0' "$m_pace" 'pacing_rate is parsed and converted to Mbps'
+assert_eq '958.3' "$m_dlv" 'delivery_rate too'
+assert_eq '0.0' "$m_rwnd" 'rwnd_limited is parsed as a percentage'
+assert_eq '0.5' "$m_snd" 'sndbuf_limited too'
+assert_eq '840' "$m_retr" 'retrans total is parsed'
+assert_eq '90995370' "$m_tb" 'and the send buffer out of skmem'
+pass 'every field needed to separate the four ceilings is parsed'
+
+# A Gbps pacing_rate must not read as 1.2 Mbps.
+printf 'ESTAB 0 0 10.0.0.5:1 1.2.3.4:443\n\t rtt:10/1 mss:1448 unacked:1 pacing_rate 1.2Gbps delivery_rate 800Mbps\n' > "$ss_fixture"
+assert_eq '1200.0' "$(ss_metrics "$ss_fixture" | cut -f9)" 'Gbps is converted, not truncated'
+rm -f "$ss_fixture"
+
+# The verdicts have to follow the field that establishes them. In-flight at the
+# congestion window with rwnd_limited near zero is a congestion ceiling, and
+# saying "peer window" there is the mistake this release is correcting.
+out="$(render_conn_evidence 1.2.3.4:443 142.2 1448 8400 8380 16777216 14480 977 958.3 0.0 0.5 840 131072 90995370 13946880 2>&1)"
+[[ "$out" == *"指向拥塞窗口"* ]] || fail 'in-flight at cwnd with no rwnd limiting is a congestion ceiling'
+[[ "$out" != *"指向对端接收窗口"* ]] || fail 'and must not be blamed on the peer'
+pass 'a congestion ceiling is named as one'
+out="$(render_conn_evidence 1.2.3.4:443 32.1 1448 180 12 0 2600000 70.1 61.2 41.2 0.0 3 31266816 4194304 20480 2>&1)"
+[[ "$out" == *"指向对端接收窗口"* ]] || fail 'rwnd_limited above the threshold is a peer ceiling'
+[[ "$out" == *"本机怎么调都拿不回来"* ]] || fail 'and must be named as external'
+pass 'a peer ceiling is named as one, on the field that establishes it'
+# Nothing pinned means nothing is claimed.
+out="$(render_conn_evidence 1.2.3.4:443 100 1448 8000 2000 16777216 14480 2000 400 0.0 0.0 0 131072 8388608 1048576 2>&1)"
+[[ "$out" == *"没有明显的本机侧天花板"* ]] || fail 'an unconstrained connection must claim nothing'
+pass 'a connection with no ceiling in evidence gets no verdict'
+
+
+# ── 0.23.0 幂等 ────────────────────────────────────────────────────────────
+# Applying twice must be a no-op the second time. This is not decoration: the
+# `raise` ratchet was discovered exactly here -- a key that cannot converge is
+# a key that either rewrites forever or refuses forever, and tcp_wmem was doing
+# the second.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((520 * 1024 * 1024)); }
+cpu_count() { printf '1\n'; }
+LINK_MBPS=2000; COVER_RTT_MS=180; SHAPE=0; PROFILE=noshape
+BUF_DEFAULT=0; NOTSENT_LOWAT=131072; FLOW_MAXRATE_MBPS=0
+live_value() {
+  awk -F'\t' -v k="$1" '$1 == k {print $2; found = 1}
+    END { if (!found) print "" }' <<< "$FAKE_LIVE"
+}
+# Pretend the machine is already exactly at target.
+FAKE_LIVE="$(target_sysctl 2000 180 | awk -F'\t' '{printf "%s\t%s\n", $1, $2}')"
+n=0
+while IFS=$'\t' read -r k v dir _; do
+  [[ -n "$k" ]] || continue
+  needs_write "$(live_value "$k")" "$v" "$dir" && { n=$((n + 1)); printf 'rewrites: %s\n' "$k" >&2; }
+done < <(target_sysctl 2000 180)
+assert_eq '0' "$n" 'a second apply against an already-applied machine writes nothing'
+
+# And converging from below still happens once, then stops.
+FAKE_LIVE="$(printf 'net.ipv4.tcp_wmem\t4096 16384 4194304\n')"
+needs_write "$(live_value net.ipv4.tcp_wmem)" '4096 16384 45438293' 'raise,exact,raise' \
+  || fail 'a machine below target must be raised'
+FAKE_LIVE="$(printf 'net.ipv4.tcp_wmem\t4096 16384 45438293\n')"
+if needs_write "$(live_value net.ipv4.tcp_wmem)" '4096 16384 45438293' 'raise,exact,raise'; then
+  fail 'and must then be left alone'
+fi
+pass 'sysctl application converges in one step and stays converged'
+
+# The queue spec is a pure function of the configuration: same inputs, same
+# bytes. A spec that varies between calls makes drift detection meaningless.
+assert_eq "$(target_qdisc 2000 180)" "$(target_qdisc 2000 180)" \
+  'the queue spec is deterministic'
+unset -f live_value

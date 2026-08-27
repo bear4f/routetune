@@ -2694,4 +2694,113 @@ render_region_table >/dev/null 2>&1 || fail 'and the table must tolerate it'
 rm -rf "$STATE_DIR"
 unset -f config_fingerprint
 
+
+# ══ 1.0.0 调参基线：锁死 ═══════════════════════════════════════════════════
+#
+# Everything below is the tuning baseline as shipped in 1.0.0, asserted value by
+# value. Changing any default makes this section fail, which is the point: after
+# twenty rounds of reversals, a default must not be able to move by accident.
+# Whoever changes one has to change the assertion too, and that is a decision
+# rather than a drive-by edit.
+#
+# The reasoning for each value lives in TUNING.md. This file is what enforces it
+# -- a README gets skipped, a red suite does not.
+restore_lib
+available_cc() { printf 'reno cubic bbr\n'; }
+total_ram_bytes() { printf '%s\n' $((1024 * 1024 * 1024)); }
+cpu_count() { printf '1\n'; }
+live_value() { printf '\n'; }
+IFACE=eth0
+
+# ── 四个档位的预设组合 ─────────────────────────────────────────────────────
+# stable/balanced keep the kernel's own buffer start and a conservative initial
+# window; speed/noshape take the warm start that was measured -- dropping the
+# initial window from 64 to 32 took all four regions to 35-113 Mbps.
+check_profile() {  # name shape pct initcwnd buf_default
+  apply_profile "$1" || fail "profile $1 must exist"
+  assert_eq "$2" "$SHAPE"       "$1: shaping flag is frozen"
+  assert_eq "$3" "$SHAPE_PCT"   "$1: shaping percentage is frozen"
+  assert_eq "$4" "$INITCWND"    "$1: initial window is frozen"
+  assert_eq "$5" "$BUF_DEFAULT" "$1: buffer start size is frozen"
+}
+check_profile stable   1 90 16 0
+check_profile balanced 1 95 20 0
+check_profile speed    1 98 64 1048576
+check_profile noshape  0 98 64 1048576
+unset -f check_profile
+
+# ── 不整形档写出来的 sysctl，逐键逐值 ──────────────────────────────────────
+apply_profile noshape
+LINK_MBPS=2000; COVER_RTT_MS=180
+NOTSENT_LOWAT=0; PACING_SS_RATIO=0; FLOW_MAXRATE_MBPS=0; SHAPER_MBPS=''; BUF_MB=0
+baseline="$(target_sysctl 2000 180)"
+lock() {  # key value direction
+  local got
+  got="$(awk -F'\t' -v k="$1" '$1 == k {printf "%s\t%s", $2, $3}' <<< "$baseline")"
+  assert_eq "$2	$3" "$got" "1.0 baseline: $1"
+}
+lock net.ipv4.tcp_congestion_control    bbr                          exact
+lock net.core.default_qdisc             fq                           exact
+lock net.core.rmem_max                  89478485                     raise
+lock net.core.wmem_max                  89478485                     raise
+lock net.ipv4.tcp_rmem                  '4096 1048576 89478485'      raise,exact,raise
+lock net.ipv4.tcp_wmem                  '4096 1048576 89478485'      raise,exact,raise
+lock net.ipv4.tcp_slow_start_after_idle 0                            exact
+lock net.core.rmem_default              262144                       raise
+lock net.core.wmem_default              262144                       raise
+lock net.core.optmem_max                4194304                      raise
+lock net.ipv4.tcp_fastopen              0                            exact
+lock net.ipv4.tcp_mtu_probing           1                            exact
+lock net.ipv4.tcp_adv_win_scale         1                            exact
+lock net.ipv4.tcp_moderate_rcvbuf       1                            exact
+lock net.ipv4.tcp_mem                   '21845 43690 87381'          raise
+lock net.core.netdev_max_backlog        16384                        raise
+lock net.ipv4.tcp_ecn                   0                            exact
+assert_eq '17' "$(grep -c '' <<< "$baseline")" \
+  '1.0 baseline writes exactly seventeen keys, no more'
+unset -f lock
+
+# ── 默认不写的东西 ─────────────────────────────────────────────────────────
+# Three settings tcpwide deliberately leaves to the kernel. Each was either
+# withdrawn after its evidence collapsed or never measured here at all, and an
+# unmeasured value does not get to be a default.
+for absent in tcp_notsent_lowat tcp_pacing_ss_ratio tcp_frto tcp_no_metrics_save; do
+  [[ "$baseline" != *"$absent"* ]] || fail "1.0 baseline must not write $absent"
+done
+pass '1.0 baseline leaves the withdrawn and unmeasured keys to the kernel'
+
+# The no-shape profile must not carry a rate limit. maxrate is a PER-FLOW
+# ceiling, and deriving it from the port speed turned "no shaping" into a
+# single-flow cap the panel could not switch off.
+assert_eq 'fq limit 40960 flow_limit 8192' "$(target_qdisc 2000 180)" \
+  '1.0 baseline: the no-shape queue is plain fq with no rate limit'
+for prof in stable:1800000 balanced:1900000 speed:1960000; do
+  apply_profile "${prof%%:*}"
+  assert_eq "cake bandwidth ${prof##*:}kbit dual-dsthost besteffort rtt 180ms no-split-gso" \
+    "$(target_qdisc 2000 180)" "1.0 baseline: the ${prof%%:*} queue is frozen"
+done
+apply_profile noshape
+
+# ── 规范必须跟着代码走 ─────────────────────────────────────────────────────
+# A key added to target_sysctl without a matching entry in TUNING.md is a value
+# nobody has justified. Fail rather than let it ship unexplained.
+if [[ -r "$ROOT/TUNING.md" ]]; then
+  while IFS=$'\t' read -r k _; do
+    [[ -n "$k" ]] || continue
+    grep -qF "$k" "$ROOT/TUNING.md" || fail "TUNING.md does not cover $k"
+  done <<< "$baseline"
+  pass 'every key the baseline writes is justified in TUNING.md'
+else
+  fail 'TUNING.md must exist: it is where the frozen reasoning lives'
+fi
+
+# The README must not hard-code a version. It said 0.29.1 while the script said
+# 0.30.0, which is what a hand-maintained second source of truth always does.
+# shellcheck disable=SC2016 # a literal regex, not a string to expand
+if grep -qE '当前版本|`0\.[0-9]+\.[0-9]+`|`1\.[0-9]+\.[0-9]+`' "$ROOT/README.md"; then
+  fail 'README must not hard-code a version; VERSION in the script is the source'
+fi
+pass 'the version has exactly one source of truth'
+unset -f live_value
+
 printf '\n%s\n' "All tcpwide self-tests passed ($PASS_COUNT assertions)."

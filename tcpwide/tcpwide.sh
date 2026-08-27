@@ -28,7 +28,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.30.0"
+VERSION="1.0.0"
 PROGRAM="tcpwide"
 STATE_DIR="/var/lib/tcpwide"
 SYSCTL_SNAP="$STATE_DIR/sysctl.snapshot"
@@ -3423,16 +3423,23 @@ render_panel() {
   printf '%b%s%b\n\n' "$DIM" "$RULE" "$RESET"
 
   cwnd_now="$(current_default_route 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "initcwnd") {print $(i + 1); exit}}' || true)"
-  local best_cell='-'
+  # A fresh install has no history, and printing "-" there tells a first-time
+  # operator nothing. Naming the key that fills it teaches the workflow instead:
+  # press 8 while a transfer is running and the diagnostic records everything.
+  local best_cell='按 8 记录'
   local brow bm _bf _bn bw
   if brow="$(best_measurement)"; then
     IFS=$'\t' read -r bm _bf _bn bw <<< "$brow"
     best_cell="$bm Mbps"
     [[ "$bw" != - && -n "$bw" ]] && best_cell="$best_cell  ${bw%% *}"
   fi
+  # 0 means "leave the kernel's value alone", and a bare 0 in a panel reads as
+  # "this is set to zero" -- the opposite.
+  local notsent_cell="$NOTSENT_LOWAT"
+  [[ "$NOTSENT_LOWAT" == 0 ]] && notsent_cell='系统默认'
   panel_row '覆盖 RTT' "$COVER_RTT_MS ms" '缓冲上限' "$(mb "$show_buf") MB/socket"
   panel_row '首窗' "${cwnd_now:-内核默认}" '根队列' "$(short_qdisc "${live_q:-未知}" || true)"
-  panel_row '历史最好' "$best_cell" '未发送' "${NOTSENT_LOWAT}"
+  panel_row '历史最好' "$best_cell" '未发送' "$notsent_cell"
 
   # Alerts only exist when something is wrong, so they cost nothing when it is
   # not. These are the three that have actually mattered on live machines.

@@ -294,8 +294,8 @@ apply_profile balanced
 assert_eq '95|20|0|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
   'the balanced profile keeps the system buffer start'
 apply_profile speed
-assert_eq '98|64|1048576|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
-  'the high-throughput shaped profile gets a warm start'
+assert_eq '98|32|1048576|1' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+  'the high-throughput shaped profile balances warm start against regional burst loss'
 speed_tgt="$(target_sysctl 2000 150)"
 assert_eq '1048576' "$(awk -F'\t' '$1 == "net.ipv4.tcp_rmem" {split($2,v," "); print v[2]}' <<< "$speed_tgt")" \
   'the warm receive start reaches the applied tuple'
@@ -303,7 +303,7 @@ assert_eq '1048576' "$(awk -F'\t' '$1 == "net.ipv4.tcp_wmem" {split($2,v," "); p
   'the warm send start reaches the applied tuple'
 apply_profile noshape
 assert_eq '0' "$SHAPE" 'the no-shape profile stops shaping'
-assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+assert_eq '32|1048576' "$INITCWND|$BUF_DEFAULT" \
   'the no-shape profile warms both startup controls'
 [[ "$(target_qdisc 500 250)" == fq* && "$(target_qdisc 500 250)" != *maxrate* ]] \
   || fail 'the no-shape profile yields paced fq, not cake'
@@ -742,11 +742,11 @@ BUF_MB=0
 # things depending on what had been chosen before it.
 apply_profile speed
 apply_profile noshape
-assert_eq '98|64|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+assert_eq '98|32|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
   'the no-shape profile sets every value it depends on'
 apply_profile stable
 apply_profile noshape
-assert_eq '98|64|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
+assert_eq '98|32|1048576|0' "$SHAPE_PCT|$INITCWND|$BUF_DEFAULT|$SHAPE" \
   'and does so regardless of what preceded it'
 apply_profile balanced
 
@@ -1880,32 +1880,52 @@ assert_eq '131072' "$NOTSENT_LOWAT" 'a current explicit 128 KiB experiment is pr
 assert_eq '0' "$MIGRATED_NOTSENT_LOWAT" 'a current config is not migrated again'
 rm -f "$CONFIG_FILE"
 
-# 0.28.0 moves only the two throughput profiles to a warm start. The exact old
-# preset migrates once; a current schema carrying the same numbers is an
-# operator choice and must not be overwritten.
+# 0.28.0 moved only the two throughput profiles to a warm start. 0.29.0 keeps
+# the 1 MiB start but pulls its exact 64-packet preset back to 32. Each schema
+# migrates once; current-schema experiments must not be overwritten.
 CONFIG_FILE="$(mktemp)"
 printf 'CONFIG_VERSION=27\nPROFILE=noshape\nSHAPE=0\nINITCWND=20\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
 PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_FAST_START=0
 load_config
-assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+assert_eq '32|1048576' "$INITCWND|$BUF_DEFAULT" \
   'the old no-shape preset migrates to the warm start'
 assert_eq '1' "$MIGRATED_FAST_START" 'the warm-start migration is announced'
 printf 'CONFIG_VERSION=27\nPROFILE=speed\nSHAPE=1\nINITCWND=32\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
 PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_FAST_START=0
 load_config
-assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+assert_eq '32|1048576' "$INITCWND|$BUF_DEFAULT" \
   'the old high-throughput shaped preset migrates too'
 printf 'CONFIG_VERSION=28\nPROFILE=noshape\nSHAPE=0\nINITCWND=20\nBUF_DEFAULT=0\n' > "$CONFIG_FILE"
-PROFILE=balanced; SHAPE=1; INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=0
+PROFILE=balanced; SHAPE=1; INITCWND=64; BUF_DEFAULT=1048576; MIGRATED_FAST_START=0; MIGRATED_REGIONAL_START=0
 load_config
 assert_eq '20|0' "$INITCWND|$BUF_DEFAULT" \
-  'a current explicit cold start is preserved'
-assert_eq '0' "$MIGRATED_FAST_START" 'the current profile is not migrated twice'
+  'an older explicit cold start is preserved because it is not the aggressive preset'
+assert_eq '0|0' "$MIGRATED_FAST_START|$MIGRATED_REGIONAL_START" \
+  'a non-preset profile is not migrated'
+printf 'CONFIG_VERSION=28\nPROFILE=noshape\nSHAPE=0\nINITCWND=64\nBUF_DEFAULT=1048576\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_REGIONAL_START=0
+load_config
+assert_eq '32|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'the 0.28 no-shape preset migrates away from the regional burst'
+assert_eq '1' "$MIGRATED_REGIONAL_START" 'the regional-start migration is announced'
+printf 'CONFIG_VERSION=28\nPROFILE=speed\nSHAPE=1\nINITCWND=64\nBUF_DEFAULT=1048576\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=0; INITCWND=20; BUF_DEFAULT=0; MIGRATED_REGIONAL_START=0
+load_config
+assert_eq '32|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'the 0.28 shaped high-throughput preset migrates by the same rule'
+assert_eq '1' "$MIGRATED_REGIONAL_START" 'the shaped migration is announced too'
+printf 'CONFIG_VERSION=29\nPROFILE=noshape\nSHAPE=0\nINITCWND=64\nBUF_DEFAULT=1048576\n' > "$CONFIG_FILE"
+PROFILE=balanced; SHAPE=1; INITCWND=20; BUF_DEFAULT=0; MIGRATED_REGIONAL_START=0
+load_config
+assert_eq '64|1048576' "$INITCWND|$BUF_DEFAULT" \
+  'a current explicit 64-packet experiment is preserved'
+assert_eq '0' "$MIGRATED_REGIONAL_START" 'the current schema is not migrated twice'
 rm -f "$CONFIG_FILE"
 CONFIG_FILE="/etc/tcpwide.conf"
 MIGRATED_FROM_EGRESS=0
 MIGRATED_NOTSENT_LOWAT=0
 MIGRATED_FAST_START=0
+MIGRATED_REGIONAL_START=0
 apply_profile balanced
 
 
